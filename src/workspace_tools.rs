@@ -1,12 +1,14 @@
 use crate::command;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
+use image::imageops::FilterType;
+use image::{ImageFormat, ImageReader};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -14,6 +16,11 @@ use std::process::{Command as ProcessCommand, Stdio};
 const MAX_READ_BYTES: usize = 512 * 1024;
 pub const MAX_READ_BATCH_FILES: usize = 32;
 pub const MAX_READ_BATCH_BYTES: usize = 512 * 1024;
+pub const DEFAULT_IMAGE_MAX_WIDTH: u32 = 1600;
+pub const DEFAULT_IMAGE_MAX_HEIGHT: u32 = 1600;
+pub const MAX_IMAGE_OUTPUT_DIMENSION: u32 = 4096;
+pub const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 const MAX_WRITE_BYTES: usize = 512 * 1024;
 const DEFAULT_LIST_LIMIT: usize = 200;
 const HARD_LIST_LIMIT: usize = 1000;
@@ -254,6 +261,127 @@ fn readable_size(target: &Path) -> Result<u64, String> {
         return Err(format!("Not a file: {}", target.display()));
     }
     Ok(metadata.len())
+}
+
+fn image_mime_type(format: ImageFormat) -> Result<&'static str, String> {
+    match format {
+        ImageFormat::Png => Ok("image/png"),
+        ImageFormat::Jpeg => Ok("image/jpeg"),
+        ImageFormat::WebP => Ok("image/webp"),
+        _ => Err(format!(
+            "Unsupported image format: {format:?}. Supported formats are PNG, JPEG, and WebP."
+        )),
+    }
+}
+
+fn resolve_image_limit(name: &str, value: Option<u32>, default_value: u32) -> Result<u32, String> {
+    let value = value.unwrap_or(default_value);
+    if value == 0 {
+        return Err(format!("{name} must be at least 1"));
+    }
+    if value > MAX_IMAGE_OUTPUT_DIMENSION {
+        return Err(format!(
+            "{name} must not exceed {MAX_IMAGE_OUTPUT_DIMENSION}"
+        ));
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Debug)]
+pub struct ReadImageOutput {
+    pub path: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub width: u32,
+    pub height: u32,
+    pub original_width: u32,
+    pub original_height: u32,
+    pub resized: bool,
+    pub data: Vec<u8>,
+}
+
+pub fn read_image(
+    workspace_root: &str,
+    path: &str,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> Result<ReadImageOutput, String> {
+    let root = workspace_root_path(workspace_root)?;
+    let target = resolve_target_path(workspace_root, path)?;
+    let size_bytes = readable_size(&target)?;
+    if size_bytes > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "Image is too large: {size_bytes} bytes exceeds the {MAX_IMAGE_BYTES}-byte limit"
+        ));
+    }
+
+    let mut file =
+        fs::File::open(&target).map_err(|error| format!("{error}: {}", target.display()))?;
+    let mut bytes = Vec::with_capacity(size_bytes.min(MAX_IMAGE_BYTES) as usize);
+    file.by_ref()
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{error}: {}", target.display()))?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "Image is too large: more than {MAX_IMAGE_BYTES} bytes"
+        ));
+    }
+
+    let format = image::guess_format(&bytes)
+        .map_err(|error| format!("Unsupported or invalid image: {error}"))?;
+    let mime_type = image_mime_type(format)?;
+
+    let (original_width, original_height) =
+        ImageReader::with_format(Cursor::new(bytes.as_slice()), format)
+            .into_dimensions()
+            .map_err(|error| format!("Failed to read image dimensions: {error}"))?;
+    let pixels = u64::from(original_width)
+        .checked_mul(u64::from(original_height))
+        .ok_or_else(|| "Image dimensions overflow the pixel limit calculation".to_string())?;
+    if pixels > MAX_IMAGE_PIXELS {
+        return Err(format!(
+            "Image dimensions are too large: {original_width}x{original_height} ({pixels} pixels) exceeds the {MAX_IMAGE_PIXELS}-pixel limit"
+        ));
+    }
+
+    let max_width = resolve_image_limit("max_width", max_width, DEFAULT_IMAGE_MAX_WIDTH)?;
+    let max_height = resolve_image_limit("max_height", max_height, DEFAULT_IMAGE_MAX_HEIGHT)?;
+    let resized = original_width > max_width || original_height > max_height;
+
+    let (data, width, height) = if resized {
+        let decoded = image::load_from_memory_with_format(&bytes, format)
+            .map_err(|error| format!("Failed to decode image: {error}"))?;
+        let resized_image = decoded.resize(max_width, max_height, FilterType::Lanczos3);
+        let width = resized_image.width();
+        let height = resized_image.height();
+        let mut encoded = Cursor::new(Vec::new());
+        resized_image
+            .write_to(&mut encoded, format)
+            .map_err(|error| format!("Failed to encode resized image: {error}"))?;
+        let data = encoded.into_inner();
+        if data.len() as u64 > MAX_IMAGE_BYTES {
+            return Err(format!(
+                "Resized image is too large to return: {} bytes exceeds the {MAX_IMAGE_BYTES}-byte limit",
+                data.len()
+            ));
+        }
+        (data, width, height)
+    } else {
+        (bytes, original_width, original_height)
+    };
+
+    Ok(ReadImageOutput {
+        path: to_workspace_relative(&root, &target),
+        mime_type: mime_type.to_string(),
+        size_bytes,
+        width,
+        height,
+        original_width,
+        original_height,
+        resized,
+        data,
+    })
 }
 
 fn read_file(workspace_root: &str, path: &str, budget: usize) -> Result<ReadFileOutput, String> {

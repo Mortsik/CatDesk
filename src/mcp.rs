@@ -534,6 +534,23 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
+        "read_image" => {
+            properties.insert("path".to_string(), json!({ "type": "string" }));
+            properties.insert("mimeType".to_string(), json!({ "type": "string" }));
+            for field in [
+                "sizeBytes",
+                "width",
+                "height",
+                "originalWidth",
+                "originalHeight",
+            ] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert("resized".to_string(), json!({ "type": "boolean" }));
+        }
         "search" => {
             properties.insert("searchPattern".to_string(), json!({ "type": "string" }));
             properties.insert("searchPath".to_string(), json!({ "type": "string" }));
@@ -935,6 +952,39 @@ async fn handle_tools_list_with_show_detail_mode(
             "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
         }));
         tools.push(json!({
+            "name": "read_image",
+            "title": "Read image",
+            "description": "Read an image from the workspace and return it as native MCP image content for visual/vision analysis.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1, "description": "Image path relative to workspace root, or an absolute path within it" },
+                    "max_width": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": workspace_tools::MAX_IMAGE_OUTPUT_DIMENSION,
+                        "description": format!(
+                            "Maximum returned image width in pixels (default {}, maximum {})",
+                            workspace_tools::DEFAULT_IMAGE_MAX_WIDTH,
+                            workspace_tools::MAX_IMAGE_OUTPUT_DIMENSION
+                        )
+                    },
+                    "max_height": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": workspace_tools::MAX_IMAGE_OUTPUT_DIMENSION,
+                        "description": format!(
+                            "Maximum returned image height in pixels (default {}, maximum {})",
+                            workspace_tools::DEFAULT_IMAGE_MAX_HEIGHT,
+                            workspace_tools::MAX_IMAGE_OUTPUT_DIMENSION
+                        )
+                    }
+                },
+                "required": ["path"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
             "name": "search",
             "title": "Search text",
             "description": "Search text across files in workspace. Uses rg when available, then grep, then built-in search.",
@@ -1159,6 +1209,7 @@ async fn handle_tools_call_with_show_detail_mode(
             } else {
                 match tool_name.as_str() {
                     "read" => handle_read_files(req, workspace_root),
+                    "read_image" => handle_read_image(req, workspace_root),
                     "search" => handle_search_text(req, workspace_root),
                     "create_handoff" => handle_create_handoff(req, workspace_root),
                     _ => {
@@ -1888,6 +1939,25 @@ fn tool_response(
     JsonRpcResponse::success(req.id.clone(), result)
 }
 
+fn image_tool_success_response(
+    req: &JsonRpcRequest,
+    data: &[u8],
+    mime_type: &str,
+    structured: Value,
+) -> JsonRpcResponse {
+    JsonRpcResponse::success(
+        req.id.clone(),
+        json!({
+            "content": [{
+                "type": "image",
+                "data": base64::engine::general_purpose::STANDARD.encode(data),
+                "mimeType": mime_type,
+            }],
+            "structuredContent": structured,
+        }),
+    )
+}
+
 fn tool_message_structured(req: &JsonRpcRequest, message: String, is_error: bool) -> Value {
     json!({
         "toolName": tool_name_from_request(req),
@@ -2398,6 +2468,15 @@ fn sanitize_result_for_turn_token_count(result: &Value) -> Value {
         return sanitized;
     };
     obj.remove("_meta");
+    if let Some(content) = obj.get_mut("content").and_then(Value::as_array_mut) {
+        for entry in content {
+            if entry.get("type").and_then(Value::as_str) == Some("image") {
+                if let Some(entry) = entry.as_object_mut() {
+                    entry.remove("data");
+                }
+            }
+        }
+    }
     sanitized
 }
 
@@ -2483,6 +2562,7 @@ fn tool_descriptor_should_attach_widget(name: &str) -> bool {
             | "catdesk_instruction"
             | "search"
             | "read"
+            | "read_image"
             | "write"
             | "edit"
             | "create_handoff"
@@ -3390,6 +3470,56 @@ fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespo
     }
 }
 
+fn parse_optional_image_dimension(arguments: &Value, name: &str) -> Result<Option<u32>, String> {
+    let Some(value) = arguments.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| format!("Parameter {name} must be a positive integer"))?;
+    let value = u32::try_from(value).map_err(|_| format!("Parameter {name} is too large"))?;
+    Ok(Some(value))
+}
+
+fn handle_read_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let path = match arguments.get("path").and_then(Value::as_str) {
+        Some(path) if !path.is_empty() => path,
+        Some(_) => return tool_error_response(req, "Parameter path must not be empty".into()),
+        None => return tool_error_response(req, "Missing required parameter: path".into()),
+    };
+    let max_width = match parse_optional_image_dimension(&arguments, "max_width") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let max_height = match parse_optional_image_dimension(&arguments, "max_height") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    match workspace_tools::read_image(workspace_root, path, max_width, max_height) {
+        Ok(output) => {
+            let message = format!("Read image {}", output.path);
+            let mime_type = output.mime_type.clone();
+            let structured = json!({
+                "toolName": "read_image",
+                "path": output.path,
+                "mimeType": mime_type,
+                "sizeBytes": output.size_bytes,
+                "width": output.width,
+                "height": output.height,
+                "originalWidth": output.original_width,
+                "originalHeight": output.original_height,
+                "resized": output.resized,
+                "message": message,
+                "success": true,
+            });
+            image_tool_success_response(req, &output.data, &output.mime_type, structured)
+        }
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
 fn handle_write_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let path = match arguments.get("path").and_then(|v| v.as_str()) {
@@ -3876,6 +4006,50 @@ mod tests {
                 && entry.get("type").and_then(Value::as_str) != Some("text")),
             "tool result content must not contain text entries: {content:?}"
         );
+    }
+
+    fn write_test_image(path: &Path, format: image::ImageFormat, width: u32, height: u32) {
+        let image = image::RgbImage::from_pixel(width, height, image::Rgb([23, 67, 101]));
+        image
+            .save_with_format(path, format)
+            .expect("write test image");
+    }
+
+    async fn read_image_response(
+        workspace_root: &Path,
+        arguments: Value,
+        tool_mode: ToolMode,
+    ) -> JsonRpcResponse {
+        let req = tool_call_request("read_image", arguments);
+        handle_tools_call(
+            &req,
+            &workspace_root.to_string_lossy(),
+            1,
+            Mode::Both,
+            tool_mode,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await
+    }
+
+    fn image_structured(response: &JsonRpcResponse) -> &Value {
+        response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content")
+    }
+
+    fn image_content(response: &JsonRpcResponse) -> &Value {
+        response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .expect("missing image content")
     }
 
     #[test]
@@ -4427,6 +4601,7 @@ mod tests {
                 "cancel_command",
                 "catdesk_instruction",
                 "read",
+                "read_image",
                 "search",
                 "write",
                 "edit",
@@ -4488,6 +4663,7 @@ mod tests {
             ("run_command", "stdout"),
             ("catdesk_instruction", "instructionText"),
             ("read", "files"),
+            ("read_image", "mimeType"),
             ("search", "searchResults"),
             ("write", "bytesWritten"),
             ("edit", "operationCount"),
@@ -4784,7 +4960,13 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["catdesk_instruction", "read", "search", "create_handoff"]
+            vec![
+                "catdesk_instruction",
+                "read",
+                "read_image",
+                "search",
+                "create_handoff"
+            ]
         );
     }
 
@@ -6031,6 +6213,347 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_image_returns_native_mcp_image_content() {
+        let workspace_root = read_workspace("image-native-content");
+        write_test_image(
+            &workspace_root.join("visual.bin"),
+            image::ImageFormat::Png,
+            64,
+            32,
+        );
+
+        let response = read_image_response(
+            &workspace_root,
+            json!({ "path": "visual.bin" }),
+            ToolMode::MultiTools,
+        )
+        .await;
+        let content = image_content(&response);
+        assert_eq!(content["type"], json!("image"));
+        assert_eq!(content["mimeType"], json!("image/png"));
+        let data = content["data"].as_str().expect("missing base64 data");
+        assert!(!data.is_empty());
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .expect("valid base64");
+        assert!(!decoded.is_empty());
+
+        let structured = image_structured(&response);
+        assert_eq!(structured["mimeType"], json!("image/png"));
+        assert_eq!(structured["path"], json!("visual.bin"));
+        assert!(
+            structured.get("data").is_none(),
+            "structuredContent must not contain image data"
+        );
+        assert!(
+            !structured.to_string().contains(data),
+            "structuredContent must not duplicate base64 image data"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn read_image_supports_jpeg_and_webp_by_detected_format() {
+        let workspace_root = read_workspace("image-formats");
+        write_test_image(
+            &workspace_root.join("photo.png"),
+            image::ImageFormat::Jpeg,
+            48,
+            24,
+        );
+        write_test_image(
+            &workspace_root.join("texture.jpg"),
+            image::ImageFormat::WebP,
+            40,
+            20,
+        );
+
+        for (path, expected_mime) in [("photo.png", "image/jpeg"), ("texture.jpg", "image/webp")] {
+            let response = read_image_response(
+                &workspace_root,
+                json!({ "path": path }),
+                ToolMode::MultiTools,
+            )
+            .await;
+            assert_eq!(image_content(&response)["mimeType"], json!(expected_mime));
+            assert_eq!(
+                image_structured(&response)["mimeType"],
+                json!(expected_mime)
+            );
+            assert_eq!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                None
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn read_image_is_available_in_read_only_mode() {
+        let workspace_root = read_workspace("image-read-only");
+        write_test_image(
+            &workspace_root.join("safe.png"),
+            image::ImageFormat::Png,
+            32,
+            16,
+        );
+
+        let response = read_image_response(
+            &workspace_root,
+            json!({ "path": "safe.png" }),
+            ToolMode::ReadOnly,
+        )
+        .await;
+        assert_eq!(image_content(&response)["type"], json!("image"));
+        assert_eq!(image_structured(&response)["success"], json!(true));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn read_image_rejects_non_image_missing_file_and_directory() {
+        let workspace_root = read_workspace("image-errors");
+        std::fs::write(workspace_root.join("notes.txt"), "not an image\n")
+            .expect("write non-image");
+        std::fs::create_dir_all(workspace_root.join("folder")).expect("create directory");
+
+        for (arguments, expected) in [
+            (
+                json!({ "path": "notes.txt" }),
+                "Unsupported or invalid image",
+            ),
+            (json!({ "path": "missing.png" }), "File not found"),
+            (json!({ "path": "folder" }), "Not a file"),
+        ] {
+            let response =
+                read_image_response(&workspace_root, arguments, ToolMode::MultiTools).await;
+            assert_eq!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                Some(true)
+            );
+            assert!(
+                result_text(&response).contains(expected),
+                "expected error containing {expected:?}, got {:?}",
+                result_text(&response)
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn read_image_rejects_path_outside_workspace() {
+        let workspace_root = read_workspace("image-outside");
+        let outside_path = workspace_root
+            .parent()
+            .expect("workspace parent")
+            .join(format!("catdesk-outside-{}.png", Uuid::new_v4()));
+        write_test_image(&outside_path, image::ImageFormat::Png, 16, 16);
+
+        let relative = format!(
+            "../{}",
+            outside_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("outside filename")
+        );
+        for path in [relative, outside_path.to_string_lossy().into_owned()] {
+            let response = read_image_response(
+                &workspace_root,
+                json!({ "path": path }),
+                ToolMode::MultiTools,
+            )
+            .await;
+
+            assert_eq!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                Some(true)
+            );
+            assert!(result_text(&response).contains("Path escapes workspace root"));
+        }
+
+        let _ = std::fs::remove_file(outside_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_image_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let workspace_root = read_workspace("image-symlink");
+        let outside_path = workspace_root
+            .parent()
+            .expect("workspace parent")
+            .join(format!("catdesk-symlink-outside-{}.png", Uuid::new_v4()));
+        write_test_image(&outside_path, image::ImageFormat::Png, 16, 16);
+        symlink(&outside_path, workspace_root.join("escape.png")).expect("create symlink");
+
+        let response = read_image_response(
+            &workspace_root,
+            json!({ "path": "escape.png" }),
+            ToolMode::MultiTools,
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("Path escapes workspace root"));
+
+        let _ = std::fs::remove_file(workspace_root.join("escape.png"));
+        let _ = std::fs::remove_file(outside_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn read_image_rejects_oversized_input_before_decoding() {
+        let workspace_root = read_workspace("image-size-limit");
+        let oversized = workspace_root.join("huge.png");
+        let file = std::fs::File::create(&oversized).expect("create oversized file");
+        file.set_len(workspace_tools::MAX_IMAGE_BYTES + 1)
+            .expect("size oversized file");
+
+        let response = read_image_response(
+            &workspace_root,
+            json!({ "path": "huge.png" }),
+            ToolMode::MultiTools,
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("Image is too large"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn read_image_rejects_excessive_requested_dimensions() {
+        let workspace_root = read_workspace("image-output-limit");
+        write_test_image(
+            &workspace_root.join("small.png"),
+            image::ImageFormat::Png,
+            32,
+            32,
+        );
+
+        let response = read_image_response(
+            &workspace_root,
+            json!({
+                "path": "small.png",
+                "max_width": workspace_tools::MAX_IMAGE_OUTPUT_DIMENSION + 1,
+            }),
+            ToolMode::MultiTools,
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("max_width must not exceed"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn read_image_resizes_large_image_and_preserves_aspect_ratio() {
+        let workspace_root = read_workspace("image-resize");
+        write_test_image(
+            &workspace_root.join("portrait.png"),
+            image::ImageFormat::Png,
+            450,
+            1800,
+        );
+
+        let response = read_image_response(
+            &workspace_root,
+            json!({ "path": "portrait.png" }),
+            ToolMode::MultiTools,
+        )
+        .await;
+        let structured = image_structured(&response);
+
+        assert_eq!(structured["originalWidth"], json!(450));
+        assert_eq!(structured["originalHeight"], json!(1800));
+        assert_eq!(structured["width"], json!(400));
+        assert_eq!(structured["height"], json!(1600));
+        assert_eq!(structured["resized"], json!(true));
+        assert_eq!(
+            structured["width"].as_u64().unwrap() * 1800,
+            structured["height"].as_u64().unwrap() * 450
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn read_image_respects_custom_bounds_without_upscaling() {
+        let workspace_root = read_workspace("image-custom-bounds");
+        write_test_image(
+            &workspace_root.join("wide.png"),
+            image::ImageFormat::Png,
+            800,
+            400,
+        );
+        write_test_image(
+            &workspace_root.join("small.png"),
+            image::ImageFormat::Png,
+            120,
+            80,
+        );
+
+        let resized = read_image_response(
+            &workspace_root,
+            json!({ "path": "wide.png", "max_width": 300, "max_height": 300 }),
+            ToolMode::MultiTools,
+        )
+        .await;
+        assert_eq!(image_structured(&resized)["width"], json!(300));
+        assert_eq!(image_structured(&resized)["height"], json!(150));
+        assert_eq!(image_structured(&resized)["resized"], json!(true));
+
+        let unchanged = read_image_response(
+            &workspace_root,
+            json!({ "path": "small.png", "max_width": 1600, "max_height": 1600 }),
+            ToolMode::MultiTools,
+        )
+        .await;
+        assert_eq!(image_structured(&unchanged)["width"], json!(120));
+        assert_eq!(image_structured(&unchanged)["height"], json!(80));
+        assert_eq!(image_structured(&unchanged)["resized"], json!(false));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn read_tool_returns_every_named_file_in_one_call() {
         let workspace_root = read_workspace("batch");
         for (name, body) in [("a.txt", "alpha\n"), ("b.txt", "beta\n")] {
@@ -6893,6 +7416,52 @@ hello world"
                 .and_then(Value::as_array)
                 .map(|domains| domains.len()),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn token_usage_sanitizer_drops_native_image_base64() {
+        let result = json!({
+            "content": [{
+                "type": "image",
+                "data": "aGVsbG8=".repeat(10_000),
+                "mimeType": "image/png",
+            }],
+            "structuredContent": {
+                "toolName": "read_image",
+                "mimeType": "image/png",
+            },
+            "_meta": {
+                WIDGET_PAYLOAD_META_KEY: {
+                    "toolName": "read_image"
+                }
+            }
+        });
+
+        let sanitized = sanitize_result_for_turn_token_count(&result);
+        let image = sanitized
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .expect("missing image content");
+        assert_eq!(image.get("type").and_then(Value::as_str), Some("image"));
+        assert_eq!(
+            image.get("mimeType").and_then(Value::as_str),
+            Some("image/png")
+        );
+        assert!(image.get("data").is_none());
+        assert!(sanitized.get("_meta").is_none());
+
+        let original_data = result
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .and_then(|image| image.get("data"))
+            .and_then(Value::as_str)
+            .expect("original image data missing");
+        assert!(
+            !original_data.is_empty(),
+            "sanitizer must not mutate the source"
         );
     }
 

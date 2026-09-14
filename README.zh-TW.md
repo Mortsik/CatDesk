@@ -193,7 +193,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 
 # 工具
 
-CatDesk 有兩種本機工具模式：`multi-tools` 提供 11 個工具，`read-only` 提供 4 個工具。
+CatDesk 有兩種本機工具模式：`multi-tools` 提供 12 個工具，`read-only` 提供 5 個工具。
 
 在 `multi-tools` 模式下，CatDesk 的本機工具如下：
 
@@ -201,6 +201,7 @@ CatDesk 有兩種本機工具模式：`multi-tools` 提供 11 個工具，`read-
 | ----------------------- | ----- | ------------------------------------------------------------------------ |
 | `catdesk_instruction`   | 指南  | 回傳 CatDesk 使用說明並顯示 Binagotchy                                  |
 | `read`                  | 讀取  | 從 workspace 讀取一個或多個文字檔                                       |
+| `read_image`            | 讀取  | 以原生 MCP 圖像內容讀取 workspace 圖片，供視覺分析使用                  |
 | `search`                | 讀取  | 使用 `rg`、`grep` 或內建搜尋器搜尋 workspace 文字                        |
 | `write`                 | 寫入  | 建立或覆寫檔案                                                           |
 | `edit`                  | 寫入  | 原子化套用受保護的 replace/range 編輯                                   |
@@ -210,6 +211,8 @@ CatDesk 有兩種本機工具模式：`multi-tools` 提供 11 個工具，`read-
 | `start_command`         | Job   | 啟動長時間指令，並立即回傳 job ID                                        |
 | `poll_command`          | Job   | 讀取背景指令的增量輸出與狀態                                             |
 | `cancel_command`        | Job   | 停止背景指令以及其子程序樹                                               |
+
+`read_image` 支援 PNG、JPEG 與 WebP，會依圖片實際格式判斷而不是只相信副檔名，並回傳原生 MCP 圖像內容。圖片必須位於 workspace sandbox 內，輸入上限為 20 MiB / 4,000 萬像素；預設會等比例縮放至 1600×1600 以內且不放大小圖，呼叫端可指定最高 4096 像素的單邊限制。
 
 長時間執行的指令刻意與 MCP HTTP request 的生命週期分離。Build、compile、dependency installation、長時間 test suite 與 development server 應使用 `start_command`，接著以回傳的 cursor 呼叫 `poll_command`。Poll response 有大小限制；如果 `hasMoreOutput` 為 true，即使 job 已經結束，也要持續用 `nextCursor` 輪詢，直到把剩餘輸出讀完。`run_command` 適合較短的指令，而且 timeout 上限為 120 秒。
 
