@@ -193,7 +193,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 
 # Tools
 
-CatDesk has two local tool modes: `multi-tools` exposes 11 tools, and `read-only` exposes 4 tools.
+CatDesk has two local tool modes: `multi-tools` exposes 12 tools, and `read-only` exposes 5 tools.
 
 CatDesk's local tools in `multi-tools` mode are:
 
@@ -201,6 +201,7 @@ CatDesk's local tools in `multi-tools` mode are:
 | --------------------- | ----- | -------------------------------------------------------------------------- |
 | `catdesk_instruction` | Guide | Returns CatDesk usage instructions and render Binagotchy                   |
 | `read`                | Read  | Reads one or more text files from the workspace                            |
+| `read_image`          | Read  | Reads a workspace image as native MCP image content for vision analysis    |
 | `search`              | Read  | Searches workspace text with `rg`, `grep`, or built-in search              |
 | `write`               | Write | Creates or overwrites a file                                               |
 | `edit`                | Write | Applies guarded replace/range edits atomically                             |
@@ -210,6 +211,8 @@ CatDesk's local tools in `multi-tools` mode are:
 | `start_command`       | Job   | Starts a long-running shell command and immediately returns a job ID       |
 | `poll_command`        | Job   | Reads incremental output and status from a background command              |
 | `cancel_command`      | Job   | Stops a background command and its child process tree                      |
+
+`read_image` supports PNG, JPEG, and WebP, detects the actual image format instead of trusting the filename extension, and returns native MCP image content. Images are constrained to the workspace sandbox, limited to 20 MiB / 40 megapixels, and resized to fit 1600×1600 by default without upscaling; callers may request bounds up to 4096 pixels per dimension.
 
 Long-running commands are deliberately decoupled from the lifetime of an MCP HTTP request. Builds, compilation, dependency installation, long test suites, and development servers should use `start_command`, then `poll_command` with the returned cursor. Poll responses are bounded; if `hasMoreOutput` is true, keep polling with `nextCursor` even after the command reaches a terminal state to drain the remaining buffered output. `run_command` remains the simpler path for short commands and has a 120-second maximum timeout.
 
