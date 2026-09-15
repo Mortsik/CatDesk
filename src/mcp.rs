@@ -2239,6 +2239,10 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.computer_enabled() {
         lines.push("Use read to read files and search to search the workspace. Name every file you need in one read call.".to_string());
+        lines.push(
+            "Use read_image instead of read for images (PNG, JPEG, WebP): it returns native image content for visual analysis, detects the format from the file bytes, accepts files up to 20 MiB and 40,000,000 pixels, and proportionally resizes larger images to fit within 1600x1600 unless max_width/max_height say otherwise."
+                .to_string(),
+        );
         let handoff_search_prefix =
             handoff::handoff_search_prefix(workspace_root).map_err(std::io::Error::other)?;
         let handoff_filename =
@@ -5558,6 +5562,29 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn catdesk_instruction_mentions_read_image_for_image_reading() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "catdesk-mcp-instruction-read-image-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let instruction =
+            catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
+                .expect("build instruction");
+        assert!(instruction.contains("read_image"));
+        assert!(instruction.contains("native image content"));
+
+        // read_image is a read-only tool, so the read-only mode instruction
+        // must mention it too, not just the full MultiTools one.
+        let read_only =
+            catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::ReadOnly)
+                .expect("build read-only instruction");
+        assert!(read_only.contains("read_image"));
+    }
+
     fn catdesk_instruction_points_new_sessions_to_library_handoff_search() {
         let workspace_root = std::env::temp_dir().join(format!(
             "catdesk-mcp-handoff-instruction-{}",
