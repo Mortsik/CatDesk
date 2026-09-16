@@ -451,6 +451,13 @@ fn handle_resources_read_with_show_detail_mode(
 // ── tools/list ──────────────────────────────────────────────
 
 fn local_tool_output_schema(name: &str) -> Option<Value> {
+    // Keep read_image as a native multimodal tool result. ChatGPT otherwise
+    // projects the call through outputSchema and only exposes structuredContent,
+    // hiding content[type=image] from the model.
+    if name == "read_image" {
+        return None;
+    }
+
     let mut properties = Map::new();
     properties.insert(
         "toolName".to_string(),
@@ -533,23 +540,6 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                     }
                 }),
             );
-        }
-        "read_image" => {
-            properties.insert("path".to_string(), json!({ "type": "string" }));
-            properties.insert("mimeType".to_string(), json!({ "type": "string" }));
-            for field in [
-                "sizeBytes",
-                "width",
-                "height",
-                "originalWidth",
-                "originalHeight",
-            ] {
-                properties.insert(
-                    field.to_string(),
-                    json!({ "type": "integer", "minimum": 0 }),
-                );
-            }
-            properties.insert("resized".to_string(), json!({ "type": "boolean" }));
         }
         "search" => {
             properties.insert("searchPattern".to_string(), json!({ "type": "string" }));
@@ -4616,7 +4606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_tools_list_exposes_output_schemas() {
+    async fn local_tools_list_exposes_output_schemas_except_multimodal_read_image() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!("req-tools-list")),
@@ -4637,6 +4627,13 @@ mod tests {
                 .get("name")
                 .and_then(Value::as_str)
                 .expect("missing tool name");
+            if name == "read_image" {
+                assert!(
+                    tool.get("outputSchema").is_none(),
+                    "read_image must omit outputSchema so native image content reaches MCP hosts"
+                );
+                continue;
+            }
             let schema = tool
                 .get("outputSchema")
                 .and_then(Value::as_object)
@@ -4667,7 +4664,6 @@ mod tests {
             ("run_command", "stdout"),
             ("catdesk_instruction", "instructionText"),
             ("read", "files"),
-            ("read_image", "mimeType"),
             ("search", "searchResults"),
             ("write", "bytesWritten"),
             ("edit", "operationCount"),
