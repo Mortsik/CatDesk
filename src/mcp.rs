@@ -1933,8 +1933,13 @@ fn image_tool_success_response(
     req: &JsonRpcRequest,
     data: &[u8],
     mime_type: &str,
-    structured: Value,
 ) -> JsonRpcResponse {
+    // ChatGPT's MCP client drops the native image block when a tool result also
+    // carries structuredContent (it projects the result through the metadata
+    // object instead). take_screenshot proves the content-only shape survives
+    // the bridge, so read_image must answer with pure multimodal content and no
+    // structuredContent/outputSchema. Image dimensions are recoverable by the
+    // client from the decoded bytes themselves.
     JsonRpcResponse::success(
         req.id.clone(),
         json!({
@@ -1943,7 +1948,6 @@ fn image_tool_success_response(
                 "data": base64::engine::general_purpose::STANDARD.encode(data),
                 "mimeType": mime_type,
             }],
-            "structuredContent": structured,
         }),
     )
 }
@@ -3492,24 +3496,7 @@ fn handle_read_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespo
     };
 
     match workspace_tools::read_image(workspace_root, path, max_width, max_height) {
-        Ok(output) => {
-            let message = format!("Read image {}", output.path);
-            let mime_type = output.mime_type.clone();
-            let structured = json!({
-                "toolName": "read_image",
-                "path": output.path,
-                "mimeType": mime_type,
-                "sizeBytes": output.size_bytes,
-                "width": output.width,
-                "height": output.height,
-                "originalWidth": output.original_width,
-                "originalHeight": output.original_height,
-                "resized": output.resized,
-                "message": message,
-                "success": true,
-            });
-            image_tool_success_response(req, &output.data, &output.mime_type, structured)
-        }
+        Ok(output) => image_tool_success_response(req, &output.data, &output.mime_type),
         Err(error) => tool_error_response(req, error),
     }
 }
@@ -3931,6 +3918,7 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
     use uuid::Uuid;
 
     fn resources_list_request() -> JsonRpcRequest {
@@ -4028,12 +4016,25 @@ mod tests {
         .await
     }
 
-    fn image_structured(response: &JsonRpcResponse) -> &Value {
-        response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("structuredContent"))
-            .expect("missing structured content")
+    fn decoded_image_dimensions(content: &Value) -> (u32, u32) {
+        let data = content["data"].as_str().expect("missing base64 data");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .expect("valid base64");
+        image::load_from_memory(&bytes)
+            .expect("decodable image")
+            .dimensions()
+    }
+
+    fn assert_no_structured_content(response: &JsonRpcResponse) {
+        assert!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .is_none(),
+            "read_image must answer with pure multimodal content; structuredContent makes ChatGPT drop the image block"
+        );
     }
 
     fn image_content(response: &JsonRpcResponse) -> &Value {
@@ -5558,7 +5559,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn catdesk_instruction_mentions_read_image_for_image_reading() {
         let workspace_root = std::env::temp_dir().join(format!(
             "catdesk-mcp-instruction-read-image-{}",
@@ -5581,6 +5581,7 @@ mod tests {
         assert!(read_only.contains("read_image"));
     }
 
+    #[test]
     fn catdesk_instruction_points_new_sessions_to_library_handoff_search() {
         let workspace_root = std::env::temp_dir().join(format!(
             "catdesk-mcp-handoff-instruction-{}",
@@ -6260,17 +6261,24 @@ mod tests {
             .decode(data)
             .expect("valid base64");
         assert!(!decoded.is_empty());
-
-        let structured = image_structured(&response);
-        assert_eq!(structured["mimeType"], json!("image/png"));
-        assert_eq!(structured["path"], json!("visual.bin"));
-        assert!(
-            structured.get("data").is_none(),
-            "structuredContent must not contain image data"
+        assert_eq!(
+            image::load_from_memory(&decoded)
+                .expect("decodable image")
+                .dimensions(),
+            (64, 32)
         );
+
+        assert_no_structured_content(&response);
         assert!(
-            !structured.to_string().contains(data),
-            "structuredContent must not duplicate base64 image data"
+            !response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("content"))
+                .and_then(Value::as_array)
+                .is_some_and(|content| content
+                    .iter()
+                    .any(|entry| entry.get("type").and_then(Value::as_str) == Some("text"))),
+            "metadata text blocks would be lifted back into structuredContent by the shared tool-result post-processing"
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -6300,10 +6308,7 @@ mod tests {
             )
             .await;
             assert_eq!(image_content(&response)["mimeType"], json!(expected_mime));
-            assert_eq!(
-                image_structured(&response)["mimeType"],
-                json!(expected_mime)
-            );
+            assert_no_structured_content(&response);
             assert_eq!(
                 response
                     .result
@@ -6334,7 +6339,7 @@ mod tests {
         )
         .await;
         assert_eq!(image_content(&response)["type"], json!("image"));
-        assert_eq!(image_structured(&response)["success"], json!(true));
+        assert_no_structured_content(&response);
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
@@ -6522,17 +6527,11 @@ mod tests {
             ToolMode::MultiTools,
         )
         .await;
-        let structured = image_structured(&response);
+        let (width, height) = decoded_image_dimensions(image_content(&response));
 
-        assert_eq!(structured["originalWidth"], json!(450));
-        assert_eq!(structured["originalHeight"], json!(1800));
-        assert_eq!(structured["width"], json!(400));
-        assert_eq!(structured["height"], json!(1600));
-        assert_eq!(structured["resized"], json!(true));
-        assert_eq!(
-            structured["width"].as_u64().unwrap() * 1800,
-            structured["height"].as_u64().unwrap() * 450
-        );
+        assert_eq!((width, height), (400, 1600));
+        assert_eq!(u64::from(width) * 1800, u64::from(height) * 450);
+        assert_no_structured_content(&response);
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
@@ -6559,9 +6558,10 @@ mod tests {
             ToolMode::MultiTools,
         )
         .await;
-        assert_eq!(image_structured(&resized)["width"], json!(300));
-        assert_eq!(image_structured(&resized)["height"], json!(150));
-        assert_eq!(image_structured(&resized)["resized"], json!(true));
+        assert_eq!(
+            decoded_image_dimensions(image_content(&resized)),
+            (300, 150)
+        );
 
         let unchanged = read_image_response(
             &workspace_root,
@@ -6569,9 +6569,11 @@ mod tests {
             ToolMode::MultiTools,
         )
         .await;
-        assert_eq!(image_structured(&unchanged)["width"], json!(120));
-        assert_eq!(image_structured(&unchanged)["height"], json!(80));
-        assert_eq!(image_structured(&unchanged)["resized"], json!(false));
+        // No upscaling: the 120x80 original comes back byte-identical.
+        assert_eq!(
+            decoded_image_dimensions(image_content(&unchanged)),
+            (120, 80)
+        );
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
