@@ -1534,14 +1534,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = run_app(&mut terminal, state.clone()).await;
 
+    diagnostics::event("process_stopping");
+    diagnostics::event("server_stopping");
+
     stdout().execute(DisableBracketedPaste)?;
     stdout().execute(DisableMouseCapture)?;
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
 
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
-    diagnostics::event("process_stopping");
-    diagnostics::event("server_stopping");
     let command_jobs = { state.lock().await.command_jobs.clone() };
     command_jobs.cancel_all().await;
     {

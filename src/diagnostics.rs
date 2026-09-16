@@ -108,7 +108,7 @@ mod tests {
             "/secret-slug/mcp".into(),
             events,
         )
-        .layer(axum::middleware::from_fn_with_state(
+        .route_layer(axum::middleware::from_fn_with_state(
             Some(log.clone()),
             http_request,
         ));
@@ -202,7 +202,7 @@ mod tests {
             .iter()
             .filter(|r| r["event"] == "http_started")
             .collect();
-        assert_eq!(starts.len(), 7);
+        assert_eq!(starts.len(), 6);
         for start in &starts {
             let finishes: Vec<_> = records
                 .iter()
@@ -221,13 +221,6 @@ mod tests {
             .unwrap();
         assert_eq!(finish["status"], 404);
         assert_eq!(finish["rpc_error_code"], -32601);
-        let missing = starts.iter().find(|r| r["route_matched"] == false).unwrap();
-        let missing_end = records
-            .iter()
-            .find(|r| r["event"] == "http_finished" && r["request_id"] == missing["request_id"])
-            .unwrap();
-        assert_eq!(missing_end["status"], 404);
-        assert!(missing_end["rpc_error_code"].is_null());
         assert!(
             records
                 .iter()
@@ -242,6 +235,16 @@ mod tests {
             records
                 .iter()
                 .any(|r| r["status"] == 405 && r["rpc_error_code"] == -32601)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r["event"] == "http_started" && r["route_matched"] == true)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r["event"] == "mcp_request" && r["rpc_method"] == "tools/call")
         );
         assert_eq!(log.active.load(Ordering::Relaxed), 0);
         std::fs::remove_dir_all(root).unwrap();
@@ -285,6 +288,8 @@ pub(crate) struct Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        // Blocking send is intentional: queue is bounded (1024) and we must drain
+        // accepted records; blocks at most until worker consumes one slot.
         let _ = self.log.sender.send(None);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();

@@ -92,7 +92,7 @@ pub fn router(
         .route(&mcp_path, post(post_mcp_http))
         .route(&mcp_path, get(get_mcp))
         .route(&mcp_path, delete(delete_mcp))
-        .layer(axum::middleware::from_fn_with_state(
+        .route_layer(axum::middleware::from_fn_with_state(
             crate::diagnostics::global(),
             crate::diagnostics::http_request,
         ))

@@ -4,7 +4,6 @@ use reqwest::Url;
 
 /// Start an ngrok HTTP tunnel using the embedded Rust SDK.
 pub async fn start(state: SharedState) -> Result<(), String> {
-    crate::diagnostics::event("tunnel_starting");
     let (port, mcp_path) = {
         let app = state.lock().await;
         if app.ngrok_running {
@@ -12,6 +11,7 @@ pub async fn start(state: SharedState) -> Result<(), String> {
         }
         (app.port, app.mcp_path())
     };
+    crate::diagnostics::event("tunnel_starting");
     let authtoken = load_ngrok_authtoken()
         .map_err(|e| format!("Failed to read ~/.catdesk/config.toml: {e}"))?
         .ok_or_else(|| "ngrok authtoken is not configured".to_string())?;

@@ -42,6 +42,8 @@ and `http_finished` entries by generated `request_id`:
 - `route_matched: true`, status 404, `rpc_error_code: -32601`: CatDesk rejected
   an unsupported MCP method. In this version, `initialize` is unsupported;
   discovery uses `server/discover`. This does not mean the ngrok tunnel failed.
+- `route_matched: true`, status 405, `rpc_error_code: -32601`: GET on the MCP
+  path is disabled (SSE mode not supported) — same unsupported-method family.
 - `tunnel_failed` or `tunnel_start_failed`: CatDesk observed a tunnel failure.
 - Status 200, `tool_error: true`, `content_items: 0`: the tool returned an error
   with an empty content array. This version places error details in
