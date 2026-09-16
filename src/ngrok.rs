@@ -11,6 +11,7 @@ pub async fn start(state: SharedState) -> Result<(), String> {
         }
         (app.port, app.mcp_path())
     };
+    crate::diagnostics::event("tunnel_starting");
     let authtoken = load_ngrok_authtoken()
         .map_err(|e| format!("Failed to read ~/.catdesk/config.toml: {e}"))?
         .ok_or_else(|| "ngrok authtoken is not configured".to_string())?;
@@ -39,10 +40,17 @@ pub async fn start(state: SharedState) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to open ngrok tunnel: {e}"))?;
     let url = forwarder.url().to_string();
+    crate::diagnostics::event("tunnel_started");
 
     let state_clone = state.clone();
     let watcher = tokio::spawn(async move {
         let result = forwarder.join().await;
+        crate::diagnostics::event(match &result {
+            Ok(Ok(())) => "tunnel_stopped",
+            Ok(Err(_)) => "tunnel_failed",
+            Err(e) if e.is_cancelled() => "tunnel_cancelled",
+            Err(_) => "tunnel_join_failed",
+        });
         let mut app = state_clone.lock().await;
         match result {
             Ok(Ok(())) => app.log("WARN", "ngrok tunnel exited".into()),

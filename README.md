@@ -44,6 +44,9 @@ That's the idea behind CatDesk! It gives ChatGPT Web tools like `write` and `run
 
 # How does this work?
 
+Connection errors? See [connection diagnostics](docs/connection-diagnostics.md)
+for persistent request metadata, tunnel events, and interpreting HTTP 404 errors.
+
 1. A ChatGPT Plus or above subscription is required.
 2. CatDesk runs as a local MCP server on your computer. It has the ability to run commands and edit files, just like Codex.
 3. You can connect ChatGPT Web to CatDesk using a Custom Connector, which is a feature available only to Plus and Pro users.
