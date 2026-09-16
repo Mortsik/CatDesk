@@ -21,6 +21,7 @@ use crate::state::{
     AgentsPathMode, Mode, ShowDetailMode, TokenStatsLayout, ToolMode, app_config_path,
     load_app_config, user_home_dir,
 };
+use crate::vision;
 use crate::workspace_tools;
 
 const SERVER_NAME: &str = "catdesk";
@@ -968,6 +969,13 @@ async fn handle_tools_list_with_show_detail_mode(
                             workspace_tools::DEFAULT_IMAGE_MAX_HEIGHT,
                             workspace_tools::MAX_IMAGE_OUTPUT_DIMENSION
                         )
+                    },
+                    "analyze": {
+                        "oneOf": [
+                            { "type": "boolean" },
+                            { "type": "string", "minLength": 1 }
+                        ],
+                        "description": "Optionally describe the image with a server-side vision model and return the description as text (structuredContent.analysis.description). true uses a default prompt; a non-empty string is used as the custom prompt. Requires the vision backend to be configured (GEMINI_API_KEY)."
                     }
                 },
                 "required": ["path"]
@@ -1199,7 +1207,7 @@ async fn handle_tools_call_with_show_detail_mode(
             } else {
                 match tool_name.as_str() {
                     "read" => handle_read_files(req, workspace_root),
-                    "read_image" => handle_read_image(req, workspace_root),
+                    "read_image" => handle_read_image(req, workspace_root).await,
                     "search" => handle_search_text(req, workspace_root),
                     "create_handoff" => handle_create_handoff(req, workspace_root),
                     _ => {
@@ -2235,6 +2243,10 @@ Always specify the branch explicitly when using `git push`."#
         lines.push("Use read to read files and search to search the workspace. Name every file you need in one read call.".to_string());
         lines.push(
             "Use read_image instead of read for images (PNG, JPEG, WebP): it returns native image content for visual analysis, detects the format from the file bytes, accepts files up to 20 MiB and 40,000,000 pixels, and proportionally resizes larger images to fit within 1600x1600 unless max_width/max_height say otherwise."
+                .to_string(),
+        );
+        lines.push(
+            "When image content cannot reach your own vision (for example through the ChatGPT connector, which drops image blocks from tool results), pass analyze=true or a custom prompt string to read_image: CatDesk describes the image server-side with a vision model and returns the description as text in structuredContent.analysis.description."
                 .to_string(),
         );
         let handoff_search_prefix =
@@ -3479,7 +3491,7 @@ fn parse_optional_image_dimension(arguments: &Value, name: &str) -> Result<Optio
     Ok(Some(value))
 }
 
-fn handle_read_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+async fn handle_read_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let path = match arguments.get("path").and_then(Value::as_str) {
         Some(path) if !path.is_empty() => path,
@@ -3494,11 +3506,97 @@ fn handle_read_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespo
         Ok(value) => value,
         Err(error) => return tool_error_response(req, error),
     };
+    let analyze_prompt = match parse_optional_analysis_prompt(&arguments) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
 
-    match workspace_tools::read_image(workspace_root, path, max_width, max_height) {
-        Ok(output) => image_tool_success_response(req, &output.data, &output.mime_type),
-        Err(error) => tool_error_response(req, error),
+    let output = match workspace_tools::read_image(workspace_root, path, max_width, max_height) {
+        Ok(output) => output,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    match analyze_prompt {
+        None => image_tool_success_response(req, &output.data, &output.mime_type),
+        Some(prompt) => {
+            let config = match vision::vision_config_from_env() {
+                Ok(config) => config,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let image_base64 = base64::engine::general_purpose::STANDARD.encode(&output.data);
+            let analysis = match vision::analyze_image(
+                &config,
+                prompt
+                    .as_deref()
+                    .unwrap_or(vision::default_analysis_prompt()),
+                &image_base64,
+                &output.mime_type,
+            )
+            .await
+            {
+                Ok(description) => description,
+                Err(error) => return tool_error_response(req, error),
+            };
+            image_tool_analyzed_response(req, &output, &config, analysis)
+        }
     }
+}
+
+/// `analyze` accepts `false`/absent (image only), `true` (default prompt) or a
+/// non-empty custom prompt string. Anything else is a client error.
+fn parse_optional_analysis_prompt(arguments: &Value) -> Result<Option<Option<String>>, String> {
+    match arguments.get("analyze") {
+        None | Some(Value::Bool(false)) => Ok(None),
+        Some(Value::Bool(true)) => Ok(Some(None)),
+        Some(Value::String(prompt)) => {
+            let prompt = prompt.trim();
+            if prompt.is_empty() {
+                return Err("Parameter analyze must not be an empty string".to_string());
+            }
+            Ok(Some(Some(prompt.to_string())))
+        }
+        Some(_) => Err("Parameter analyze must be a boolean or a string".to_string()),
+    }
+}
+
+fn image_tool_analyzed_response(
+    req: &JsonRpcRequest,
+    output: &workspace_tools::ReadImageOutput,
+    config: &vision::VisionConfig,
+    analysis: String,
+) -> JsonRpcResponse {
+    // ChatGPT drops image blocks from tool results but does deliver
+    // structuredContent text to the model, so the vision description travels
+    // in structuredContent while the image stays in content[] for clients
+    // with native multimodal support (Claude, Cline, MCP Inspector).
+    JsonRpcResponse::success(
+        req.id.clone(),
+        json!({
+            "content": [{
+                "type": "image",
+                "data": base64::engine::general_purpose::STANDARD.encode(&output.data),
+                "mimeType": output.mime_type,
+            }],
+            "structuredContent": {
+                "toolName": "read_image",
+                "path": output.path,
+                "mimeType": output.mime_type,
+                "sizeBytes": output.size_bytes,
+                "width": output.width,
+                "height": output.height,
+                "originalWidth": output.original_width,
+                "originalHeight": output.original_height,
+                "resized": output.resized,
+                "analysis": {
+                    "backend": config.backend.as_str(),
+                    "model": config.model,
+                    "description": analysis,
+                },
+                "message": format!("Read image {} (analyzed with {})", output.path, config.model),
+                "success": true,
+            },
+        }),
+    )
 }
 
 fn handle_write_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
@@ -5579,6 +5677,74 @@ mod tests {
             catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::ReadOnly)
                 .expect("build read-only instruction");
         assert!(read_only.contains("read_image"));
+    }
+
+    #[test]
+    fn read_image_analyze_requires_configured_backend() {
+        // Testy biegają równolegle w jednym procesie, a edition 2024 wymaga
+        // jawnego unsafe dla mutacji env. Mutex serializuje ten test; żaden
+        // inny test nie czyta tych zmiennych, więc mutacja jest izolowana.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::remove_var("GEMINI_API_KEY");
+            std::env::remove_var("CATDESK_GEMINI_API_KEY");
+        }
+
+        let workspace_root = read_workspace("image-analyze-unconfigured");
+        write_test_image(
+            &workspace_root.join("pic.png"),
+            image::ImageFormat::Png,
+            16,
+            8,
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let response = runtime.block_on(read_image_response(
+            &workspace_root,
+            json!({ "path": "pic.png", "analyze": true }),
+            ToolMode::MultiTools,
+        ));
+
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let text = result_text(&response);
+        assert!(
+            text.contains("Vision analysis is not configured"),
+            "unexpected error text: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn read_image_analyze_rejects_non_boolean_or_string_values() {
+        let workspace_root = read_workspace("image-analyze-bad-param");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+
+        let response = read_image_response(
+            &workspace_root,
+            json!({ "path": "pic.png", "analyze": 123 }),
+            ToolMode::MultiTools,
+        )
+        .await;
+        let text = result_text(&response);
+        assert!(
+            text.contains("analyze must be a boolean or a string"),
+            "unexpected error text: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[test]

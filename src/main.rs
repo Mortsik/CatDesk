@@ -17,6 +17,7 @@ mod server;
 mod startup;
 mod state;
 mod theme;
+mod vision;
 mod workspace_tools;
 
 use crossterm::{
