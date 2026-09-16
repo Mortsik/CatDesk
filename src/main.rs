@@ -1481,7 +1481,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _diagnostics_guard = match diagnostics::init(&diagnostics_dir) {
         Ok(guard) => Some(guard),
         Err(_) => {
-            eprintln!("CatDesk: connection diagnostics unavailable (log directory unwritable or in use)");
+            eprintln!(
+                "CatDesk: connection diagnostics unavailable (log directory unwritable or in use)"
+            );
             None
         }
     };
@@ -1539,6 +1541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
     diagnostics::event("process_stopping");
+    diagnostics::event("server_stopping");
     let command_jobs = { state.lock().await.command_jobs.clone() };
     command_jobs.cancel_all().await;
     {

@@ -141,6 +141,15 @@ mod tests {
         );
         assert_eq!(
             client
+                .get(format!("{base}/secret-slug/mcp"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            405
+        );
+        assert_eq!(
+            client
                 .get(format!("{base}/secret-wrong-slug/mcp"))
                 .send()
                 .await
@@ -193,7 +202,7 @@ mod tests {
             .iter()
             .filter(|r| r["event"] == "http_started")
             .collect();
-        assert_eq!(starts.len(), 6);
+        assert_eq!(starts.len(), 7);
         for start in &starts {
             let finishes: Vec<_> = records
                 .iter()
@@ -228,6 +237,11 @@ mod tests {
             records
                 .iter()
                 .any(|r| r["status"] == 200 && r["tool_error"] == true && r["content_items"] == 0)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r["status"] == 405 && r["rpc_error_code"] == -32601)
         );
         assert_eq!(log.active.load(Ordering::Relaxed), 0);
         std::fs::remove_dir_all(root).unwrap();

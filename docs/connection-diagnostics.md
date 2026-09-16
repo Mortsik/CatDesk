@@ -28,7 +28,9 @@ The disk writer runs on a separate thread with a bounded queue. When saturated,
 requests continue and records are dropped; `dropped_records` on a later record
 reports that loss. A write failure disables the writer and prints a warning.
 Normal shutdown drains accepted records; abrupt termination can lose queued
-records. This is diagnostic logging, not a durable transaction journal.
+records. Shutdown aborts the HTTP server first (`server_stopping`), so in-flight
+requests may end as `http_cancelled` and records accepted after `process_stopping`
+are best-effort. This is diagnostic logging, not a durable transaction journal.
 
 ## Investigating a reported 404
 

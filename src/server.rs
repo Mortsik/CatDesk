@@ -3152,7 +3152,10 @@ async fn post_mcp_inner(
         if let Some(result) = response_json.get("result") {
             builder = builder.extension(crate::diagnostics::ToolResult {
                 is_error: result.get("isError").and_then(Value::as_bool),
-                content_items: result.get("content").and_then(Value::as_array).map(Vec::len),
+                content_items: result
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(Vec::len),
             });
         }
     }
@@ -3168,6 +3171,7 @@ async fn post_mcp_inner(
 async fn get_mcp() -> Response<Body> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
+        .extension(crate::diagnostics::RpcError(-32601))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
             r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"GET SSE stream is disabled in pure HTTP mode"}}"#,
