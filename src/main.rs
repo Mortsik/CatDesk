@@ -4,6 +4,7 @@ mod change_tracking;
 mod command;
 mod command_jobs;
 mod devtools;
+mod diagnostics;
 mod handoff;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
@@ -1476,6 +1477,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => std::env::current_dir()?.to_string_lossy().into_owned(),
     };
 
+    let diagnostics_dir = user_home_dir()?.join(".catdesk").join("logs");
+    let _diagnostics_guard = match diagnostics::init(&diagnostics_dir) {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            eprintln!("CatDesk: connection diagnostics unavailable (log directory unwritable or in use)");
+            None
+        }
+    };
     let state: SharedState = Arc::new(Mutex::new(AppState::new(port, workspace_root)?));
     {
         let mut app = state.lock().await;
@@ -1529,6 +1538,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdout().execute(LeaveAlternateScreen)?;
 
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
+    diagnostics::event("process_stopping");
     let command_jobs = { state.lock().await.command_jobs.clone() };
     command_jobs.cancel_all().await;
     {
@@ -4761,6 +4771,7 @@ async fn start_services(
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
         Ok(l) => l,
         Err(e) => {
+            diagnostics::event("server_bind_failed");
             state
                 .lock()
                 .await
@@ -4770,7 +4781,11 @@ async fn start_services(
     };
 
     let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        diagnostics::event("server_started");
+        match axum::serve(listener, router).await {
+            Ok(()) => diagnostics::event("server_stopped"),
+            Err(_) => diagnostics::event("server_failed"),
+        }
     });
 
     {
@@ -4782,6 +4797,7 @@ async fn start_services(
 
     // Start ngrok
     if let Err(e) = ngrok::start(state.clone()).await {
+        diagnostics::event("tunnel_start_failed");
         state.lock().await.log("ERROR", format!("ngrok: {e}"));
     }
 

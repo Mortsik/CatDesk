@@ -4,6 +4,7 @@ use reqwest::Url;
 
 /// Start an ngrok HTTP tunnel using the embedded Rust SDK.
 pub async fn start(state: SharedState) -> Result<(), String> {
+    crate::diagnostics::event("tunnel_starting");
     let (port, mcp_path) = {
         let app = state.lock().await;
         if app.ngrok_running {
@@ -39,10 +40,17 @@ pub async fn start(state: SharedState) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to open ngrok tunnel: {e}"))?;
     let url = forwarder.url().to_string();
+    crate::diagnostics::event("tunnel_started");
 
     let state_clone = state.clone();
     let watcher = tokio::spawn(async move {
         let result = forwarder.join().await;
+        crate::diagnostics::event(match &result {
+            Ok(Ok(())) => "tunnel_stopped",
+            Ok(Err(_)) => "tunnel_failed",
+            Err(e) if e.is_cancelled() => "tunnel_cancelled",
+            Err(_) => "tunnel_join_failed",
+        });
         let mut app = state_clone.lock().await;
         match result {
             Ok(Ok(())) => app.log("WARN", "ngrok tunnel exited".into()),

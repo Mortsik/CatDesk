@@ -92,6 +92,10 @@ pub fn router(
         .route(&mcp_path, post(post_mcp_http))
         .route(&mcp_path, get(get_mcp))
         .route(&mcp_path, delete(delete_mcp))
+        .layer(axum::middleware::from_fn_with_state(
+            crate::diagnostics::global(),
+            crate::diagnostics::http_request,
+        ))
         .with_state(state)
 }
 
@@ -119,6 +123,7 @@ fn jsonrpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response<
     .unwrap();
     Response::builder()
         .status(status)
+        .extension(crate::diagnostics::RpcError(code))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap()
@@ -142,6 +147,7 @@ fn modern_jsonrpc_error_response(
     });
     Response::builder()
         .status(status)
+        .extension(crate::diagnostics::RpcError(code))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -2898,6 +2904,7 @@ async fn post_mcp_inner(
         );
     }
 
+    crate::diagnostics::rpc_request(&body);
     let _ = s.ui_events.send(ServerUiEvent::IncrementRequestCount);
     let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(true));
 
@@ -3133,7 +3140,23 @@ async fn post_mcp_inner(
     };
     let response_body = serde_json::to_string(&response_json).unwrap();
 
-    Response::builder()
+    let mut builder = Response::builder();
+    if let Some(code) = response_json
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_i64)
+    {
+        builder = builder.extension(crate::diagnostics::RpcError(code));
+    }
+    if req.method == "tools/call" {
+        if let Some(result) = response_json.get("result") {
+            builder = builder.extension(crate::diagnostics::ToolResult {
+                is_error: result.get("isError").and_then(Value::as_bool),
+                content_items: result.get("content").and_then(Value::as_array).map(Vec::len),
+            });
+        }
+    }
+    builder
         .status(response_status)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(response_body))
