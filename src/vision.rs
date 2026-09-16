@@ -10,7 +10,9 @@
 
 use serde_json::{Value, json};
 
-const DEFAULT_GEMINI_MODEL: &str = "gemini-3.8-flash";
+// gemini-3-flash ma na free tierze zaledwie 20 requestów/dzień (429 po chwilę);
+// 3.5-flash działa i ma hojniejszy limit. Nadpisywalne przez CATDESK_VISION_MODEL.
+const DEFAULT_GEMINI_MODEL: &str = "gemini-3.5-flash";
 const DEFAULT_ANALYSIS_PROMPT: &str = "Describe what this image shows in detail. \
 Include the subject, layout, colors, any visible text verbatim, and anything \
 notable about the composition.";
@@ -106,6 +108,10 @@ pub async fn analyze_image(
     }
 }
 
+const GEMINI_INTERACTIONS_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/interactions";
+const GEMINI_HTTP_TIMEOUT_SECS: u64 = 55;
+
 async fn gemini_analyze(
     config: &VisionConfig,
     prompt: &str,
@@ -119,28 +125,19 @@ async fn gemini_analyze(
             { "type": "image", "data": image_base64, "mime_type": mime_type },
         ],
     });
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("Failed to build vision HTTP client: {e}"))?;
-    let response = client
-        .post("https://generativelanguage.googleapis.com/v1beta/interactions")
-        .header("x-goog-api-key", &config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Vision backend request failed: {e}"))?;
-    let status = response.status();
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Vision backend returned a non-JSON body ({status}): {e}"))?;
-    if !status.is_success() {
+    let raw = gemini_http_post(GEMINI_INTERACTIONS_URL, &config.api_key, &body).await?;
+    let (http_status, payload) = split_status_marker(&raw)?;
+    let payload: Value = serde_json::from_str(&payload).map_err(|e| {
+        format!("Vision backend returned a non-JSON body (HTTP {http_status}): {e}")
+    })?;
+    if !(200..300).contains(&http_status) {
         let message = payload
             .pointer("/error/message")
             .and_then(Value::as_str)
             .unwrap_or("unknown error");
-        return Err(format!("Vision backend error (HTTP {status}): {message}"));
+        return Err(format!(
+            "Vision backend error (HTTP {http_status}): {message}"
+        ));
     }
     if payload.get("status").and_then(Value::as_str) != Some("completed") {
         let interaction_status = payload
@@ -152,6 +149,81 @@ async fn gemini_analyze(
         ));
     }
     extract_gemini_text(&payload)
+}
+
+/// Gemini Interactions API przez subprocess curl, NIE reqwest.
+/// DLACZEGO: z wnętrza procesu catdesk (WSL2, mirrored networking) żądanie
+/// HTTPS do generativelanguage.googleapis.com przez reqwest po zestawieniu TCP
+/// wisi bez odpowiedzi aż do timeoutu — podczas gdy ten sam stack z osobnego
+/// procesu odpowiada w <0.3 s (examples/probe_gemini). Systemowy curl omija
+/// ten quirk niezawodnie, więc jest deliberate zależnością runtime tego modułu.
+async fn gemini_http_post(url: &str, api_key: &str, body: &Value) -> Result<String, String> {
+    let status_marker = "__CATDESK_HTTP_STATUS__";
+    let body_str = serde_json::to_string(body)
+        .map_err(|e| format!("Failed to serialize vision request: {e}"))?;
+    let mut command = tokio::process::Command::new("curl");
+    command
+        .args([
+            "-sS",
+            "--max-time",
+            &GEMINI_HTTP_TIMEOUT_SECS.to_string(),
+            "-X",
+            "POST",
+            url,
+            "-H",
+            &format!("x-goog-api-key: {api_key}"),
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+            "-w",
+            &format!("\n{status_marker}%{{http_code}}"),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Failed to spawn curl for vision backend: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(body_str.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to send vision request body to curl: {e}"))?;
+        stdin
+            .shutdown()
+            .await
+            .map_err(|e| format!("Failed to close curl stdin: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("Vision backend curl failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Vision backend curl failed (exit {:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.into_owned())
+}
+
+/// Splits the `-w` status marker appended by gemini_http_post into
+/// (http_status, raw JSON body).
+fn split_status_marker(raw: &str) -> Result<(u16, String), String> {
+    const STATUS_MARKER: &str = "__CATDESK_HTTP_STATUS__";
+    let (payload, status) = raw
+        .rsplit_once(&format!("\n{STATUS_MARKER}"))
+        .ok_or_else(|| "Vision backend response is missing the HTTP status marker".to_string())?;
+    let http_status: u16 = status
+        .trim()
+        .parse()
+        .map_err(|e| format!("Vision backend returned an invalid HTTP status: {e}"))?;
+    Ok((http_status, payload.to_string()))
 }
 
 /// Answer path per the Interactions API schema: steps[type=model_output]
