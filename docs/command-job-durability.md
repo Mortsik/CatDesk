@@ -133,11 +133,13 @@ as empty.
 
 ## Manager construction
 
-`CommandJobManager` gains an optional store directory. `new()` keeps its
-signature and resolves `~/.catdesk/jobs`; a new constructor accepts an
-explicit path so tests can use a temp dir. Both run recovery once, at
-construction. Existing call sites in `server.rs` are unchanged; new and
-existing tests construct managers with temp-dir stores.
+`CommandJobManager::new()` (and `Default`) keeps today's behavior: an
+in-memory-only manager with a disabled store, so the ~60 existing test
+call sites stay hermetic without a sweep. Persistence and recovery opt in
+explicitly: `CommandJobManager::with_store(dir)` opens the store, runs
+recovery once at construction, and is used by the single production
+construction site in `main.rs` with `~/.catdesk/jobs` (resolved via
+`user_home_dir()`; a missing home directory falls back to `new()`).
 
 ## MCP surface
 
