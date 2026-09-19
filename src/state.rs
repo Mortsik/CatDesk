@@ -733,13 +733,11 @@ pub(crate) fn parse_seed_hex(seed: &str) -> std::io::Result<u64> {
 }
 
 fn now_hms() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let h = (secs % 86400) / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
+    let now =
+        time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let h = now.hour();
+    let m = now.minute();
+    let s = now.second();
     format!("{h:02}:{m:02}:{s:02}")
 }
 
@@ -1376,6 +1374,47 @@ mod tests {
             app.logs
                 .windows(2)
                 .all(|pair| pair[0].id.saturating_add(1) == pair[1].id)
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn log_timestamps_use_local_time_of_day() {
+        let (mut app, workspace, config_path) = test_app("catdesk-log-local-time");
+
+        app.log("INFO", "timestamp check".to_string());
+
+        let entry = app.logs.last().expect("log entry");
+        let mut parts = entry.time.split(':');
+        let h = parts.next().and_then(|p| p.parse::<u64>().ok()).expect("hour");
+        let m = parts
+            .next()
+            .and_then(|p| p.parse::<u64>().ok())
+            .expect("minute");
+        let s = parts
+            .next()
+            .and_then(|p| p.parse::<u64>().ok())
+            .expect("second");
+        assert!(
+            parts.next().is_none(),
+            "expected HH:MM:SS, got {}",
+            entry.time
+        );
+
+        let now = time::OffsetDateTime::now_local()
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let local_secs = u64::from(now.hour()) * 3600
+            + u64::from(now.minute()) * 60
+            + u64::from(now.second());
+        let entry_secs = h * 3600 + m * 60 + s;
+        let delta = (local_secs + 86400 - entry_secs) % 86400;
+        assert!(
+            delta <= 5,
+            "log time {} is {}s off local time-of-day",
+            entry.time,
+            delta
         );
 
         let _ = std::fs::remove_file(config_path);
