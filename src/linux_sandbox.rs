@@ -103,6 +103,38 @@ fn runtime_read_paths() -> BTreeSet<PathBuf> {
         insert_ssh_read_paths(&mut paths, &home);
     }
 
+    // Playwright browsers (A2): default cache lives under ~/.cache and is
+    // otherwise absent from the namespace, so sandboxed run_command cannot
+    // see browsers installed on the host. Bind explicitly, mirroring
+    // Playwright resolution order: $PLAYWRIGHT_BROWSERS_PATH >
+    // $XDG_CACHE_HOME/ms-playwright > ~/.cache/ms-playwright.
+    // insert_* only keeps canonicalizable (existing) paths; --ro-bind-try
+    // skips the rest, so a missing cache is safe. Empty values are skipped:
+    // an empty XDG_CACHE_HOME would otherwise resolve to the cwd-relative
+    // "ms-playwright". HOME itself stays unbound
+    // (see runtime_read_paths_do_not_grant_the_home_directory_itself).
+    if let Some(browsers) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH")
+        && !browsers.is_empty()
+    {
+        insert_existing(&mut paths, PathBuf::from(browsers));
+    }
+    if let Some(xdg_cache) = std::env::var_os("XDG_CACHE_HOME")
+        && !xdg_cache.is_empty()
+    {
+        insert_existing(
+            &mut paths,
+            PathBuf::from(xdg_cache).join("ms-playwright"),
+        );
+    }
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+    {
+        insert_existing(
+            &mut paths,
+            PathBuf::from(home).join(".cache/ms-playwright"),
+        );
+    }
+
     paths
 }
 
@@ -290,8 +322,77 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
+    /// Serializes tests that read or mutate the process-global env consumed
+    /// by `runtime_read_paths` (cargo runs tests in threads, so an env
+    /// mutation in one test would otherwise leak into a concurrent reader).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Locks `ENV_LOCK`, tolerating poisoning: a test that fails while
+    /// holding the lock must not cascade into every other env test.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Scoped env overrides: sets the given vars for the test body, holds
+    /// `ENV_LOCK` for the whole scope, and restores previous values on drop
+    /// (including on panic). One lock acquisition per scope, so multi-var
+    /// tests must go through a single `set_many` call (std Mutex is not
+    /// reentrant).
+    struct EnvGuards {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuards {
+        fn set_many(pairs: &[(&'static str, &Path)]) -> Self {
+            let guard = env_lock();
+            // Snapshot every previous value before mutating anything, so a
+            // mid-loop panic cannot leave an earlier var unrestored.
+            let prev: Vec<(&'static str, Option<std::ffi::OsString>)> = pairs
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(*name)))
+                .collect();
+            for (name, value) in pairs {
+                // SAFETY: ENV_LOCK serializes all in-process env readers and
+                // writers in this test module; no other thread observes the
+                // swap. Restore happens in Drop while still holding the lock.
+                unsafe { std::env::set_var(*name, *value) };
+            }
+            Self {
+                prev,
+                _guard: guard,
+            }
+        }
+
+        fn set(name: &'static str, value: &Path) -> Self {
+            Self::set_many(&[(name, value)])
+        }
+
+        /// Read-only env tests go through here so every env access in this
+        /// module holds the lock via a single entry point (std Mutex is not
+        /// reentrant — never nest `read`/`set`/`set_many`).
+        fn read() -> Self {
+            Self::set_many(&[])
+        }
+    }
+
+    impl Drop for EnvGuards {
+        fn drop(&mut self) {
+            // Reverse order so duplicate keys restore to the original value.
+            for (name, value) in self.prev.iter().rev() {
+                // SAFETY: same serialization as in `set_many`; Drop runs
+                // before `_guard` is released.
+                match value {
+                    Some(value) => unsafe { std::env::set_var(*name, value) },
+                    None => unsafe { std::env::remove_var(*name) },
+                }
+            }
+        }
+    }
+
     #[test]
     fn runtime_read_paths_include_resolv_conf_target() {
+        let _env = EnvGuards::read();
         let resolv_conf = Path::new("/etc/resolv.conf")
             .canonicalize()
             .expect("canonical /etc/resolv.conf");
@@ -300,6 +401,7 @@ mod tests {
 
     #[test]
     fn runtime_read_paths_include_ssh_known_hosts_target() {
+        let _env = EnvGuards::read();
         let Some(home) = std::env::var_os("HOME") else {
             return;
         };
@@ -354,6 +456,7 @@ mod tests {
 
     #[test]
     fn runtime_read_paths_do_not_grant_the_home_directory_itself() {
+        let _env = EnvGuards::read();
         let Some(home) = std::env::var_os("HOME") else {
             return;
         };
@@ -362,8 +465,62 @@ mod tests {
     }
 
     #[test]
+    fn runtime_read_paths_include_playwright_browsers_path() {
+        let tree = TempTree::new();
+        let browsers = tree.path().join("browsers");
+        std::fs::create_dir_all(&browsers).expect("create browsers dir");
+        let canonical = browsers.canonicalize().expect("canonical browsers");
+        let _env = EnvGuards::set("PLAYWRIGHT_BROWSERS_PATH", &canonical);
+        assert!(runtime_read_paths().contains(&canonical));
+    }
+
+    #[test]
+    fn runtime_read_paths_include_xdg_playwright_cache() {
+        let tree = TempTree::new();
+        let cache = tree.path().join("xdg-cache").join("ms-playwright");
+        std::fs::create_dir_all(&cache).expect("create xdg cache dir");
+        let canonical = cache.canonicalize().expect("canonical xdg cache");
+        let _env = EnvGuards::set("XDG_CACHE_HOME", &tree.path().join("xdg-cache"));
+        assert!(runtime_read_paths().contains(&canonical));
+    }
+
+    #[test]
+    fn runtime_read_paths_include_default_playwright_cache() {
+        let tree = TempTree::new();
+        let cache = tree.path().join("home").join(".cache/ms-playwright");
+        std::fs::create_dir_all(&cache).expect("create default cache dir");
+        let canonical = cache.canonicalize().expect("canonical default cache");
+        let _env = EnvGuards::set("HOME", &tree.path().join("home"));
+        assert!(runtime_read_paths().contains(&canonical));
+    }
+
+    #[test]
+    fn runtime_read_paths_skip_missing_playwright_dirs() {
+        let tree = TempTree::new();
+        let missing = tree.path().join("does-not-exist");
+        let empty_home = tree.path().join("empty-home");
+        std::fs::create_dir_all(&empty_home).expect("create empty home");
+        let _env = EnvGuards::set_many(&[
+            ("PLAYWRIGHT_BROWSERS_PATH", &missing),
+            ("XDG_CACHE_HOME", &missing),
+            ("HOME", &empty_home),
+        ]);
+        let paths = runtime_read_paths();
+        assert!(!paths.contains(&missing));
+        assert!(!paths.contains(&missing.join("ms-playwright")));
+        // Prefix-absence: no bound path may live under the temp home at all,
+        // so a bug inserting the wrong child there still goes red. Compare
+        // canonical against canonical — TempTree may sit under a symlinked
+        // TMPDIR, where a literal prefix would miss real escapes.
+        let empty_home = empty_home.canonicalize().expect("canonical home");
+        assert!(!paths.contains(&empty_home));
+        assert!(paths.iter().all(|path| !path.starts_with(&empty_home)));
+    }
+
+    #[test]
     fn helper_command_creates_private_scratch_directory() {
         use std::os::unix::fs::PermissionsExt;
+        let _env = EnvGuards::read();
 
         // bwrap may not be installed in every environment. helper_command
         // reports that rather than returning a command, so there is nothing to
@@ -385,6 +542,7 @@ mod tests {
 
     #[test]
     fn bubblewrap_command_chdirs_to_cwd_and_uses_new_session() {
+        let _env = EnvGuards::read();
         let tree = TempTree::new();
         let workspace = tree.path().join("workspace");
         let cwd = workspace.join("src");
