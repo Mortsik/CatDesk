@@ -2911,7 +2911,7 @@ async fn post_mcp_http(
     }
     let id = metadata.and_then(|v| v.get("id").cloned());
     static WORKERS: std::sync::LazyLock<crate::request_workers::RequestWorkers> =
-        std::sync::LazyLock::new(|| crate::request_workers::RequestWorkers::new(4));
+        std::sync::LazyLock::new(|| crate::request_workers::RequestWorkers::new(12));
     match WORKERS.run(async move {
         post_mcp_inner(State(s), body_bytes, &headers, None).await
     }, std::time::Duration::from_secs(180)).await {

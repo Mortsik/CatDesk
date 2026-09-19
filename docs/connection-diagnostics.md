@@ -65,7 +65,7 @@ New logging starts only after restarting CatDesk with the updated binary.
 ## Stalls, busy responses and memory
 
 Synchronous tool and filesystem operations run outside the async network
-workers. At most four HTTP operations occupy this pool; excess requests return
+workers. At most twelve HTTP operations occupy this pool; excess requests return
 503 with `request_workers_busy`. A request that exceeds its 180-second response
 deadline returns 504 with `request_worker_timeout`. The worker continues to own
 its slot until the operation actually ends, including after client disconnection.
