@@ -360,7 +360,22 @@ fn terminate_process_tree(_pid: u32) {}
 
 struct PreparedShellCommand {
     command: Command,
+    cwd: PathBuf,
     cleanup_dir: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_sandbox_command(
+    command: &str,
+    workspace_root: &Path,
+    cwd: &Path,
+) -> io::Result<PreparedShellCommand> {
+    let (helper, scratch_dir) = crate::linux_sandbox::helper_command(command, workspace_root, cwd)?;
+    Ok(PreparedShellCommand {
+        command: Command::from(helper),
+        cwd: cwd.to_path_buf(),
+        cleanup_dir: Some(scratch_dir),
+    })
 }
 
 fn shell_command(
@@ -383,6 +398,7 @@ fn shell_command(
             .arg(command);
         Ok(PreparedShellCommand {
             command: shell,
+            cwd: cwd.to_path_buf(),
             cleanup_dir: None,
         })
     }
@@ -395,18 +411,14 @@ fn shell_command(
         shell.arg("-c").arg(command);
         Ok(PreparedShellCommand {
             command: shell,
+            cwd: cwd.to_path_buf(),
             cleanup_dir: None,
         })
     }
 
     #[cfg(all(target_os = "linux", not(test)))]
     {
-        let (helper, scratch_dir) =
-            crate::linux_sandbox::helper_command(command, workspace_root, cwd)?;
-        Ok(PreparedShellCommand {
-            command: Command::from(helper),
-            cleanup_dir: Some(scratch_dir),
-        })
+        prepare_linux_sandbox_command(command, workspace_root, cwd)
     }
 
     #[cfg(all(target_os = "linux", test))]
@@ -417,21 +429,18 @@ fn shell_command(
         shell.arg("-c").arg(command);
         Ok(PreparedShellCommand {
             command: shell,
+            cwd: cwd.to_path_buf(),
             cleanup_dir: None,
         })
     }
 }
 
-fn spawn_shell_command_blocking(
-    command: &str,
-    workspace_root: &Path,
-    cwd: &Path,
-) -> io::Result<SpawnedProcess> {
-    let prepared = shell_command(command, workspace_root, cwd)?;
+fn spawn_prepared_shell_command(prepared: PreparedShellCommand) -> io::Result<SpawnedProcess> {
     let mut shell = prepared.command;
+    let cwd = prepared.cwd;
     let mut cleanup_dir = prepared.cleanup_dir;
     shell
-        .current_dir(cwd)
+        .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -508,19 +517,83 @@ fn spawn_shell_command_blocking(
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn spawn_shell_command_blocking(
+    command: &str,
+    workspace_root: &Path,
+    cwd: &Path,
+) -> io::Result<SpawnedProcess> {
+    spawn_prepared_shell_command(shell_command(command, workspace_root, cwd)?)
+}
+
+#[cfg(target_os = "linux")]
+async fn prepare_linux_command_async(
+    command: String,
+    workspace_root: PathBuf,
+    cwd: PathBuf,
+    force_sandbox: bool,
+) -> io::Result<PreparedShellCommand> {
+    tokio::task::spawn_blocking(move || {
+        if force_sandbox {
+            prepare_linux_sandbox_command(&command, &workspace_root, &cwd)
+        } else {
+            shell_command(&command, &workspace_root, &cwd)
+        }
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("command preparation task failed: {error}")))?
+}
+
+#[cfg(all(target_os = "linux", test))]
+async fn spawn_linux_sandboxed_for_test(
+    command: &str,
+    workspace_root: &Path,
+    cwd: &Path,
+) -> io::Result<SpawnedProcess> {
+    let prepared = prepare_linux_command_async(
+        command.to_owned(),
+        workspace_root.to_path_buf(),
+        cwd.to_path_buf(),
+        true,
+    )
+    .await?;
+    // bwrap --die-with-parent must be spawned by a runtime worker that lives
+    // for the runtime lifetime, never by a transient spawn_blocking thread.
+    spawn_prepared_shell_command(prepared)
+}
+
 pub async fn spawn_shell_command(
     command: &str,
     workspace_root: &Path,
     cwd: &Path,
 ) -> io::Result<SpawnedProcess> {
-    let command = command.to_owned();
-    let workspace_root = workspace_root.to_path_buf();
-    let cwd = cwd.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        spawn_shell_command_blocking(&command, &workspace_root, &cwd)
-    })
-    .await
-    .map_err(|error| io::Error::other(format!("command spawn task failed: {error}")))?
+    #[cfg(target_os = "linux")]
+    {
+        let prepared = prepare_linux_command_async(
+            command.to_owned(),
+            workspace_root.to_path_buf(),
+            cwd.to_path_buf(),
+            false,
+        )
+        .await?;
+        // On Linux the prepared command is bwrap --die-with-parent in
+        // production. Spawn it on a long-lived runtime worker: spawning it in
+        // spawn_blocking makes bwrap inherit an ephemeral parent thread and it
+        // receives SIGKILL when Tokio retires that thread.
+        return spawn_prepared_shell_command(prepared);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let command = command.to_owned();
+        let workspace_root = workspace_root.to_path_buf();
+        let cwd = cwd.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            spawn_shell_command_blocking(&command, &workspace_root, &cwd)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("command spawn task failed: {error}")))?
+    }
 }
 
 #[derive(Debug)]
@@ -764,6 +837,34 @@ mod tests {
             captured.read_error.as_deref(),
             Some("synthetic read failure")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_sandboxed_process_survives_blocking_pool_thread_retirement() {
+        let root = workspace("sandbox-parent-lifetime");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .thread_keep_alive(Duration::from_millis(100))
+            .enable_all()
+            .build()
+            .expect("build isolated runtime");
+
+        runtime.block_on(async {
+            let mut process = spawn_linux_sandboxed_for_test("sleep 2", &root, &root)
+                .await
+                .expect("spawn sandboxed command");
+            let premature = timeout(Duration::from_millis(350), process.wait()).await;
+            assert!(
+                premature.is_err(),
+                "bwrap died when the transient blocking-pool thread retired: {premature:?}"
+            );
+            process.terminate_tree().await;
+            let _ = process.wait().await;
+        });
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
