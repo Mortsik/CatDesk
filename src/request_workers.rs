@@ -56,6 +56,96 @@ impl RequestWorkers {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestClass {
+    Control,
+    Filesystem,
+    Process,
+    Browser,
+    General,
+}
+
+impl RequestClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Filesystem => "filesystem",
+            Self::Process => "process",
+            Self::Browser => "browser",
+            Self::General => "general",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RequestLimits {
+    control: usize,
+    filesystem: usize,
+    process: usize,
+    browser: usize,
+    general: usize,
+}
+
+impl Default for RequestLimits {
+    fn default() -> Self {
+        Self {
+            control: 8,
+            filesystem: 16,
+            process: 12,
+            browser: 4,
+            general: 8,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RequestScheduler {
+    control: RequestWorkers,
+    filesystem: RequestWorkers,
+    process: RequestWorkers,
+    browser: RequestWorkers,
+    general: RequestWorkers,
+}
+
+impl RequestScheduler {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(RequestLimits::default())
+    }
+
+    fn with_limits(limits: RequestLimits) -> Self {
+        Self {
+            control: RequestWorkers::new(limits.control),
+            filesystem: RequestWorkers::new(limits.filesystem),
+            process: RequestWorkers::new(limits.process),
+            browser: RequestWorkers::new(limits.browser),
+            general: RequestWorkers::new(limits.general),
+        }
+    }
+
+    fn workers(&self, class: RequestClass) -> &RequestWorkers {
+        match class {
+            RequestClass::Control => &self.control,
+            RequestClass::Filesystem => &self.filesystem,
+            RequestClass::Process => &self.process,
+            RequestClass::Browser => &self.browser,
+            RequestClass::General => &self.general,
+        }
+    }
+
+    pub(crate) async fn run<F>(
+        &self,
+        class: RequestClass,
+        work: F,
+        deadline: Duration,
+    ) -> Result<F::Output, RequestFailure>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.workers(class).run(work, deadline).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +242,54 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn saturated_filesystem_pool_does_not_starve_control_pool() {
+        let scheduler = RequestScheduler::with_limits(RequestLimits {
+            control: 1,
+            filesystem: 1,
+            process: 1,
+            browser: 1,
+            general: 1,
+        });
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let filesystem_scheduler = scheduler.clone();
+        let filesystem = tokio::spawn(async move {
+            filesystem_scheduler
+                .run(
+                    RequestClass::Filesystem,
+                    async move {
+                        started.send(()).unwrap();
+                        let _ = wait.recv_timeout(Duration::from_secs(2));
+                        7
+                    },
+                    Duration::from_secs(3),
+                )
+                .await
+        });
+        running.await.unwrap();
+
+        let second_filesystem = scheduler
+            .run(
+                RequestClass::Filesystem,
+                async { 8 },
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(second_filesystem, Err(RequestFailure::Busy));
+
+        let control = scheduler
+            .run(
+                RequestClass::Control,
+                async { 42 },
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(control, Ok(42));
+
+        let _ = release.send(());
+        assert_eq!(filesystem.await.unwrap(), Ok(7));
     }
 }

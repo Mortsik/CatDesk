@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, mpsc::Sender};
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
+use crate::request_workers::{RequestClass, RequestScheduler};
 use crate::state::{
     AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
     TokenStatsLayout, UsageTotals, parse_seed_hex, save_agents_path_mode, save_show_detail_mode,
@@ -481,6 +482,59 @@ fn request_tool_arguments(req: &Value) -> Option<&serde_json::Map<String, Value>
     req.get("params")
         .and_then(|v| v.get("arguments"))
         .and_then(Value::as_object)
+}
+
+fn request_class(req: &Value) -> RequestClass {
+    let method = req.get("method").and_then(Value::as_str).unwrap_or_default();
+    match method {
+        "server/discover" | "tools/list" | "resources/list" | "resources/read" => {
+            RequestClass::Control
+        }
+        "tools/call" => match request_tool_name(req).as_deref() {
+            Some("catdesk_instruction" | "poll_command" | "cancel_command") => {
+                RequestClass::Control
+            }
+            Some("run_command" | "start_command") => RequestClass::Process,
+            Some(
+                "read" | "read_image" | "search" | "write" | "edit" | "create_handoff"
+                | "delete",
+            ) => RequestClass::Filesystem,
+            // Any tool not owned by CatDesk itself is a dynamically discovered
+            // DevTools operation when browser mode is enabled. Isolate it from
+            // local filesystem/process capacity even if the browser is slow.
+            Some(_) => RequestClass::Browser,
+            None => RequestClass::General,
+        },
+        _ => RequestClass::General,
+    }
+}
+
+fn request_deadline(class: RequestClass) -> StdDuration {
+    match class {
+        // poll_command may legitimately wait up to 30 seconds. Leave headroom
+        // without allowing a stalled control call to retain a slot for minutes.
+        RequestClass::Control => StdDuration::from_secs(45),
+        RequestClass::Filesystem | RequestClass::Process | RequestClass::Browser => {
+            StdDuration::from_secs(180)
+        }
+        RequestClass::General => StdDuration::from_secs(60),
+    }
+}
+
+fn request_failure_event(
+    class: RequestClass,
+    failure: &crate::request_workers::RequestFailure,
+) -> &'static str {
+    use crate::request_workers::RequestFailure;
+    match (class, failure) {
+        (RequestClass::Control, RequestFailure::Busy) => "request_control_busy",
+        (RequestClass::Filesystem, RequestFailure::Busy) => "request_filesystem_busy",
+        (RequestClass::Process, RequestFailure::Busy) => "request_process_busy",
+        (RequestClass::Browser, RequestFailure::Busy) => "request_browser_busy",
+        (RequestClass::General, RequestFailure::Busy) => "request_general_busy",
+        (_, RequestFailure::Deadline) => "request_worker_timeout",
+        (_, RequestFailure::Failed) => "request_worker_failed",
+    }
 }
 
 fn flow_file_name(path: &str) -> Option<String> {
@@ -1466,6 +1520,33 @@ mod tests {
             request_flow_label(&search),
             "tools/call:search › FLOW_ANIM_CELLS"
         );
+    }
+
+    #[test]
+    fn request_classification_keeps_control_plane_separate_from_heavy_work() {
+        use crate::request_workers::RequestClass;
+
+        let cases = [
+            (mcp_request_body("server/discover", json!({})), RequestClass::Control),
+            (mcp_request_body("tools/list", json!({})), RequestClass::Control),
+            (mcp_request_body("resources/list", json!({})), RequestClass::Control),
+            (mcp_request_body("resources/read", json!({ "uri": "ui://widget/catdesk-dashboard.html" })), RequestClass::Control),
+            (tool_call_body("catdesk_instruction", json!({})), RequestClass::Control),
+            (tool_call_body("poll_command", json!({ "job_id": "x" })), RequestClass::Control),
+            (tool_call_body("cancel_command", json!({ "job_id": "x" })), RequestClass::Control),
+            (tool_call_body("read", json!({ "paths": ["x"] })), RequestClass::Filesystem),
+            (tool_call_body("search", json!({ "pattern": "x" })), RequestClass::Filesystem),
+            (tool_call_body("edit", json!({ "path": "x", "edits": [] })), RequestClass::Filesystem),
+            (tool_call_body("run_command", json!({ "command": "true" })), RequestClass::Process),
+            (tool_call_body("start_command", json!({ "command": "true" })), RequestClass::Process),
+            (tool_call_body("take_screenshot", json!({})), RequestClass::Browser),
+            (mcp_request_body("catdesk/unknown", json!({})), RequestClass::General),
+        ];
+
+        for (body, expected) in cases {
+            let body: Value = serde_json::from_slice(&body).expect("parse test request");
+            assert_eq!(request_class(&body), expected, "unexpected class for {body}");
+        }
     }
 
     #[test]
@@ -3105,22 +3186,35 @@ async fn post_mcp_http(
     if let Some(body) = &metadata {
         crate::diagnostics::rpc_request(body);
     }
+    let class = metadata
+        .as_ref()
+        .map(request_class)
+        .unwrap_or(RequestClass::General);
     let id = metadata.and_then(|v| v.get("id").cloned());
-    static WORKERS: std::sync::LazyLock<crate::request_workers::RequestWorkers> =
-        std::sync::LazyLock::new(|| crate::request_workers::RequestWorkers::new(12));
-    match WORKERS.run(async move {
-        post_mcp_inner(State(s), body_bytes, &headers, None).await
-    }, std::time::Duration::from_secs(180)).await {
+    static SCHEDULER: std::sync::LazyLock<RequestScheduler> =
+        std::sync::LazyLock::new(RequestScheduler::new);
+    match SCHEDULER
+        .run(
+            class,
+            async move { post_mcp_inner(State(s), body_bytes, &headers, None).await },
+            request_deadline(class),
+        )
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             use crate::request_workers::RequestFailure;
-            let (status, event) = match error {
-                RequestFailure::Busy => (StatusCode::SERVICE_UNAVAILABLE, "request_workers_busy"),
-                RequestFailure::Deadline => (StatusCode::GATEWAY_TIMEOUT, "request_worker_timeout"),
-                RequestFailure::Failed => (StatusCode::INTERNAL_SERVER_ERROR, "request_worker_failed"),
+            let status = match error {
+                RequestFailure::Busy => StatusCode::SERVICE_UNAVAILABLE,
+                RequestFailure::Deadline => StatusCode::GATEWAY_TIMEOUT,
+                RequestFailure::Failed => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            crate::diagnostics::event(event);
-            let payload = mcp::JsonRpcResponse::error(id, -32000, error.to_string());
+            crate::diagnostics::event(request_failure_event(class, &error));
+            let payload = mcp::JsonRpcResponse::error(
+                id,
+                -32000,
+                format!("CatDesk {} request: {error}", class.as_str()),
+            );
             let mut response = Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
