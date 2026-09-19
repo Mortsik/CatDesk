@@ -153,21 +153,38 @@ mod tests {
     #[tokio::test]
     async fn synchronous_tool_does_not_starve_runtime_timer() {
         let workers = RequestWorkers::new(1);
-        let task = tokio::spawn(async move {
-            workers
-                .run(
-                    async {
-                        std::thread::sleep(Duration::from_millis(300));
-                    },
-                    Duration::from_secs(2),
-                )
-                .await
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let watchdog_tx = release_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let _ = watchdog_tx.send(false);
         });
-        let started = std::time::Instant::now();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let responsive = started.elapsed() < Duration::from_millis(200);
-        task.await.unwrap().unwrap();
-        assert!(responsive, "synchronous work blocked the runtime timer");
+
+        let async_release = tokio::spawn(async move {
+            started_rx.await.expect("synchronous fixture never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = release_tx.send(true);
+        });
+
+        let released_by_runtime = workers
+            .run(
+                async move {
+                    started_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(4))
+                        .expect("worker fixture was never released")
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("worker request failed");
+        async_release.await.expect("runtime release task panicked");
+
+        assert!(
+            released_by_runtime,
+            "synchronous work blocked the runtime timer until the watchdog intervened"
+        );
     }
 
     #[tokio::test]
