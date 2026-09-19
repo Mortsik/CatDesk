@@ -15,6 +15,11 @@ mod tests {
             }}
         }));
         assert_eq!(value["rpc_method"], "tools/call");
+        assert_eq!(value["rpc_tool"], "other");
+        assert_eq!(
+            request_metadata(&json!({"method":"tools/call", "params":{"name":"start_command"}}))["rpc_tool"],
+            "start_command"
+        );
         assert!(!value.to_string().contains("secret"));
         let unknown = request_metadata(&json!({"method": "secret-method"}));
         assert_eq!(unknown["rpc_method"], "other");
@@ -76,6 +81,30 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_processes_keep_separate_bounded_logs() {
+        let root =
+            std::env::temp_dir().join(format!("catdesk-concurrent-logs-{}", uuid::Uuid::new_v4()));
+        let (first, first_guard) = Diagnostics::start(&root).unwrap();
+        let second = Diagnostics::start(&root);
+        first.record(json!({"event":"first"}));
+        drop(first_guard);
+        let (second, second_guard) = second.expect("a second process must retain diagnostics");
+        second.record(json!({"event":"second"}));
+        drop(second_guard);
+        assert!(
+            std::fs::read_to_string(root.join("connections.jsonl"))
+                .unwrap()
+                .contains("first")
+        );
+        assert!(
+            std::fs::read_to_string(root.join("concurrent/connections.jsonl"))
+                .unwrap()
+                .contains("second")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn only_one_writer_can_rotate_the_same_log() {
         let root =
             std::env::temp_dir().join(format!("catdesk-diagnostics-lock-{}", uuid::Uuid::new_v4()));
@@ -89,7 +118,7 @@ mod tests {
     #[tokio::test]
     async fn real_http_requests_keep_status_and_correlation_without_payloads() {
         use crate::{command_jobs::CommandJobManager, state::AppState};
-        use tokio::sync::{Mutex, mpsc::unbounded_channel};
+        use tokio::sync::{Mutex, mpsc::channel};
         let root =
             std::env::temp_dir().join(format!("catdesk-diagnostics-http-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -100,7 +129,7 @@ mod tests {
             root.join("config.toml"),
         )
         .unwrap();
-        let (events, _receiver) = unbounded_channel();
+        let (events, _receiver) = channel(crate::state::UI_EVENT_CAPACITY);
         let app = crate::server::router(
             Arc::new(Mutex::new(state)),
             None,
@@ -299,7 +328,11 @@ impl Drop for Guard {
 
 impl Diagnostics {
     fn start(root: &Path) -> io::Result<(Self, Guard)> {
-        let mut writer = LogWriter::open(root, LOG_LIMIT)?;
+        // An overlapping restart must not silently lose all diagnostics while
+        // the old process still holds the primary log. Two fixed slots retain
+        // rotation bounds; they do not accumulate per-PID files indefinitely.
+        let mut writer = LogWriter::open(root, LOG_LIMIT)
+            .or_else(|_| LogWriter::open(&root.join("concurrent"), LOG_LIMIT))?;
         let (sender, receiver) = mpsc::sync_channel(1024);
         let log = Self {
             sender,
@@ -382,7 +415,33 @@ fn request_metadata(body: &Value) -> Value {
         Some(_) => "other",
         None => "missing",
     };
-    json!({"rpc_method": method})
+    let mut metadata = json!({"rpc_method": method});
+    if method == "tools/call" {
+        // Only known local tool names are safe: browser/custom names are input.
+        let tool = match body
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(Value::as_str)
+        {
+            Some(
+                name @ ("catdesk_instruction"
+                | "run_command"
+                | "start_command"
+                | "poll_command"
+                | "cancel_command"
+                | "read"
+                | "read_image"
+                | "search"
+                | "write"
+                | "edit"
+                | "delete"
+                | "create_handoff"),
+            ) => name,
+            _ => "other",
+        };
+        metadata["rpc_tool"] = json!(tool);
+    }
+    metadata
 }
 
 pub(crate) fn rpc_request(body: &Value) {

@@ -3,16 +3,18 @@
 CatDesk writes metadata-only JSON Lines to `~/.catdesk/logs/connections.jsonl`.
 The current file and two rotated files (`connections.1.jsonl` and
 `connections.2.jsonl`) each hold at most 5 MiB. On Unix, files have mode `0600`.
-Only one process can own the log writer; a second process continues serving
-without diagnostics and prints a warning. An unwritable directory also disables
-diagnostics without preventing startup.
+Only one process can own each log writer. An overlapping second process uses
+`~/.catdesk/logs/concurrent/`, with the same rotation limits. If both slots are
+occupied, or neither directory is writable, startup prints a warning and
+continues without diagnostics. Check both directories when comparing restarts.
 
 Records contain Unix milliseconds (`timestamp_ms`), process ID (`pid`), and:
 
 - `http_started`: generated `request_id`, HTTP method, `route_matched`, and the
   number of active requests. Paths, query strings and headers are not saved.
-- `mcp_request`: the same generated ID and an allowlisted `rpc_method`.
-  Unknown methods become `other`. Client IDs, arguments, tool names, resource
+- `mcp_request`: the same generated ID, an allowlisted `rpc_method`, and for tool
+  calls an allowlisted local `rpc_tool`. Unknown methods/tool names become
+  `other`. Client IDs, arguments, custom/browser tool names, resource
   names, commands, output, credentials and connector URLs are never saved.
 - `http_finished`: HTTP `status`, numeric `rpc_error_code` when provided by the
   MCP handler, `tool_error` and `content_items` for tool responses, and `elapsed_ms`.
@@ -59,3 +61,44 @@ header at the time of failure. Never publish the secret connector URL.
 
 Use `tail -n 100 ~/.catdesk/logs/connections.jsonl` to inspect recent activity.
 New logging starts only after restarting CatDesk with the updated binary.
+
+## Stalls, busy responses and memory
+
+Synchronous tool and filesystem operations run outside the async network
+workers. At most four HTTP operations occupy this pool; excess requests return
+503 with `request_workers_busy`. A request that exceeds its 180-second response
+deadline returns 504 with `request_worker_timeout`. The worker continues to own
+its slot until the operation actually ends, including after client disconnection.
+**A timeout does not prove that a command or write stopped.** Inspect the result
+or poll an existing command job before retrying. MCP `ping` stays independent of
+this pool and of the shared application-state lock, with normal MCP validation.
+
+Browser calls wait at most two seconds for the serialized DevTools bridge.
+Writing to its stdin is limited to ten seconds; a request has a 120-second total
+deadline. EOF fails pending calls promptly. Look for `devtools_stdout_closed`,
+`devtools_stdin_failed`, `devtools_request_timeout`, and
+`devtools_response_too_large` (a response line exceeded 16 MiB). These events do
+not reveal stderr, arguments, or response contents. Stderr is classified into
+`devtools_stderr_memory_error`, `devtools_stderr_connection_error` or
+`devtools_stderr_error`; its raw text is never persisted. Restart CatDesk if its
+browser service disconnected; there is no automatic replay of browser actions.
+
+The UI event queue is bounded and best-effort; events may be dropped when the
+terminal falls behind. Keyboard polling continues when application state is
+busy. Quit restores the terminal before cleanup, which has a six-second limit;
+runtime shutdown waits at most one additional second for background work.
+
+Change previews read files in fixed-size chunks while retaining only their
+existing bounded preview. Automatic discovery does not descend into another
+mounted filesystem. Explicitly choosing that mount as the command's working
+directory still permits scanning it; explicit file operations and recursive
+listing/search are not disabled by this preview policy. Prefer a specific
+project as `WORKSPACE_ROOT`, rather than a directory containing archive disks.
+
+These are application bounds, not an OS memory quota: arbitrary commands,
+browser processes and other file operations can still consume substantial RAM.
+On Linux, compare `/proc/<pid>/status`, `/proc/pressure/memory` and kernel OOM
+records. A large swap allocation alone is not proof of an OOM kill.
+
+See the [2026-09-19 investigation](findings/2026-09-19-mcp-stalls.md) for the
+evidence and remaining limitations.

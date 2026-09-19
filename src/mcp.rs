@@ -1336,8 +1336,7 @@ async fn forward_to_devtools(
         "params": params
     });
 
-    let mut b = bridge.lock().await;
-    match b.request(&forward_req).await {
+    match DevtoolsBridge::call(bridge, &forward_req).await {
         Ok(resp) => {
             if let Some(result) = resp.get("result") {
                 return JsonRpcResponse::success(req.id.clone(), result.clone());
@@ -3399,8 +3398,7 @@ async fn fetch_devtools_tools(bridge: &Arc<Mutex<DevtoolsBridge>>) -> Option<Vec
         "method": "tools/list",
         "params": {}
     });
-    let mut b = bridge.lock().await;
-    let resp = b.request(&list_req).await.ok()?;
+    let resp = DevtoolsBridge::call(bridge, &list_req).await.ok()?;
     let dt_tools = resp
         .get("result")
         .and_then(|r| r.get("tools"))
