@@ -27,6 +27,24 @@ const HARD_LIST_LIMIT: usize = 1000;
 const DEFAULT_SEARCH_LIMIT: usize = 100;
 const HARD_SEARCH_LIMIT: usize = 500;
 const HARD_SEARCH_CONTEXT_LINES: usize = 20;
+const MAX_FALLBACK_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_FALLBACK_SEARCH_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FALLBACK_SEARCH_FILES: usize = 2_000;
+
+#[cfg(unix)]
+fn filesystem_device(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|metadata| metadata.dev())
+}
+
+#[cfg(not(unix))]
+fn filesystem_device(_path: &Path) -> Option<u64> {
+    None
+}
+
+fn may_recurse_on_same_filesystem(root_device: Option<u64>, path: &Path) -> bool {
+    root_device.is_none_or(|device| filesystem_device(path) == Some(device))
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -685,6 +703,7 @@ pub fn list_files_filtered(
     }
 
     let max_items = safe_limit(limit, DEFAULT_LIST_LIMIT, HARD_LIST_LIMIT);
+    let root_device = filesystem_device(&start);
     let mut queue = VecDeque::new();
     queue.push_back(start.clone());
 
@@ -728,7 +747,9 @@ pub fn list_files_filtered(
                         depth,
                     });
                 }
-                queue.push_back(path);
+                if may_recurse_on_same_filesystem(root_device, &path) {
+                    queue.push_back(path);
+                }
             } else if ft.is_file() {
                 if matches!(
                     filter,
@@ -869,6 +890,7 @@ fn search_text_rg(
     command
         .current_dir(&root)
         .arg("--json")
+        .arg("--one-file-system")
         .arg("--line-number")
         .arg("--with-filename")
         .arg("--no-heading")
@@ -994,8 +1016,9 @@ fn search_text_grep(
     start: &Path,
     options: ResolvedSearchTextOptions<'_>,
 ) -> Result<SearchTextOutput, SearchBackendError> {
-    let files = collect_search_files(root, start, options)
+    let collected = collect_search_files(root, start, options)
         .map_err(|e| SearchBackendError::Failed(e.to_string()))?;
+    let files = collected.files;
     let mut results = Vec::new();
     let mut returned_matches = 0_usize;
     let mut truncated = false;
@@ -1086,7 +1109,7 @@ fn search_text_grep(
         pattern: options.pattern.to_string(),
         path: to_workspace_relative(root, start),
         backend: "grep".into(),
-        backend_note: "rg not found; used grep".into(),
+        backend_note: fallback_search_note("rg not found; used grep", collected.limited),
         match_count: returned_matches,
         truncated,
         limit: options.max_matches,
@@ -1101,7 +1124,9 @@ fn search_text_rust(
     backend_note: String,
 ) -> Result<SearchTextOutput, String> {
     let matcher = SearchMatcher::new(options)?;
-    let files = collect_search_files(root, start, options)?;
+    let collected = collect_search_files(root, start, options)?;
+    let files = collected.files;
+    let backend_note = fallback_search_note(&backend_note, collected.limited);
     let mut results = Vec::new();
     let mut returned_matches = 0_usize;
     let mut truncated = false;
@@ -1111,7 +1136,16 @@ fn search_text_rust(
             truncated = true;
             break;
         }
-        let data = fs::read(file).map_err(|e| e.to_string())?;
+        let mut file_handle = fs::File::open(file).map_err(|e| e.to_string())?;
+        let mut data = Vec::with_capacity(MAX_FALLBACK_SEARCH_FILE_BYTES as usize + 1);
+        file_handle
+            .by_ref()
+            .take(MAX_FALLBACK_SEARCH_FILE_BYTES + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| e.to_string())?;
+        if data.len() as u64 > MAX_FALLBACK_SEARCH_FILE_BYTES {
+            data.truncate(MAX_FALLBACK_SEARCH_FILE_BYTES as usize);
+        }
         if data.iter().any(|b| *b == 0) {
             continue;
         }
@@ -1263,15 +1297,30 @@ fn parse_grep_line_prefix(line: &str) -> Option<(usize, char, &str)> {
     None
 }
 
+struct CollectedSearchFiles {
+    files: Vec<PathBuf>,
+    limited: bool,
+}
+
+fn fallback_search_note(base: &str, limited: bool) -> String {
+    if !limited {
+        return base.to_string();
+    }
+    format!(
+        "{base}; fallback scan bounded to 2 MiB per file, 64 MiB total, and 2000 files"
+    )
+}
+
 fn collect_search_files(
     root: &Path,
     start: &Path,
     options: ResolvedSearchTextOptions<'_>,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<CollectedSearchFiles, String> {
     let glob = compile_search_glob(options.glob)?;
     let mut builder = WalkBuilder::new(start);
     builder
         .hidden(!options.include_hidden)
+        .same_file_system(true)
         .parents(!options.no_ignore)
         .ignore(!options.no_ignore)
         .git_global(!options.no_ignore)
@@ -1279,6 +1328,8 @@ fn collect_search_files(
         .git_exclude(!options.no_ignore);
 
     let mut files = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut limited = false;
     for entry_result in builder.build() {
         let entry = entry_result.map_err(|e| e.to_string())?;
         let path = entry.path();
@@ -1294,10 +1345,28 @@ fn collect_search_files(
                 continue;
             }
         }
+        let file_bytes = match entry.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(_) => {
+                limited = true;
+                continue;
+            }
+        };
+        if file_bytes > MAX_FALLBACK_SEARCH_FILE_BYTES {
+            limited = true;
+            continue;
+        }
+        if files.len() >= MAX_FALLBACK_SEARCH_FILES
+            || total_bytes.saturating_add(file_bytes) > MAX_FALLBACK_SEARCH_TOTAL_BYTES
+        {
+            limited = true;
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(file_bytes);
         files.push(path.to_path_buf());
     }
     files.sort();
-    Ok(files)
+    Ok(CollectedSearchFiles { files, limited })
 }
 
 fn compile_search_glob(glob: Option<&str>) -> Result<Option<GlobSet>, String> {
@@ -1717,6 +1786,47 @@ mod tests {
     }
 
     #[test]
+    fn builtin_search_caps_bytes_read_per_file() {
+        use std::io::Write;
+
+        let workspace_root = test_workspace("search-rust-file-cap");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let mut file = fs::File::create(workspace_root.join("large.txt")).expect("create large file");
+        file.write_all(&vec![b'a'; MAX_FALLBACK_SEARCH_FILE_BYTES as usize])
+            .expect("write prefix");
+        file.write_all(b"\nneedle-after-cap\n")
+            .expect("write suffix");
+        drop(file);
+
+        let output = search_text_rust(
+            &workspace_root,
+            &workspace_root,
+            ResolvedSearchTextOptions {
+                pattern: "needle-after-cap",
+                glob: None,
+                fixed_strings: true,
+                case_insensitive: false,
+                before: 0,
+                after: 0,
+                max_matches: 100,
+                max_matches_per_file: None,
+                include_hidden: false,
+                no_ignore: false,
+            },
+            "test rust backend".into(),
+        )
+        .expect("search");
+
+        assert_eq!(output.match_count, 0, "fallback read past its per-file byte cap");
+        assert!(
+            output.backend_note.contains("2 MiB per file"),
+            "missing bounded-scan note: {}",
+            output.backend_note
+        );
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
     fn grep_search_backend_marks_truncated_when_an_extra_match_exists() {
         if !command_available("grep") {
             return;
@@ -1807,6 +1917,131 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recursive_listing_and_builtin_search_do_not_cross_mount_boundary() {
+        use std::process::Command;
+
+        if std::env::var_os("CATDESK_WORKSPACE_MOUNT_TEST_CHILD").is_none() {
+            let available = Command::new("unshare")
+                .args(["--user", "--map-root-user", "--mount", "true"])
+                .output()
+                .is_ok_and(|result| result.status.success());
+            if !available {
+                eprintln!("mount-boundary fixture unavailable: user/mount namespaces are disabled");
+                return;
+            }
+            let result = Command::new("unshare")
+                .args(["--user", "--map-root-user", "--mount", "--fork"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workspace_tools::tests::recursive_listing_and_builtin_search_do_not_cross_mount_boundary",
+                    "--nocapture",
+                ])
+                .env("CATDESK_WORKSPACE_MOUNT_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let root = test_workspace("mount-boundary");
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        assert!(
+            Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(&archive)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(root.join("local.txt"), "needle-local\n").unwrap();
+        fs::write(archive.join("sentinel.txt"), "needle-mounted\n").unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+
+        let listing = list_files_filtered(
+            &root_string,
+            None,
+            false,
+            Some(100),
+            command::FileListingFilter::All,
+        )
+        .expect("list workspace");
+        assert!(listing.entries.iter().any(|entry| entry.path == "local.txt"));
+        assert!(
+            listing
+                .entries
+                .iter()
+                .all(|entry| entry.path != "archive/sentinel.txt"),
+            "recursive listing crossed into mounted filesystem"
+        );
+
+        let search = search_text_rust(
+            &root,
+            &root,
+            ResolvedSearchTextOptions {
+                pattern: "needle",
+                glob: None,
+                fixed_strings: true,
+                case_insensitive: false,
+                before: 0,
+                after: 0,
+                max_matches: 100,
+                max_matches_per_file: None,
+                include_hidden: false,
+                no_ignore: false,
+            },
+            "test rust backend".into(),
+        )
+        .expect("search workspace");
+        assert!(search.results.iter().any(|entry| entry.path == "local.txt"));
+        assert!(
+            search
+                .results
+                .iter()
+                .all(|entry| entry.path != "archive/sentinel.txt"),
+            "built-in search crossed into mounted filesystem"
+        );
+
+        let public_search = search_text(
+            &root_string,
+            SearchTextOptions {
+                pattern: "needle",
+                path: None,
+                glob: None,
+                fixed_strings: true,
+                case_insensitive: false,
+                context: None,
+                before: None,
+                after: None,
+                max_matches: Some(100),
+                max_matches_per_file: None,
+                include_hidden: false,
+                no_ignore: false,
+            },
+        )
+        .expect("public search workspace");
+        assert!(public_search.results.iter().any(|entry| entry.path == "local.txt"));
+        assert!(
+            public_search
+                .results
+                .iter()
+                .all(|entry| entry.path != "archive/sentinel.txt"),
+            "public search crossed into mounted filesystem via {}",
+            public_search.backend
+        );
+
+        assert!(Command::new("umount").arg(&archive).status().unwrap().success());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -149,6 +149,11 @@ fn collect_directory_explicit(
     files: &mut HashMap<String, FileSnapshot>,
     remaining: &mut usize,
 ) {
+    #[cfg(unix)]
+    let root_device = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(start).ok().map(|metadata| metadata.dev())
+    };
     capture_path(workspace_root, start, files, remaining);
     if *remaining == 0 {
         return;
@@ -175,6 +180,19 @@ fn collect_directory_explicit(
             };
             capture_path(workspace_root, &path, files, remaining);
             if file_type.is_dir() && recursive {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let same_file_system = root_device.is_none_or(|device| {
+                        fs::metadata(&path)
+                            .ok()
+                            .is_some_and(|metadata| metadata.dev() == device)
+                    });
+                    if same_file_system {
+                        stack.push(path);
+                    }
+                }
+                #[cfg(not(unix))]
                 stack.push(path);
             }
         }
@@ -315,6 +333,70 @@ mod bounded_tests {
         assert!(first.text_truncated);
         assert_eq!(first.text, second.text);
         assert!(!snapshots_equal(&first, &second));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_recursive_snapshot_does_not_cross_mount_boundary() {
+        use std::process::Command;
+        if std::env::var_os("CATDESK_EXPLICIT_MOUNT_TEST_CHILD").is_none() {
+            let available = Command::new("unshare")
+                .args(["--user", "--map-root-user", "--mount", "true"])
+                .output()
+                .is_ok_and(|result| result.status.success());
+            if !available {
+                eprintln!("mount-boundary fixture unavailable: user/mount namespaces are disabled");
+                return;
+            }
+            let result = Command::new("unshare")
+                .args(["--user", "--map-root-user", "--mount", "--fork"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "change_tracking::snapshot::bounded_tests::explicit_recursive_snapshot_does_not_cross_mount_boundary",
+                    "--nocapture",
+                ])
+                .env("CATDESK_EXPLICIT_MOUNT_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("catdesk-explicit-mount-{}", uuid::Uuid::new_v4()));
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        assert!(
+            Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(&archive)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(root.join("local.txt"), "local").unwrap();
+        fs::write(archive.join("sentinel.txt"), "mounted").unwrap();
+
+        let snapshot = collect_snapshot(&root, &[ChangeTarget::explicit(root.clone(), true)]);
+
+        let unmounted = Command::new("umount")
+            .arg(&archive)
+            .status()
+            .unwrap()
+            .success();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(unmounted);
+        assert!(snapshot.files.contains_key("local.txt"));
+        assert!(snapshot.files.contains_key("archive"));
+        assert!(
+            !snapshot.files.contains_key("archive/sentinel.txt"),
+            "explicit recursive snapshot crossed mounted filesystem"
+        );
     }
 
     #[cfg(target_os = "linux")]
