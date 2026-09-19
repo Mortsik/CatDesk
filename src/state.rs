@@ -10,6 +10,10 @@ use uuid::Uuid;
 
 use crate::browser::DetectedBrowser;
 use crate::command_jobs::CommandJobManager;
+
+// UI telemetry is best-effort. A stalled terminal must not grow an unbounded
+// queue of request events in memory or block the server trying to publish them.
+pub(crate) const UI_EVENT_CAPACITY: usize = 2048;
 use crate::mascot::{self, MascotPack};
 use crate::theme;
 

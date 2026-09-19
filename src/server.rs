@@ -13,7 +13,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::{Mutex, mpsc::UnboundedSender};
+use tokio::sync::{Mutex, mpsc::Sender};
 
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
@@ -31,7 +31,7 @@ struct ServerState {
     app: SharedState,
     devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     command_jobs: CommandJobManager,
-    ui_events: UnboundedSender<ServerUiEvent>,
+    ui_events: Sender<ServerUiEvent>,
     catdesk_instruction_called: Arc<AtomicBool>,
 }
 
@@ -41,7 +41,7 @@ pub fn router(
     devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     command_jobs: CommandJobManager,
     mcp_path: String,
-    ui_events: UnboundedSender<ServerUiEvent>,
+    ui_events: Sender<ServerUiEvent>,
 ) -> Router {
     let state = ServerState {
         app: app_state,
@@ -1307,7 +1307,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::{Mutex, mpsc::unbounded_channel};
+    use tokio::sync::{Mutex, mpsc::channel};
 
     #[test]
     fn tool_flow_label_includes_selected_argument_summary() {
@@ -1521,7 +1521,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let server_state = ServerState {
             app: app_state.clone(),
             devtools: None,
@@ -1557,7 +1557,7 @@ mod tests {
         .expect("create app state");
         app.show_detail_mode = ShowDetailMode::Disable;
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let server_state = ServerState {
             app: app_state,
             devtools: None,
@@ -1607,7 +1607,7 @@ mod tests {
         .expect("create app state");
         let mcp_path = app.mcp_path();
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, mut ui_rx) = unbounded_channel();
+        let (ui_tx, mut ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let server_state = ServerState {
             app: app_state,
             devtools: None,
@@ -1665,7 +1665,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, mut ui_rx) = unbounded_channel();
+        let (ui_tx, mut ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let server_state = ServerState {
             app: app_state,
             devtools: None,
@@ -1740,7 +1740,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, mut ui_rx) = unbounded_channel();
+        let (ui_tx, mut ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let server_state = ServerState {
             app: app_state,
             devtools: None,
@@ -1868,6 +1868,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ping_remains_responsive_while_app_state_is_locked() {
+        let root = unique_temp_path("catdesk-ping-busy");
+        std::fs::create_dir_all(&root).unwrap();
+        let app = AppState::new_for_test(0, root.to_string_lossy().into_owned(), root.join("config.toml")).unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let (ui_events, _receiver) = channel(crate::state::UI_EVENT_CAPACITY);
+        let server = ServerState {
+            app: state.clone(), devtools: None, command_jobs: CommandJobManager::new(),
+            ui_events, catdesk_instruction_called: Arc::new(AtomicBool::new(false)),
+        };
+        let _locked = state.lock().await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), post_mcp_http(
+            State(server), modern_mcp_headers("ping", None), mcp_request_body("ping", json!({})),
+        )).await;
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.expect("ping must not wait for UI/persistence").status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn modern_2026_http_flow_validates_and_decorates_results() {
         let workspace_root = unique_temp_path("catdesk-modern-mcp-workspace");
         let config_root = unique_temp_path("catdesk-modern-mcp-config");
@@ -1882,7 +1901,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let server_state = ServerState {
             app: app_state,
             devtools: None,
@@ -2029,7 +2048,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let server_state = ServerState {
             app: app_state,
             devtools: None,
@@ -2128,7 +2147,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let router = router(
             app_state,
             None,
@@ -2397,7 +2416,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let command_jobs = CommandJobManager::new();
         let server_state = ServerState {
             app: app_state,
@@ -2515,7 +2534,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let instruction_called = Arc::new(AtomicBool::new(false));
         let server_state = ServerState {
             app: app_state,
@@ -2624,7 +2643,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let instruction_called = Arc::new(AtomicBool::new(false));
         let server_state = ServerState {
             app: app_state.clone(),
@@ -2799,7 +2818,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let server_state = ServerState {
             app: app_state.clone(),
             devtools: None,
@@ -2866,7 +2885,54 @@ async fn post_mcp_http(
     headers: HeaderMap,
     body_bytes: Bytes,
 ) -> Response<Body> {
-    post_mcp_inner(State(s), body_bytes, &headers, None).await
+    // Parsing is bounded by axum's body limit. Keep ping independent of busy
+    // tool workers so clients can distinguish overload from a dead server.
+    let metadata = serde_json::from_slice::<Value>(&body_bytes).ok();
+    if metadata.as_ref().and_then(|v| v.get("method")).and_then(Value::as_str) == Some("ping") {
+        let body = metadata.as_ref().unwrap();
+        crate::diagnostics::rpc_request(body);
+        if serde_json::from_value::<JsonRpcRequest>(body.clone()).is_err() {
+            return jsonrpc_error_response(StatusCode::BAD_REQUEST, -32600, "Invalid JSON-RPC request");
+        }
+        if let Err(response) = validate_modern_request(body, &headers) { return response; }
+        let _ = s.ui_events.try_send(ServerUiEvent::IncrementRequestCount);
+        let _ = s.ui_events.try_send(ServerUiEvent::SetRemoteConnected(true));
+        let Some(id) = body.get("id").filter(|v| !v.is_null()) else {
+            return Response::builder().status(StatusCode::ACCEPTED).body(Body::empty()).unwrap();
+        };
+        let mut result = json!({});
+        mcp::decorate_modern_result("ping", &mut result);
+        return Response::builder().status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"jsonrpc":"2.0", "id":id, "result":result}).to_string())).unwrap();
+    }
+    if let Some(body) = &metadata {
+        crate::diagnostics::rpc_request(body);
+    }
+    let id = metadata.and_then(|v| v.get("id").cloned());
+    static WORKERS: std::sync::LazyLock<crate::request_workers::RequestWorkers> =
+        std::sync::LazyLock::new(|| crate::request_workers::RequestWorkers::new(4));
+    match WORKERS.run(async move {
+        post_mcp_inner(State(s), body_bytes, &headers, None).await
+    }, std::time::Duration::from_secs(180)).await {
+        Ok(response) => response,
+        Err(error) => {
+            use crate::request_workers::RequestFailure;
+            let (status, event) = match error {
+                RequestFailure::Busy => (StatusCode::SERVICE_UNAVAILABLE, "request_workers_busy"),
+                RequestFailure::Deadline => (StatusCode::GATEWAY_TIMEOUT, "request_worker_timeout"),
+                RequestFailure::Failed => (StatusCode::INTERNAL_SERVER_ERROR, "request_worker_failed"),
+            };
+            crate::diagnostics::event(event);
+            let payload = mcp::JsonRpcResponse::error(id, -32000, error.to_string());
+            let mut response = Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap())).unwrap();
+            response.extensions_mut().insert(crate::diagnostics::RpcError(-32000));
+            response
+        }
+    }
 }
 
 async fn post_mcp_inner(
@@ -2878,7 +2944,7 @@ async fn post_mcp_inner(
     let body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            let _ = s.ui_events.send(ServerUiEvent::Log {
+            let _ = s.ui_events.try_send(ServerUiEvent::Log {
                 level: "ERROR",
                 message: format!(
                     "← JSON-RPC parse error bytes={} message={}",
@@ -2894,7 +2960,7 @@ async fn post_mcp_inner(
         }
     };
     if !body.is_object() {
-        let _ = s.ui_events.send(ServerUiEvent::Log {
+        let _ = s.ui_events.try_send(ServerUiEvent::Log {
             level: "ERROR",
             message: "← JSON-RPC invalid request: expected a single message object".into(),
         });
@@ -2906,8 +2972,8 @@ async fn post_mcp_inner(
     }
 
     crate::diagnostics::rpc_request(&body);
-    let _ = s.ui_events.send(ServerUiEvent::IncrementRequestCount);
-    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(true));
+    let _ = s.ui_events.try_send(ServerUiEvent::IncrementRequestCount);
+    let _ = s.ui_events.try_send(ServerUiEvent::SetRemoteConnected(true));
 
     let has_method = body.get("method").and_then(Value::as_str).is_some();
     if !has_method {
@@ -2922,7 +2988,7 @@ async fn post_mcp_inner(
             let app = s.app.lock().await;
             app.mcp_path()
         };
-        let _ = s.ui_events.send(ServerUiEvent::Log {
+        let _ = s.ui_events.try_send(ServerUiEvent::Log {
             level: "INFO",
             message: format!(
                 "→ POST {mcp_path} non-request JSON-RPC id={} kind={kind}",
@@ -2938,7 +3004,7 @@ async fn post_mcp_inner(
     let request_summary = summarize_request(&body);
     let request_flow_event = request_flow_label(&body);
 
-    let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
+    let _ = s.ui_events.try_send(ServerUiEvent::RecordFlow {
         flow_id: STATELESS_FLOW_ID.to_string(),
         events: vec![request_flow_event.clone()],
         direction: FlowDirection::Forward,
@@ -2947,7 +3013,7 @@ async fn post_mcp_inner(
     let req: JsonRpcRequest = match serde_json::from_value(body.clone()) {
         Ok(r) => r,
         Err(e) => {
-            let _ = s.ui_events.send(ServerUiEvent::Log {
+            let _ = s.ui_events.try_send(ServerUiEvent::Log {
                 level: "ERROR",
                 message: format!(
                     "← {request_summary} invalid-request message={}",
@@ -2987,13 +3053,13 @@ async fn post_mcp_inner(
         )
     };
 
-    let _ = s.ui_events.send(ServerUiEvent::Log {
+    let _ = s.ui_events.try_send(ServerUiEvent::Log {
         level: "INFO",
         message: format!("→ POST {mcp_path} {request_summary}"),
     });
 
     if let Err(response) = validate_modern_request(&body, headers) {
-        let _ = s.ui_events.send(ServerUiEvent::Log {
+        let _ = s.ui_events.try_send(ServerUiEvent::Log {
             level: "ERROR",
             message: format!("← POST {mcp_path} {request_summary} validation-error"),
         });
@@ -3033,7 +3099,7 @@ async fn post_mcp_inner(
                 let mut app = s.app.lock().await;
                 if let Some((tool_input_tokens, tool_output_tokens)) = turn_token_usage {
                     app.record_turn_usage(tool_input_tokens, tool_output_tokens);
-                    let _ = s.ui_events.send(ServerUiEvent::RecordTurnUsage {
+                    let _ = s.ui_events.try_send(ServerUiEvent::RecordTurnUsage {
                         flow_id: STATELESS_FLOW_ID.to_string(),
                         tool_input_tokens,
                         tool_output_tokens,
@@ -3065,7 +3131,7 @@ async fn post_mcp_inner(
             "server/discover" => {
                 let _ = s
                     .ui_events
-                    .send(ServerUiEvent::RecordBootstrapDiscoverResponse {
+                    .try_send(ServerUiEvent::RecordBootstrapDiscoverResponse {
                         flow_id: STATELESS_FLOW_ID.to_string(),
                         success: response_succeeded,
                     });
@@ -3077,7 +3143,7 @@ async fn post_mcp_inner(
                     .unwrap_or_default();
                 let _ = s
                     .ui_events
-                    .send(ServerUiEvent::RecordBootstrapToolsListResponse {
+                    .try_send(ServerUiEvent::RecordBootstrapToolsListResponse {
                         flow_id: STATELESS_FLOW_ID.to_string(),
                         success: response_succeeded,
                         widgets,
@@ -3091,7 +3157,7 @@ async fn post_mcp_inner(
                 {
                     let _ = s
                         .ui_events
-                        .send(ServerUiEvent::RecordBootstrapWidgetReadResponse {
+                        .try_send(ServerUiEvent::RecordBootstrapWidgetReadResponse {
                             flow_id: STATELESS_FLOW_ID.to_string(),
                             tool_name: tool_name.to_string(),
                             success: response_succeeded,
@@ -3101,7 +3167,7 @@ async fn post_mcp_inner(
             _ => {}
         }
 
-        let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
+        let _ = s.ui_events.try_send(ServerUiEvent::RecordFlow {
             flow_id: STATELESS_FLOW_ID.to_string(),
             events: vec![request_flow_event.clone()],
             direction: FlowDirection::Backward,
@@ -3109,7 +3175,7 @@ async fn post_mcp_inner(
     }
     if let Some(ref resp_json) = response_json {
         let response_summary = summarize_response(&body, resp_json);
-        let _ = s.ui_events.send(ServerUiEvent::Log {
+        let _ = s.ui_events.try_send(ServerUiEvent::Log {
             level: "INFO",
             message: format!("← POST {mcp_path} {response_summary}"),
         });
@@ -3183,11 +3249,11 @@ async fn get_mcp() -> Response<Body> {
 // ── DELETE /<slug>/mcp ──────────────────────────────────────
 
 async fn delete_mcp(State(s): State<ServerState>) -> Response<Body> {
-    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(false));
-    let _ = s.ui_events.send(ServerUiEvent::BeginFlowClose {
+    let _ = s.ui_events.try_send(ServerUiEvent::SetRemoteConnected(false));
+    let _ = s.ui_events.try_send(ServerUiEvent::BeginFlowClose {
         flow_id: STATELESS_FLOW_ID.to_string(),
     });
-    let _ = s.ui_events.send(ServerUiEvent::Log {
+    let _ = s.ui_events.try_send(ServerUiEvent::Log {
         level: "INFO",
         message: "DELETE mcp endpoint: stateless reset".to_string(),
     });

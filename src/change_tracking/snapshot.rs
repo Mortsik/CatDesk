@@ -1,6 +1,7 @@
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{self, Read};
 use std::path::Path;
 
 use ignore::WalkBuilder;
@@ -106,6 +107,8 @@ fn collect_directory_with_project_ignores(
         .git_exclude(true)
         .require_git(false)
         .follow_links(false)
+        // Automatic change previews must not scan mounted archive/network disks.
+        .same_file_system(true)
         .max_depth((!recursive).then_some(1));
     let root = workspace_root.to_path_buf();
     builder.filter_entry(move |entry| {
@@ -230,28 +233,144 @@ fn capture_entry(path: &Path) -> Option<FileSnapshot> {
         return None;
     }
 
-    let data = fs::read(path).ok()?;
+    capture_file(fs::File::open(path).ok()?).ok()
+}
+
+fn capture_file(mut reader: impl Read) -> io::Result<FileSnapshot> {
+    let mut preview = Vec::with_capacity(MAX_FILE_CAPTURE_BYTES);
+    let mut buffer = [0u8; 64 * 1024];
     let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
+    let mut size_bytes = 0usize;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
+        }
+        hasher.write(&buffer[..count]);
+        size_bytes = size_bytes.saturating_add(count);
+        let keep = count.min(MAX_FILE_CAPTURE_BYTES - preview.len());
+        preview.extend_from_slice(&buffer[..keep]);
+    }
     let digest = hasher.finish();
-    let preview = &data[..data.len().min(MAX_FILE_CAPTURE_BYTES)];
     let is_binary = preview.iter().any(|byte| *byte == 0);
     let mut text = String::new();
-    let text_truncated = data.len() > MAX_FILE_CAPTURE_BYTES;
+    let text_truncated = size_bytes > MAX_FILE_CAPTURE_BYTES;
 
     if !is_binary {
-        text = String::from_utf8_lossy(preview).into_owned();
+        text = String::from_utf8_lossy(&preview).into_owned();
     }
 
-    Some(FileSnapshot {
+    Ok(FileSnapshot {
         digest,
-        size_bytes: data.len(),
+        size_bytes,
         is_binary,
         is_directory: false,
         is_symlink: false,
         text,
         text_truncated,
     })
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    struct ChunkChecked {
+        remaining: usize,
+        tail: u8,
+    }
+    impl Read for ChunkChecked {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(
+                buf.len() <= 64 * 1024,
+                "snapshot requested an unbounded read buffer"
+            );
+            let n = self.remaining.min(buf.len());
+            buf[..n].fill(b'a');
+            self.remaining -= n;
+            if self.remaining == 0 && n > 0 {
+                buf[n - 1] = self.tail;
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn large_file_is_streamed_and_changes_beyond_preview_are_detected() {
+        let first = capture_file(ChunkChecked {
+            remaining: 1024 * 1024,
+            tail: b'b',
+        })
+        .unwrap();
+        let second = capture_file(ChunkChecked {
+            remaining: 1024 * 1024,
+            tail: b'c',
+        })
+        .unwrap();
+        assert_eq!(first.size_bytes, 1024 * 1024);
+        assert_eq!(first.text.len(), MAX_FILE_CAPTURE_BYTES);
+        assert!(first.text_truncated);
+        assert_eq!(first.text, second.text);
+        assert!(!snapshots_equal(&first, &second));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn automatic_snapshot_does_not_cross_mount_boundary() {
+        use std::process::Command;
+        if std::env::var_os("CATDESK_MOUNT_TEST_CHILD").is_none() {
+            let available = Command::new("unshare")
+                .args(["--user", "--map-root-user", "--mount", "true"])
+                .output()
+                .is_ok_and(|result| result.status.success());
+            if !available {
+                eprintln!("mount-boundary fixture unavailable: user/mount namespaces are disabled");
+                return;
+            }
+            let result = Command::new("unshare")
+                .args(["--user", "--map-root-user", "--mount", "--fork"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "change_tracking::snapshot::bounded_tests::automatic_snapshot_does_not_cross_mount_boundary", "--nocapture"])
+                .env("CATDESK_MOUNT_TEST_CHILD", "1").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        // Only this child owns the mount namespace; never mount in the host.
+        let root = std::env::temp_dir().join(format!("catdesk-mount-{}", uuid::Uuid::new_v4()));
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        assert!(
+            Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(&archive)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(root.join("local.txt"), "local").unwrap();
+        fs::write(archive.join("sentinel.txt"), "mounted").unwrap();
+        let automatic = collect_snapshot(&root, &[ChangeTarget::discovered(root.clone(), true)]);
+        let explicit_root =
+            collect_snapshot(&archive, &[ChangeTarget::discovered(archive.clone(), true)]);
+        let unmounted = Command::new("umount")
+            .arg(&archive)
+            .status()
+            .unwrap()
+            .success();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(unmounted);
+        assert!(automatic.files.contains_key("local.txt"));
+        assert!(!automatic.files.contains_key("archive/sentinel.txt"));
+        assert!(explicit_root.files.contains_key("sentinel.txt"));
+    }
 }
 
 pub(super) fn snapshots_equal(left: &FileSnapshot, right: &FileSnapshot) -> bool {

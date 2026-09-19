@@ -11,6 +11,7 @@ mod linux_sandbox;
 mod macos_terminal;
 mod mascot;
 mod mcp;
+mod request_workers;
 mod ngrok;
 mod process_runner;
 mod server;
@@ -47,7 +48,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{
     Mutex,
-    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    mpsc::{Receiver, Sender, channel},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1395,8 +1396,10 @@ fn normalize_ngrok_authtoken_input(text: &str) -> String {
     trimmed.to_string()
 }
 
-fn drain_server_ui_events(app: &mut AppState, ui_events: &mut UnboundedReceiver<ServerUiEvent>) {
-    while let Ok(event) = ui_events.try_recv() {
+fn drain_server_ui_events(app: &mut AppState, ui_events: &mut Receiver<ServerUiEvent>) {
+    // An ongoing request stream must not postpone keyboard handling forever.
+    for _ in 0..256 {
+        let Ok(event) = ui_events.try_recv() else { break };
         app.apply_server_ui_event(event);
     }
 }
@@ -1439,8 +1442,16 @@ fn macos_terminal_profile_enabled() -> std::io::Result<bool> {
     Ok(enabled)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let result = runtime.block_on(async_main());
+    // A filesystem mounted over 9p/NFS can remain blocked in the kernel. Do not
+    // let Tokio's implicit infinite wait for blocking workers prevent exit.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // rustls 0.23 refuses to pick a process-level CryptoProvider when more than
     // one provider feature is enabled, and panics on first use. Both end up
     // enabled here through feature unification: ngrok requires aws-lc-rs, while
@@ -1544,9 +1555,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdout().execute(LeaveAlternateScreen)?;
 
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
-    let command_jobs = { state.lock().await.command_jobs.clone() };
-    command_jobs.cancel_all().await;
-    {
+    let cleanup = async {
+        let command_jobs = { state.lock().await.command_jobs.clone() };
+        command_jobs.cancel_all().await;
         let mut app = state.lock().await;
         if let Some(handle) = app.server_handle.take() {
             handle.abort();
@@ -1565,6 +1576,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.ngrok_url = None;
         app.remote_connected = false;
         app.last_remote_activity_ms = None;
+    };
+    if tokio::time::timeout(Duration::from_secs(6), cleanup).await.is_err() {
+        diagnostics::event("shutdown_cleanup_timeout");
     }
 
     result
@@ -1638,7 +1652,7 @@ async fn run_app(
     }
 
     // Start services
-    let (ui_event_tx, mut ui_event_rx) = unbounded_channel();
+    let (ui_event_tx, mut ui_event_rx) = channel(crate::state::UI_EVENT_CAPACITY);
     let devtools_bridge = start_services(state.clone(), ui_event_tx).await;
 
     run_chatgpt_connector_refresh_notice(terminal, state.clone(), &mut ui_event_rx).await?;
@@ -1650,7 +1664,7 @@ async fn run_app(
 async fn run_chatgpt_connector_refresh_notice(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
-    ui_events: &mut UnboundedReceiver<ServerUiEvent>,
+    ui_events: &mut Receiver<ServerUiEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !state.lock().await.chatgpt_connector_refresh_required {
         return Ok(());
@@ -2941,6 +2955,22 @@ mod tests {
                 "missing translated theme text: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn ui_event_drain_yields_before_emptying_a_busy_queue() {
+        let root = std::env::temp_dir().join(format!("catdesk-ui-drain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = AppState::new_for_test(0, root.to_string_lossy().into_owned(), root.join("config.toml")).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(crate::state::UI_EVENT_CAPACITY);
+        for _ in 0..300 {
+            sender.try_send(crate::state::ServerUiEvent::IncrementRequestCount).unwrap();
+        }
+        super::drain_server_ui_events(&mut app, &mut receiver);
+        assert!(app.request_count > 0 && app.request_count < 300);
+        super::drain_server_ui_events(&mut app, &mut receiver);
+        assert_eq!(app.request_count, 300);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4625,7 +4655,7 @@ async fn ensure_selected_browser_remote_debugging(
 
 async fn start_services(
     state: SharedState,
-    ui_events: UnboundedSender<ServerUiEvent>,
+    ui_events: Sender<ServerUiEvent>,
 ) -> Option<Arc<Mutex<DevtoolsBridge>>> {
     let (port, mode, mut detected_browsers, mut selected_browser) = {
         let app = state.lock().await;
@@ -4815,7 +4845,7 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
     _devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
-    mut ui_events: UnboundedReceiver<ServerUiEvent>,
+    mut ui_events: Receiver<ServerUiEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
     let mut log_follow_tail = true;
@@ -4832,14 +4862,15 @@ async fn run_tui(
     let mut last_mcp_url: Option<String> = None;
     let mut mcp_url_revealed_until: Option<Instant> = None;
     let mut log_secret_revealed_until: HashMap<u64, Instant> = HashMap::new();
+    let mut current_ui_language = UiLanguage::English;
 
     loop {
-        {
-            let mut app = state.lock().await;
+        // Persistence or another service may temporarily own the state. Keep
+        // polling the keyboard against the last frame, especially the quit key.
+        if let Ok(mut app) = state.try_lock() {
+            current_ui_language = app.ui_language;
             drain_server_ui_events(&mut app, &mut ui_events);
             app.prune_closed_flows();
-        }
-        {
             let reveal_remaining = mcp_url_revealed_until
                 .and_then(|deadline| deadline.checked_duration_since(Instant::now()));
             if mcp_url_revealed_until.is_some() && reveal_remaining.is_none() {
@@ -4848,7 +4879,6 @@ async fn run_tui(
             let now = Instant::now();
             log_secret_revealed_until
                 .retain(|_, deadline| deadline.checked_duration_since(now).is_some());
-            let app = state.lock().await;
             last_mcp_url = app.public_mcp_url();
             let toast_ref = toast
                 .as_ref()
@@ -4915,16 +4945,12 @@ async fn run_tui(
                 }
             }
             screen_lines = new_lines;
-        }
-
-        let snapshots = {
-            let app = state.lock().await;
-            build_animation_snapshot(&app)
-        };
-        if !snapshots.is_empty() {
-            let snapshot_joined = snapshots.join("\n");
-            if snapshot_joined != last_animation_snapshot {
-                last_animation_snapshot = snapshot_joined;
+            let snapshots = build_animation_snapshot(&app);
+            if !snapshots.is_empty() {
+                let snapshot_joined = snapshots.join("\n");
+                if snapshot_joined != last_animation_snapshot {
+                    last_animation_snapshot = snapshot_joined;
+                }
             }
         }
 
@@ -4935,7 +4961,6 @@ async fn run_tui(
         }
 
         if event::poll(UI_POLL_INTERVAL)? {
-            let current_ui_language = { state.lock().await.ui_language };
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
@@ -4944,6 +4969,7 @@ async fn run_tui(
                     selection.clear();
                     match key.code {
                         KeyCode::Char('q') => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                         KeyCode::Char('e') => {
                             let export_result = {
                                 let app = state.lock().await;
