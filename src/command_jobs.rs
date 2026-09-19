@@ -114,6 +114,7 @@ struct CommandJob {
     command: String,
     workspace_root: PathBuf,
     cwd: PathBuf,
+    owner_session: Option<String>,
     started_at: Instant,
     timeout_ms: u64,
     change_session: Option<ChangeSession>,
@@ -125,7 +126,7 @@ struct CommandJob {
 impl CommandJob {
     #[cfg(test)]
     fn new(command: String, cwd: PathBuf, timeout_ms: u64) -> (Arc<Self>, watch::Receiver<bool>) {
-        Self::new_with_change_session(command, cwd.clone(), cwd, timeout_ms, None)
+        Self::new_with_change_session(command, cwd.clone(), cwd, timeout_ms, None, None)
     }
 
     fn new_with_change_session(
@@ -134,6 +135,7 @@ impl CommandJob {
         cwd: PathBuf,
         timeout_ms: u64,
         change_session: Option<ChangeSession>,
+        owner_session: Option<String>,
     ) -> (Arc<Self>, watch::Receiver<bool>) {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         (
@@ -142,6 +144,7 @@ impl CommandJob {
                 command,
                 workspace_root,
                 cwd,
+                owner_session,
                 started_at: Instant::now(),
                 timeout_ms,
                 change_session,
@@ -317,8 +320,16 @@ impl CommandJobManager {
         timeout_ms: u64,
         request_key: Option<String>,
     ) -> Result<StartCommandResult, String> {
-        self.start_with_change_session(command, cwd.clone(), cwd, timeout_ms, request_key, None)
-            .await
+        self.start_with_change_session(
+            command,
+            cwd.clone(),
+            cwd,
+            timeout_ms,
+            request_key,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn start_with_change_session(
@@ -329,6 +340,7 @@ impl CommandJobManager {
         timeout_ms: u64,
         request_key: Option<String>,
         change_session: Option<ChangeSession>,
+        owner_session: Option<&str>,
     ) -> Result<StartCommandResult, String> {
         let _start_guard = self.start_lock.lock().await;
         if self.shutting_down.load(Ordering::Acquire) {
@@ -396,6 +408,7 @@ impl CommandJobManager {
             cwd,
             timeout_ms,
             change_session,
+            owner_session.map(str::to_owned),
         );
         let job_id = job.id.clone();
         {
@@ -421,8 +434,18 @@ impl CommandJobManager {
         after: u64,
         wait_ms: u64,
     ) -> Result<CommandJobSnapshot, String> {
+        self.poll_for_session(job_id, after, wait_ms, None).await
+    }
+
+    pub async fn poll_for_session(
+        &self,
+        job_id: &str,
+        after: u64,
+        wait_ms: u64,
+        owner_session: Option<&str>,
+    ) -> Result<CommandJobSnapshot, String> {
         self.cleanup().await;
-        let job = self.get_job(job_id).await?;
+        let job = self.get_job_for_session(job_id, owner_session).await?;
         let wait_ms = wait_ms.min(MAX_POLL_WAIT_MS);
 
         // `Notify::notified()` does not register with `notify_waiters()` until
@@ -441,8 +464,16 @@ impl CommandJobManager {
     }
 
     pub async fn current_changes(&self, job_id: &str) -> Result<Vec<FileChange>, String> {
+        self.current_changes_for_session(job_id, None).await
+    }
+
+    pub async fn current_changes_for_session(
+        &self,
+        job_id: &str,
+        owner_session: Option<&str>,
+    ) -> Result<Vec<FileChange>, String> {
         self.cleanup().await;
-        let job = self.get_job(job_id).await?;
+        let job = self.get_job_for_session(job_id, owner_session).await?;
         Ok(job
             .change_session
             .as_ref()
@@ -451,8 +482,16 @@ impl CommandJobManager {
     }
 
     pub async fn cancel(&self, job_id: &str) -> Result<CommandJobSnapshot, String> {
+        self.cancel_for_session(job_id, None).await
+    }
+
+    pub async fn cancel_for_session(
+        &self,
+        job_id: &str,
+        owner_session: Option<&str>,
+    ) -> Result<CommandJobSnapshot, String> {
         self.cleanup().await;
-        let job = self.get_job(job_id).await?;
+        let job = self.get_job_for_session(job_id, owner_session).await?;
 
         let current = job.snapshot(0).await;
         if current.state.is_terminal() {
@@ -484,14 +523,43 @@ impl CommandJobManager {
         }
     }
 
-    async fn get_job(&self, job_id: &str) -> Result<Arc<CommandJob>, String> {
+    async fn get_job_for_session(
+        &self,
+        job_id: &str,
+        owner_session: Option<&str>,
+    ) -> Result<Arc<CommandJob>, String> {
         self.inner
             .read()
             .await
             .jobs
             .get(job_id)
+            .filter(|job| job.owner_session.as_deref() == owner_session)
             .cloned()
             .ok_or_else(|| format!("unknown or expired command job: {job_id}"))
+    }
+
+    /// Signal every active command owned by one MCP session without waiting for
+    /// process-tree teardown. DELETE /mcp stays responsive while the runners
+    /// release their shared process permits asynchronously.
+    pub async fn cancel_session(&self, owner_session: &str) -> usize {
+        self.cleanup().await;
+        let jobs = {
+            let manager = self.inner.read().await;
+            manager
+                .jobs
+                .values()
+                .filter(|job| job.owner_session.as_deref() == Some(owner_session))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut cancelled = 0usize;
+        for job in jobs {
+            if job.runtime.lock().await.state == CommandJobState::Running {
+                let _ = job.cancel_tx.send(true);
+                cancelled += 1;
+            }
+        }
+        cancelled
     }
 
     /// Cancel every command still owned by CatDesk and wait briefly for the
@@ -1082,6 +1150,71 @@ mod tests {
             .collect::<String>();
         assert_eq!(decoded, "build ✓ 🚀");
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_session_signals_only_jobs_owned_by_that_session() {
+        let root = workspace("cancel-session");
+        let manager = CommandJobManager::new();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+
+        let first = manager
+            .start_with_change_session(
+                command.to_string(),
+                root.clone(),
+                root.clone(),
+                10_000,
+                None,
+                None,
+                Some("session-a"),
+            )
+            .await
+            .expect("start session-a job");
+        let second = manager
+            .start_with_change_session(
+                command.to_string(),
+                root.clone(),
+                root.clone(),
+                10_000,
+                None,
+                None,
+                Some("session-b"),
+            )
+            .await
+            .expect("start session-b job");
+
+        assert_eq!(manager.cancel_session("session-a").await, 1);
+        let first_terminal = loop {
+            let snapshot = manager
+                .poll_for_session(&first.snapshot.job_id, 0, 100, Some("session-a"))
+                .await
+                .expect("poll session-a job");
+            if snapshot.state.is_terminal() {
+                break snapshot;
+            }
+        };
+        assert_eq!(first_terminal.state, CommandJobState::Cancelled);
+
+        let second_snapshot = manager
+            .poll_for_session(&second.snapshot.job_id, 0, 0, Some("session-b"))
+            .await
+            .expect("poll session-b job");
+        assert_eq!(second_snapshot.state, CommandJobState::Running);
+        assert!(
+            manager
+                .poll_for_session(&second.snapshot.job_id, 0, 0, Some("session-a"))
+                .await
+                .is_err(),
+            "another session must not observe the surviving job"
+        );
+
+        assert_eq!(manager.cancel_session("session-b").await, 1);
+        let _ = manager.cancel_all().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

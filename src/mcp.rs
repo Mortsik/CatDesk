@@ -1261,8 +1261,13 @@ async fn handle_tools_call_with_session(
                             )
                             .await
                         }
-                        "poll_command" => handle_poll_command(req, command_jobs).await,
-                        "cancel_command" => handle_cancel_command(req, command_jobs).await,
+                        "poll_command" => {
+                            handle_poll_command_with_session(req, command_jobs, session_namespace).await
+                        }
+                        "cancel_command" => {
+                            handle_cancel_command_with_session(req, command_jobs, session_namespace)
+                                .await
+                        }
                         _ => unreachable!(),
                     }
                 } else if tool_mode.read_only() {
@@ -1322,7 +1327,10 @@ async fn handle_tools_call_with_session(
         )
     {
         if let Some(job_id) = command_job_id_from_response(&response) {
-            if let Ok(job_changes) = command_jobs.current_changes(job_id).await {
+            if let Ok(job_changes) = command_jobs
+                .current_changes_for_session(job_id, session_namespace)
+                .await
+            {
                 turn_files = job_changes;
             }
         }
@@ -1580,6 +1588,7 @@ async fn handle_start_command(
             timeout_ms,
             request_key,
             change_session,
+            session_namespace,
         )
         .await
     {
@@ -1602,6 +1611,14 @@ async fn handle_start_command(
 async fn handle_poll_command(
     req: &JsonRpcRequest,
     command_jobs: &CommandJobManager,
+) -> JsonRpcResponse {
+    handle_poll_command_with_session(req, command_jobs, None).await
+}
+
+async fn handle_poll_command_with_session(
+    req: &JsonRpcRequest,
+    command_jobs: &CommandJobManager,
+    session_namespace: Option<&str>,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let job_id = match required_string_argument(&arguments, "job_id") {
@@ -1638,7 +1655,10 @@ async fn handle_poll_command(
         },
         None => DEFAULT_POLL_WAIT_MS,
     };
-    match command_jobs.poll(job_id, after, wait_ms).await {
+    match command_jobs
+        .poll_for_session(job_id, after, wait_ms, session_namespace)
+        .await
+    {
         Ok(snapshot) => {
             let text = command_job_output_text(&snapshot);
             let structured = command_job_structured("poll_command", &snapshot);
@@ -1648,16 +1668,20 @@ async fn handle_poll_command(
     }
 }
 
-async fn handle_cancel_command(
+async fn handle_cancel_command_with_session(
     req: &JsonRpcRequest,
     command_jobs: &CommandJobManager,
+    session_namespace: Option<&str>,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let job_id = match required_string_argument(&arguments, "job_id") {
         Ok(value) => value,
         Err(error) => return tool_error_response(req, error),
     };
-    match command_jobs.cancel(job_id).await {
+    match command_jobs
+        .cancel_for_session(job_id, session_namespace)
+        .await
+    {
         Ok(snapshot) => {
             let text = format!(
                 "Command job {} is {}",
@@ -4467,6 +4491,135 @@ mod tests {
         assert_ne!(job_id(&anonymous_first), job_id(&anonymous_second));
         assert!(!deduplicated(&anonymous_first));
         assert!(!deduplicated(&anonymous_second));
+
+        command_jobs.cancel_all().await;
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn command_jobs_cannot_be_polled_or_cancelled_across_client_sessions() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "catdesk-mcp-session-job-owner-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+
+        let start_req = tool_call_request("start_command", json!({ "command": command }));
+        let started = handle_tools_call_with_session(
+            &start_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+            ShowDetailMode::Disable,
+            Some("session-a"),
+        )
+        .await;
+        let job_id = started
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("jobId"))
+            .and_then(Value::as_str)
+            .expect("missing job id")
+            .to_string();
+
+        for tool_name in ["poll_command", "cancel_command"] {
+            let req = tool_call_request(
+                tool_name,
+                if tool_name == "poll_command" {
+                    json!({ "job_id": job_id, "wait_ms": 0 })
+                } else {
+                    json!({ "job_id": job_id })
+                },
+            );
+            let response = handle_tools_call_with_session(
+                &req,
+                &workspace_root_str,
+                1,
+                Mode::Both,
+                ToolMode::MultiTools,
+                false,
+                &command_jobs,
+                &None,
+                ShowDetailMode::Disable,
+                Some("session-b"),
+            )
+            .await;
+            assert_eq!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                Some(true),
+                "{tool_name} from another session must be rejected"
+            );
+            assert!(
+                result_text(&response).contains("unknown or expired command job"),
+                "cross-session rejection must not reveal job ownership: {}",
+                result_text(&response)
+            );
+        }
+
+        let owner_poll = tool_call_request(
+            "poll_command",
+            json!({ "job_id": job_id, "wait_ms": 0 }),
+        );
+        let owner_response = handle_tools_call_with_session(
+            &owner_poll,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+            ShowDetailMode::Disable,
+            Some("session-a"),
+        )
+        .await;
+        assert!(
+            owner_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .is_none(),
+            "owner must still be able to poll its job"
+        );
+
+        let owner_cancel = tool_call_request("cancel_command", json!({ "job_id": job_id }));
+        let cancel_response = handle_tools_call_with_session(
+            &owner_cancel,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+            ShowDetailMode::Disable,
+            Some("session-a"),
+        )
+        .await;
+        assert!(
+            cancel_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .is_none(),
+            "owner must still be able to cancel its job"
+        );
 
         command_jobs.cancel_all().await;
         let _ = std::fs::remove_dir_all(workspace_root);

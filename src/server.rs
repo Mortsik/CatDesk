@@ -93,6 +93,19 @@ impl InstructionGate {
             .retain(|_, session| now.duration_since(session.last_seen) <= MCP_SESSION_TTL);
     }
 
+    fn ensure_capacity(state: &mut InstructionSessionMap, session_id: &str) {
+        if !state.sessions.contains_key(session_id) && state.sessions.len() >= MAX_TRACKED_MCP_SESSIONS {
+            if let Some(oldest) = state
+                .sessions
+                .iter()
+                .min_by_key(|(_, session)| session.last_seen)
+                .map(|(id, _)| id.clone())
+            {
+                state.sessions.remove(&oldest);
+            }
+        }
+    }
+
     fn is_called(&self, session: &ClientSession) -> bool {
         let Some(session_id) = session.namespace() else {
             return self.anonymous_called.load(Ordering::Acquire);
@@ -100,9 +113,14 @@ impl InstructionGate {
         let now = Instant::now();
         let mut state = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::prune_sessions(&mut state, now);
-        let Some(session) = state.sessions.get_mut(session_id) else {
-            return false;
-        };
+        Self::ensure_capacity(&mut state, session_id);
+        let session = state
+            .sessions
+            .entry(session_id.to_string())
+            .or_insert(SessionInstructionState {
+                called: false,
+                last_seen: now,
+            });
         session.last_seen = now;
         session.called
     }
@@ -115,16 +133,7 @@ impl InstructionGate {
         let now = Instant::now();
         let mut state = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::prune_sessions(&mut state, now);
-        if !state.sessions.contains_key(session_id) && state.sessions.len() >= MAX_TRACKED_MCP_SESSIONS {
-            if let Some(oldest) = state
-                .sessions
-                .iter()
-                .min_by_key(|(_, session)| session.last_seen)
-                .map(|(id, _)| id.clone())
-            {
-                state.sessions.remove(&oldest);
-            }
-        }
+        Self::ensure_capacity(&mut state, session_id);
         state.sessions.insert(
             session_id.to_string(),
             SessionInstructionState {
@@ -132,6 +141,22 @@ impl InstructionGate {
                 last_seen: now,
             },
         );
+    }
+
+    fn forget(&self, session: &ClientSession) {
+        let Some(session_id) = session.namespace() else {
+            self.anonymous_called.store(false, Ordering::Release);
+            return;
+        };
+        let mut state = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.sessions.remove(session_id);
+    }
+
+    fn has_named_sessions(&self) -> bool {
+        let now = Instant::now();
+        let mut state = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_sessions(&mut state, now);
+        !state.sessions.is_empty()
     }
 }
 
@@ -941,13 +966,21 @@ fn attach_history_usage(result: &mut Option<Value>, usage_totals: &UsageTotals) 
 // ── GET /<slug> — health ───────────────────────────────────
 
 async fn health(State(s): State<ServerState>) -> Json<Value> {
-    let app = s.app.lock().await;
+    let Ok(app) = s.app.try_lock() else {
+        return Json(json!({
+            "status": "ok",
+            "name": "CatDesk",
+            "description": "MCP Tools for ChatGPT to control your computer and browser",
+            "busy": true,
+        }));
+    };
     Json(json!({
         "status": "ok",
         "name": "CatDesk",
         "description": "MCP Tools for ChatGPT to control your computer and browser",
         "mode": app.mode.label(),
         "tool_mode": app.tool_mode.label(),
+        "busy": false,
         "workspace": app.workspace_root,
     }))
 }
@@ -2063,6 +2096,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_remains_responsive_while_app_state_is_locked() {
+        let root = unique_temp_path("catdesk-health-busy");
+        std::fs::create_dir_all(&root).unwrap();
+        let app = AppState::new_for_test(
+            0,
+            root.to_string_lossy().into_owned(),
+            root.join("config.toml"),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let (ui_events, _receiver) = channel(crate::state::UI_EVENT_CAPACITY);
+        let server = ServerState {
+            app: state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events,
+            catdesk_instruction_called: InstructionGate::with_anonymous(false),
+        };
+        let _locked = state.lock().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            health(State(server)),
+        )
+        .await
+        .expect("health must not wait for AppState");
+        assert_eq!(result.0.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(result.0.get("busy").and_then(Value::as_bool), Some(true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn ping_remains_responsive_while_app_state_is_locked() {
         let root = unique_temp_path("catdesk-ping-busy");
         std::fs::create_dir_all(&root).unwrap();
@@ -2904,6 +2968,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_one_named_session_cancels_only_its_jobs_and_keeps_other_session_connected() {
+        let workspace_root = unique_temp_path("catdesk-delete-session-workspace");
+        let config_root = unique_temp_path("catdesk-delete-session-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, mut ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let gate = InstructionGate::with_anonymous(false);
+        let session_a = ClientSession::from_headers(&modern_mcp_headers_for_session(
+            &tool_call_body("catdesk_instruction", json!({})),
+            "session-a",
+        ));
+        let session_b = ClientSession::from_headers(&modern_mcp_headers_for_session(
+            &tool_call_body("catdesk_instruction", json!({})),
+            "session-b",
+        ));
+        gate.mark_called(&session_a);
+        gate.mark_called(&session_b);
+
+        let command_jobs = CommandJobManager::new();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+        let a_job = command_jobs
+            .start_with_change_session(
+                command.to_string(),
+                workspace_root.clone(),
+                workspace_root.clone(),
+                10_000,
+                None,
+                None,
+                Some("session-a"),
+            )
+            .await
+            .expect("start session-a job");
+        let b_job = command_jobs
+            .start_with_change_session(
+                command.to_string(),
+                workspace_root.clone(),
+                workspace_root.clone(),
+                10_000,
+                None,
+                None,
+                Some("session-b"),
+            )
+            .await
+            .expect("start session-b job");
+
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: command_jobs.clone(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: gate.clone(),
+        };
+
+        let delete_a = delete_mcp(
+            State(server_state.clone()),
+            modern_mcp_headers_for_session(&tool_call_body("ping", json!({})), "session-a"),
+        )
+        .await;
+        assert_eq!(delete_a.status(), StatusCode::OK);
+        {
+            let sessions = gate
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(!sessions.sessions.contains_key("session-a"));
+            assert!(sessions.sessions.contains_key("session-b"));
+        }
+
+        let a_terminal = loop {
+            let snapshot = command_jobs
+                .poll_for_session(&a_job.snapshot.job_id, 0, 100, Some("session-a"))
+                .await
+                .expect("poll session-a job after delete");
+            if snapshot.state.is_terminal() {
+                break snapshot;
+            }
+        };
+        assert_eq!(a_terminal.state, crate::command_jobs::CommandJobState::Cancelled);
+        let b_snapshot = command_jobs
+            .poll_for_session(&b_job.snapshot.job_id, 0, 0, Some("session-b"))
+            .await
+            .expect("poll surviving session-b job");
+        assert_eq!(b_snapshot.state, crate::command_jobs::CommandJobState::Running);
+
+        let mut saw_disconnect = false;
+        while let Ok(event) = ui_rx.try_recv() {
+            if matches!(event, ServerUiEvent::SetRemoteConnected(false)) {
+                saw_disconnect = true;
+            }
+        }
+        assert!(!saw_disconnect, "deleting session-a must not disconnect session-b");
+
+        let delete_b = delete_mcp(
+            State(server_state),
+            modern_mcp_headers_for_session(&tool_call_body("ping", json!({})), "session-b"),
+        )
+        .await;
+        assert_eq!(delete_b.status(), StatusCode::OK);
+        let mut saw_final_disconnect = false;
+        while let Ok(event) = ui_rx.try_recv() {
+            if matches!(event, ServerUiEvent::SetRemoteConnected(false)) {
+                saw_final_disconnect = true;
+            }
+        }
+        assert!(saw_final_disconnect, "deleting the final named session must disconnect remote UI state");
+
+        command_jobs.cancel_all().await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
     async fn http_start_command_idempotency_is_scoped_to_mcp_session() {
         let workspace_root = unique_temp_path("catdesk-http-session-job-workspace");
         let config_root = unique_temp_path("catdesk-http-session-job-config");
@@ -3627,7 +3817,13 @@ async fn get_mcp() -> Response<Body> {
 
 async fn delete_mcp(State(s): State<ServerState>, headers: HeaderMap) -> Response<Body> {
     let client_session = ClientSession::from_headers(&headers);
-    if client_session.namespace().is_none() {
+    let cancelled_jobs = if let Some(session_id) = client_session.namespace() {
+        s.command_jobs.cancel_session(session_id).await
+    } else {
+        0
+    };
+    s.catdesk_instruction_called.forget(&client_session);
+    if client_session.namespace().is_none() || !s.catdesk_instruction_called.has_named_sessions() {
         let _ = s.ui_events.try_send(ServerUiEvent::SetRemoteConnected(false));
     }
     let _ = s.ui_events.try_send(ServerUiEvent::BeginFlowClose {
@@ -3635,7 +3831,9 @@ async fn delete_mcp(State(s): State<ServerState>, headers: HeaderMap) -> Respons
     });
     let _ = s.ui_events.try_send(ServerUiEvent::Log {
         level: "INFO",
-        message: "DELETE mcp endpoint: stateless reset".to_string(),
+        message: format!(
+            "DELETE mcp endpoint: session reset; signalled {cancelled_jobs} command job(s)"
+        ),
     });
     Response::builder()
         .status(StatusCode::OK)
