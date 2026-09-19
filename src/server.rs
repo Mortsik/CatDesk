@@ -2904,6 +2904,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_start_command_idempotency_is_scoped_to_mcp_session() {
+        let workspace_root = unique_temp_path("catdesk-http-session-job-workspace");
+        let config_root = unique_temp_path("catdesk-http-session-job-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let gate = InstructionGate::with_anonymous(false);
+        for session_id in ["session-a", "session-b"] {
+            let body = tool_call_body("catdesk_instruction", json!({}));
+            let session = ClientSession::from_headers(&modern_mcp_headers_for_session(&body, session_id));
+            gate.mark_called(&session);
+        }
+        let command_jobs = CommandJobManager::new();
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: command_jobs.clone(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: gate,
+        };
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+        let start_body = tool_call_body("start_command", json!({ "command": command }));
+
+        async fn call_start(
+            state: &ServerState,
+            body: &Bytes,
+            session_id: &str,
+        ) -> Value {
+            let response = post_mcp_http(
+                State(state.clone()),
+                modern_mcp_headers_for_session(body, session_id),
+                body.clone(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read start response");
+            serde_json::from_slice(&bytes).expect("parse start response")
+        }
+
+        let job_id = |payload: &Value| {
+            payload
+                .pointer("/result/structuredContent/jobId")
+                .and_then(Value::as_str)
+                .expect("missing job id")
+                .to_string()
+        };
+        let deduplicated = |payload: &Value| {
+            payload
+                .pointer("/result/structuredContent/deduplicated")
+                .and_then(Value::as_bool)
+                .expect("missing deduplicated flag")
+        };
+
+        let a1 = call_start(&server_state, &start_body, "session-a").await;
+        let a2 = call_start(&server_state, &start_body, "session-a").await;
+        let b1 = call_start(&server_state, &start_body, "session-b").await;
+        assert_eq!(job_id(&a1), job_id(&a2));
+        assert!(!deduplicated(&a1));
+        assert!(deduplicated(&a2));
+        assert_ne!(job_id(&a1), job_id(&b1));
+        assert!(!deduplicated(&b1));
+
+        command_jobs.cancel_all().await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
     async fn disabled_show_detail_mode_hides_widgets_across_mcp_flow() {
         let workspace_root = unique_temp_path("catdesk-disable-mcp-flow-workspace");
         let config_root = unique_temp_path("catdesk-disable-mcp-flow-config");
@@ -3359,7 +3443,7 @@ async fn post_mcp_inner(
     }
 
     let show_detail_mode = show_detail_mode.unwrap_or(app_show_detail_mode);
-    let response = mcp::handle_request_with_show_detail_mode(
+    let response = mcp::handle_request_with_session(
         &req,
         &workspace_root,
         mascot_seed,
@@ -3371,6 +3455,7 @@ async fn post_mcp_inner(
         &s.command_jobs,
         &s.devtools,
         show_detail_mode,
+        client_session.namespace(),
     )
     .await;
 

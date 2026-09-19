@@ -6,7 +6,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{Mutex, Notify, RwLock, watch};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, watch};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
@@ -18,6 +18,7 @@ pub const MAX_JOB_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const MAX_POLL_WAIT_MS: u64 = 30_000;
 pub const DEFAULT_POLL_WAIT_MS: u64 = 10_000;
 const MAX_ACTIVE_JOBS: usize = 8;
+const MAX_ACTIVE_PROCESSES: usize = 12;
 const MAX_RETAINED_JOBS: usize = 64;
 const TERMINAL_JOB_TTL: StdDuration = StdDuration::from_secs(60 * 60);
 const IDEMPOTENCY_WINDOW: StdDuration = StdDuration::from_secs(30);
@@ -242,7 +243,7 @@ struct ManagerState {
     last_cleanup: Option<Instant>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CommandJobManager {
     inner: Arc<RwLock<ManagerState>>,
     // Starting a job performs a dedupe lookup, active-job capacity check, and
@@ -252,11 +253,49 @@ pub struct CommandJobManager {
     // App shutdown is terminal for this manager. Once set, no new background
     // command may be created even if an MCP request races with shutdown.
     shutting_down: Arc<AtomicBool>,
+    // Foreground run_command and background start_command share this budget.
+    // HTTP concurrency can stay high while the number of expensive process
+    // trees remains bounded independently.
+    process_budget: Arc<Semaphore>,
+    process_limit: usize,
+}
+
+impl Default for CommandJobManager {
+    fn default() -> Self {
+        Self::with_process_limit(MAX_ACTIVE_PROCESSES)
+    }
 }
 
 impl CommandJobManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn with_process_limit(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(ManagerState::default())),
+            start_lock: Arc::new(Mutex::new(())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            process_budget: Arc::new(Semaphore::new(limit)),
+            process_limit: limit,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_process_limit(limit: usize) -> Self {
+        Self::with_process_limit(limit)
+    }
+
+    pub(crate) fn try_acquire_process(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.process_budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                format!(
+                    "too many active command processes; maximum combined foreground/background process trees is {}",
+                    self.process_limit
+                )
+            })
     }
 
     pub fn normalize_timeout(timeout_ms: Option<u64>) -> Result<u64, String> {
@@ -350,6 +389,7 @@ impl CommandJobManager {
             ));
         }
 
+        let process_permit = self.try_acquire_process()?;
         let (job, cancel_rx) = CommandJob::new_with_change_session(
             command,
             workspace_root,
@@ -368,7 +408,7 @@ impl CommandJobManager {
             }
         }
 
-        tokio::spawn(run_job(job.clone(), cancel_rx));
+        tokio::spawn(run_job(job.clone(), cancel_rx, Some(process_permit)));
         Ok(StartCommandResult {
             snapshot: job.snapshot(0).await,
             deduplicated: false,
@@ -644,7 +684,11 @@ where
     }
 }
 
-async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
+async fn run_job(
+    job: Arc<CommandJob>,
+    mut cancel_rx: watch::Receiver<bool>,
+    _process_permit: Option<OwnedSemaphorePermit>,
+) {
     let cancelled_before_spawn = *cancel_rx.borrow();
     if cancelled_before_spawn {
         job.finish(CommandJobState::Cancelled, None).await;
@@ -692,6 +736,10 @@ async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
             if status.success() {
                 (CommandJobState::Succeeded, status.code())
             } else {
+                if let Some(signal) = process_runner::exit_status_signal_diagnostic(&status) {
+                    job.append_output("stderr", format!("{signal}\n").as_bytes())
+                        .await;
+                }
                 (CommandJobState::Failed, status.code())
             }
         }
@@ -903,7 +951,7 @@ mod tests {
         let (job, cancel_rx) = CommandJob::new(command.to_string(), root.clone(), 10_000);
 
         let _ = job.cancel_tx.send(true);
-        run_job(job.clone(), cancel_rx).await;
+        run_job(job.clone(), cancel_rx, None).await;
 
         let snapshot = job.snapshot(0).await;
         assert_eq!(snapshot.state, CommandJobState::Cancelled);
@@ -967,6 +1015,30 @@ mod tests {
         assert!(
             !sentinel.exists(),
             "cancelled root shell left a descendant process alive"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signalled_background_job_reports_signal_in_output() {
+        let root = workspace("signal-diagnostic");
+        let manager = CommandJobManager::new();
+        let started = manager
+            .start("kill -KILL $$".to_string(), root.clone(), 5_000, None)
+            .await
+            .expect("start signalled job");
+        let terminal = wait_terminal(&manager, &started.snapshot.job_id).await;
+        assert_eq!(terminal.state, CommandJobState::Failed);
+        assert_eq!(terminal.exit_code, None);
+        let text = terminal
+            .events
+            .iter()
+            .map(|event| event.text.as_str())
+            .collect::<String>();
+        assert!(
+            text.contains("SIGKILL") || text.contains("signal 9"),
+            "missing signal diagnostic: {text:?}"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1203,6 +1275,43 @@ mod tests {
             MAX_JOB_TIMEOUT_MS
         );
         assert!(CommandJobManager::normalize_timeout(Some(MAX_JOB_TIMEOUT_MS + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn shared_process_budget_is_held_by_background_jobs_until_termination() {
+        let root = workspace("process-budget");
+        let manager = CommandJobManager::with_process_limit(1);
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+        let started = manager
+            .start(command.to_string(), root.clone(), 10_000, None)
+            .await
+            .expect("start background command");
+
+        let busy = manager.try_acquire_process();
+        assert!(busy.is_err(), "background job must consume shared process capacity");
+
+        manager
+            .cancel(&started.snapshot.job_id)
+            .await
+            .expect("cancel background command");
+        let _ = wait_terminal(&manager, &started.snapshot.job_id).await;
+
+        let permit = tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                if let Ok(permit) = manager.try_acquire_process() {
+                    break permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process capacity did not recover");
+        drop(permit);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

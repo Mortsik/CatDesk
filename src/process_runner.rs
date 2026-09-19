@@ -9,6 +9,37 @@ use tokio::time::{Duration, timeout};
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 
+#[cfg(unix)]
+pub(crate) fn exit_status_signal_diagnostic(status: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let signal = status.signal()?;
+    let name = match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        _ => "UNKNOWN",
+    };
+    let core = if status.core_dumped() { " (core dumped)" } else { "" };
+    Some(format!("Command terminated by signal {signal} ({name}){core}"))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn exit_status_signal_diagnostic(_status: &std::process::ExitStatus) -> Option<String> {
+    None
+}
+
 #[derive(Debug)]
 pub struct ProcessRunResult {
     pub stdout: String,
@@ -662,6 +693,13 @@ pub async fn run_shell_command(
             &format!("Command timed out after {timeout_ms} ms"),
         );
     }
+    if !timed_out
+        && wait_error.is_none()
+        && let Some(status) = status.as_ref()
+        && let Some(signal) = exit_status_signal_diagnostic(status)
+    {
+        append_stderr_diagnostic(&mut stderr, &signal);
+    }
 
     let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
     let success = wait_error.is_none()
@@ -762,6 +800,21 @@ mod tests {
         assert!(result.stderr.len() <= 4_096);
         assert!(result.stdout_truncated);
         assert!(result.stderr_truncated);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signalled_command_reports_signal_in_stderr() {
+        let root = workspace("signal-diagnostic");
+        let result = run_shell_command("kill -KILL $$", &root, &root, 5_000, 1024).await;
+        assert!(!result.success);
+        assert_eq!(result.exit_code, None);
+        assert!(
+            result.stderr.contains("SIGKILL") || result.stderr.contains("signal 9"),
+            "missing signal diagnostic: {:?}",
+            result.stderr
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

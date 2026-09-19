@@ -165,6 +165,37 @@ pub(crate) async fn handle_request_with_show_detail_mode(
     devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
     show_detail_mode: ShowDetailMode,
 ) -> Option<JsonRpcResponse> {
+    handle_request_with_session(
+        req,
+        workspace_root,
+        mascot_seed,
+        public_base_url,
+        mode,
+        tool_mode,
+        set_catdesk_as_co_author,
+        catdesk_instruction_called,
+        command_jobs,
+        devtools,
+        show_detail_mode,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn handle_request_with_session(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    mascot_seed: u64,
+    public_base_url: Option<&str>,
+    mode: Mode,
+    tool_mode: ToolMode,
+    set_catdesk_as_co_author: bool,
+    catdesk_instruction_called: bool,
+    command_jobs: &CommandJobManager,
+    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    show_detail_mode: ShowDetailMode,
+    session_namespace: Option<&str>,
+) -> Option<JsonRpcResponse> {
     match req.method.as_str() {
         "server/discover" => Some(handle_server_discover(req, show_detail_mode)),
         m if m.starts_with("notifications/") => None,
@@ -187,7 +218,7 @@ pub(crate) async fn handle_request_with_show_detail_mode(
                 ))
             } else {
                 Some(
-                    handle_tools_call_with_show_detail_mode(
+                    handle_tools_call_with_session(
                         req,
                         workspace_root,
                         mascot_seed,
@@ -197,6 +228,7 @@ pub(crate) async fn handle_request_with_show_detail_mode(
                         command_jobs,
                         devtools,
                         show_detail_mode,
+                        session_namespace,
                     )
                     .await,
                 )
@@ -1150,6 +1182,33 @@ async fn handle_tools_call_with_show_detail_mode(
     devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
     show_detail_mode: ShowDetailMode,
 ) -> JsonRpcResponse {
+    handle_tools_call_with_session(
+        req,
+        workspace_root,
+        mascot_seed,
+        mode,
+        tool_mode,
+        set_catdesk_as_co_author,
+        command_jobs,
+        devtools,
+        show_detail_mode,
+        None,
+    )
+    .await
+}
+
+async fn handle_tools_call_with_session(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    mascot_seed: u64,
+    mode: Mode,
+    tool_mode: ToolMode,
+    set_catdesk_as_co_author: bool,
+    command_jobs: &CommandJobManager,
+    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    show_detail_mode: ShowDetailMode,
+    session_namespace: Option<&str>,
+) -> JsonRpcResponse {
     let params = &req.params;
     let tool_name = params
         .get("name")
@@ -1183,7 +1242,13 @@ async fn handle_tools_call_with_show_detail_mode(
                 if tool_mode.run_command_enabled() {
                     match tool_name.as_str() {
                         "run_command" => {
-                            handle_run_command(req, workspace_root, set_catdesk_as_co_author).await
+                            handle_run_command(
+                                req,
+                                workspace_root,
+                                set_catdesk_as_co_author,
+                                command_jobs,
+                            )
+                            .await
                         }
                         "start_command" => {
                             handle_start_command(
@@ -1192,6 +1257,7 @@ async fn handle_tools_call_with_show_detail_mode(
                                 set_catdesk_as_co_author,
                                 command_jobs,
                                 show_detail_mode,
+                                session_namespace,
                             )
                             .await
                         }
@@ -1435,6 +1501,7 @@ async fn handle_start_command(
     set_catdesk_as_co_author: bool,
     command_jobs: &CommandJobManager,
     show_detail_mode: ShowDetailMode,
+    session_namespace: Option<&str>,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let command_text = match required_string_argument(&arguments, "command") {
@@ -1484,12 +1551,20 @@ async fn handle_start_command(
         } else {
             command_text.to_string()
         };
-    let request_key = req.id.as_ref().map(|id| {
-        let mut hasher = DefaultHasher::new();
-        effective_command.hash(&mut hasher);
-        cwd.hash(&mut hasher);
-        timeout_ms.hash(&mut hasher);
-        format!("start_command:{id}:{:016x}", hasher.finish())
+    let request_key = session_namespace.and_then(|session_namespace| {
+        req.id.as_ref().map(|id| {
+            let mut session_hasher = DefaultHasher::new();
+            session_namespace.hash(&mut session_hasher);
+            let session_hash = session_hasher.finish();
+            let mut args_hasher = DefaultHasher::new();
+            effective_command.hash(&mut args_hasher);
+            cwd.hash(&mut args_hasher);
+            timeout_ms.hash(&mut args_hasher);
+            format!(
+                "start_command:{session_hash:016x}:{id}:{:016x}",
+                args_hasher.finish()
+            )
+        })
     });
     let change_session = (show_detail_mode != ShowDetailMode::Disable).then(|| {
         ChangeSession::begin(
@@ -1600,6 +1675,7 @@ async fn handle_run_command(
     req: &JsonRpcRequest,
     workspace_root: &str,
     set_catdesk_as_co_author: bool,
+    command_jobs: &CommandJobManager,
 ) -> JsonRpcResponse {
     let params = &req.params;
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -1695,6 +1771,10 @@ async fn handle_run_command(
         );
     }
 
+    let _process_permit = match command_jobs.try_acquire_process() {
+        Ok(permit) => permit,
+        Err(error) => return tool_error_response(req, error),
+    };
     let result = command::run_command(
         &effective_command,
         Path::new(workspace_root),
@@ -4312,6 +4392,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_command_idempotency_is_namespaced_by_client_session() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "catdesk-mcp-session-dedupe-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+        let req = tool_call_request("start_command", json!({ "command": command }));
+
+        async fn start_for_session(
+            req: &JsonRpcRequest,
+            workspace_root: &str,
+            command_jobs: &CommandJobManager,
+            session: Option<&str>,
+        ) -> JsonRpcResponse {
+            handle_tools_call_with_session(
+                req,
+                workspace_root,
+                1,
+                Mode::Both,
+                ToolMode::MultiTools,
+                false,
+                command_jobs,
+                &None,
+                ShowDetailMode::Disable,
+                session,
+            )
+            .await
+        }
+        let job_id = |response: &JsonRpcResponse| {
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("jobId"))
+                .and_then(Value::as_str)
+                .expect("missing job id")
+                .to_string()
+        };
+        let deduplicated = |response: &JsonRpcResponse| {
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("deduplicated"))
+                .and_then(Value::as_bool)
+                .expect("missing deduplicated flag")
+        };
+
+        let session_a_first =
+            start_for_session(&req, &workspace_root_str, &command_jobs, Some("session-a")).await;
+        let session_a_retry =
+            start_for_session(&req, &workspace_root_str, &command_jobs, Some("session-a")).await;
+        assert_eq!(job_id(&session_a_first), job_id(&session_a_retry));
+        assert!(!deduplicated(&session_a_first));
+        assert!(deduplicated(&session_a_retry));
+
+        let session_b =
+            start_for_session(&req, &workspace_root_str, &command_jobs, Some("session-b")).await;
+        assert_ne!(job_id(&session_a_first), job_id(&session_b));
+        assert!(!deduplicated(&session_b));
+
+        let anonymous_first =
+            start_for_session(&req, &workspace_root_str, &command_jobs, None).await;
+        let anonymous_second =
+            start_for_session(&req, &workspace_root_str, &command_jobs, None).await;
+        assert_ne!(job_id(&anonymous_first), job_id(&anonymous_second));
+        assert!(!deduplicated(&anonymous_first));
+        assert!(!deduplicated(&anonymous_second));
+
+        command_jobs.cancel_all().await;
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn reused_json_rpc_id_with_different_start_arguments_creates_distinct_jobs() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-id-reuse-{}", Uuid::new_v4()));
@@ -4627,6 +4788,46 @@ mod tests {
         );
         assert_eq!(structured.get("exitCode").and_then(Value::as_i64), Some(7));
 
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn run_command_shares_process_budget_with_background_jobs() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-run-budget-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new_with_process_limit(1);
+        let _occupied = command_jobs
+            .try_acquire_process()
+            .expect("occupy shared process budget");
+        let req = tool_call_request("run_command", json!({ "command": "printf budget-test" }));
+
+        let response = handle_tools_call(
+            &req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            result_text(&response).contains("too many active command processes"),
+            "unexpected result text: {}",
+            result_text(&response)
+        );
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
