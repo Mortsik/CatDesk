@@ -1608,6 +1608,7 @@ async fn handle_start_command(
     }
 }
 
+#[cfg(test)]
 async fn handle_poll_command(
     req: &JsonRpcRequest,
     command_jobs: &CommandJobManager,

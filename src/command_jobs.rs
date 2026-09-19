@@ -428,6 +428,7 @@ impl CommandJobManager {
         })
     }
 
+    #[cfg(test)]
     pub async fn poll(
         &self,
         job_id: &str,
@@ -463,6 +464,7 @@ impl CommandJobManager {
         Ok(job.snapshot(after).await)
     }
 
+    #[cfg(test)]
     pub async fn current_changes(&self, job_id: &str) -> Result<Vec<FileChange>, String> {
         self.current_changes_for_session(job_id, None).await
     }
@@ -481,6 +483,7 @@ impl CommandJobManager {
             .unwrap_or_default())
     }
 
+    #[cfg(test)]
     pub async fn cancel(&self, job_id: &str) -> Result<CommandJobSnapshot, String> {
         self.cancel_for_session(job_id, None).await
     }

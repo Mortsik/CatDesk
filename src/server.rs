@@ -3178,6 +3178,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_named_sessions_with_reused_rpc_ids_keep_workloads_isolated() {
+        let workspace_root = unique_temp_path("catdesk-parallel-session-stress-workspace");
+        let config_root = unique_temp_path("catdesk-parallel-session-stress-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+        std::fs::write(workspace_root.join("hello.txt"), "hello parallel\n").expect("write file");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let gate = InstructionGate::with_anonymous(false);
+        for index in 0..18 {
+            let session_id = format!("stress-session-{index}");
+            let body = tool_call_body("catdesk_instruction", json!({}));
+            let session = ClientSession::from_headers(&modern_mcp_headers_for_session(
+                &body,
+                &session_id,
+            ));
+            gate.mark_called(&session);
+        }
+        let command_jobs = CommandJobManager::new();
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: command_jobs.clone(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: gate,
+        };
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 150"
+        } else {
+            "sleep 0.15"
+        };
+
+        let mut tasks = Vec::new();
+        for index in 0..18usize {
+            let session_id = format!("stress-session-{index}");
+            let body = match index % 3 {
+                0 => mcp_request_body("tools/list", json!({})),
+                1 => tool_call_body("read", json!({ "paths": ["hello.txt"] })),
+                _ => tool_call_body("start_command", json!({ "command": command })),
+            };
+            let headers = modern_mcp_headers_for_session(&body, &session_id);
+            let state = server_state.clone();
+            tasks.push(tokio::spawn(async move {
+                let response = post_mcp_http(State(state), headers, body).await;
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("read stress response");
+                let payload: Value = serde_json::from_slice(&bytes).expect("parse stress response");
+                (index, session_id, status, payload)
+            }));
+        }
+
+        let mut process_jobs = Vec::new();
+        for task in tasks {
+            let (index, session_id, status, payload) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                task,
+            )
+            .await
+            .expect("parallel MCP request hung")
+            .expect("parallel MCP task panicked");
+            assert_eq!(status, StatusCode::OK, "request failed for {session_id}: {payload}");
+            assert_eq!(payload.get("id").and_then(Value::as_str), Some("req-mcp"));
+            match index % 3 {
+                0 => assert!(
+                    payload
+                        .pointer("/result/tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|tools| !tools.is_empty()),
+                    "control response missing tools for {session_id}: {payload}"
+                ),
+                1 => assert_eq!(
+                    payload
+                        .pointer("/result/structuredContent/files/0/text")
+                        .and_then(Value::as_str),
+                    Some("hello parallel\n"),
+                    "filesystem response crossed or lost session state for {session_id}"
+                ),
+                _ => {
+                    let job_id = payload
+                        .pointer("/result/structuredContent/jobId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| panic!("process response missing job id for {session_id}: {payload}"));
+                    process_jobs.push((session_id, job_id.to_string()));
+                }
+            }
+        }
+
+        assert_eq!(process_jobs.len(), 6);
+        let unique_job_ids = process_jobs
+            .iter()
+            .map(|(_, job_id)| job_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            unique_job_ids.len(),
+            process_jobs.len(),
+            "different sessions reusing one JSON-RPC id must never share a command job"
+        );
+        for (session_id, job_id) in &process_jobs {
+            command_jobs
+                .poll_for_session(job_id, 0, 0, Some(session_id))
+                .await
+                .expect("job must remain visible to its owner session");
+        }
+
+        command_jobs.cancel_all().await;
+        let _ = std::fs::remove_file(workspace_root.join("hello.txt"));
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
     async fn disabled_show_detail_mode_hides_widgets_across_mcp_flow() {
         let workspace_root = unique_temp_path("catdesk-disable-mcp-flow-workspace");
         let config_root = unique_temp_path("catdesk-disable-mcp-flow-config");

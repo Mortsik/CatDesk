@@ -174,10 +174,11 @@ mod tests {
     async fn timeout_keeps_capacity_reserved_until_work_really_finishes() {
         let workers = RequestWorkers::new(1);
         let (release, wait) = std::sync::mpsc::channel();
-        // A separate watchdog also releases the fixture on the unfixed implementation.
+        let watchdog = release.clone();
+        // Safety only: never leave a blocking fixture behind if an assertion fails.
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            let _ = release.send(());
+            std::thread::sleep(Duration::from_secs(2));
+            let _ = watchdog.send(());
         });
         let result = workers
             .run(
@@ -191,21 +192,26 @@ mod tests {
             result.is_err(),
             "blocked work must have a response deadline"
         );
-        assert!(
-            workers
-                .run(async { 42 }, Duration::from_secs(1))
-                .await
-                .is_err(),
+        let rejected = workers.run(async { 42 }, Duration::from_secs(1)).await;
+        let _ = release.send(());
+        assert_eq!(
+            rejected,
+            Err(RequestFailure::Busy),
             "timed out work still owns its slot"
         );
-        tokio::time::sleep(Duration::from_millis(350)).await;
-        assert_eq!(
-            workers
-                .run(async { 42 }, Duration::from_secs(1))
-                .await
-                .unwrap(),
-            42
-        );
+
+        let value = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match workers.run(async { 42 }, Duration::from_secs(1)).await {
+                    Ok(value) => break value,
+                    Err(RequestFailure::Busy) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected worker failure after release: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("worker capacity did not recover after underlying work finished");
+        assert_eq!(value, 42);
     }
 
     #[tokio::test]
@@ -242,6 +248,106 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn mixed_saturation_fails_fast_without_starving_control_and_recovers_capacity() {
+        let scheduler = RequestScheduler::with_limits(RequestLimits {
+            control: 2,
+            filesystem: 2,
+            process: 2,
+            browser: 1,
+            general: 1,
+        });
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(4);
+        let mut blockers = Vec::new();
+
+        for class in [
+            RequestClass::Filesystem,
+            RequestClass::Filesystem,
+            RequestClass::Process,
+            RequestClass::Process,
+        ] {
+            let scheduler = scheduler.clone();
+            let release = release.clone();
+            let started_tx = started_tx.clone();
+            blockers.push(tokio::spawn(async move {
+                scheduler
+                    .run(
+                        class,
+                        async move {
+                            started_tx.send(()).await.unwrap();
+                            release.notified().await;
+                            class
+                        },
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }));
+        }
+        drop(started_tx);
+        for _ in 0..4 {
+            tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+                .await
+                .expect("saturating worker did not start")
+                .expect("started channel closed early");
+        }
+
+        let mut rejected = Vec::new();
+        for index in 0..20 {
+            let scheduler = scheduler.clone();
+            let class = if index % 2 == 0 {
+                RequestClass::Filesystem
+            } else {
+                RequestClass::Process
+            };
+            rejected.push(tokio::spawn(async move {
+                scheduler
+                    .run(class, async { 1u8 }, Duration::from_secs(1))
+                    .await
+            }));
+        }
+        for task in rejected {
+            assert_eq!(task.await.unwrap(), Err(RequestFailure::Busy));
+        }
+
+        for expected in 0..8u8 {
+            let value = scheduler
+                .run(
+                    RequestClass::Control,
+                    async move { expected },
+                    Duration::from_secs(1),
+                )
+                .await;
+            assert_eq!(value, Ok(expected));
+        }
+
+        release.notify_waiters();
+        for blocker in blockers {
+            assert!(blocker.await.unwrap().is_ok());
+        }
+
+        assert_eq!(
+            scheduler
+                .run(
+                    RequestClass::Filesystem,
+                    async { 41u8 },
+                    Duration::from_secs(1),
+                )
+                .await,
+            Ok(41)
+        );
+        assert_eq!(
+            scheduler
+                .run(
+                    RequestClass::Process,
+                    async { 42u8 },
+                    Duration::from_secs(1),
+                )
+                .await,
+            Ok(42)
+        );
     }
 
     #[tokio::test]
