@@ -8,11 +8,13 @@ use axum::{
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::{Mutex, mpsc::Sender};
 
 use crate::command_jobs::CommandJobManager;
@@ -25,6 +27,112 @@ use crate::state::{
 };
 
 const STATELESS_FLOW_ID: &str = "stateless";
+const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const MAX_TRACKED_MCP_SESSIONS: usize = 1_024;
+const MCP_SESSION_TTL: StdDuration = StdDuration::from_secs(60 * 60);
+
+#[derive(Clone, Debug)]
+struct ClientSession {
+    id: Option<String>,
+    flow_id: String,
+}
+
+impl ClientSession {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let id = headers
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+            .map(str::to_string);
+        let flow_id = id
+            .as_deref()
+            .map(|session_id| {
+                let mut hasher = DefaultHasher::new();
+                session_id.hash(&mut hasher);
+                format!("session:{:016x}", hasher.finish())
+            })
+            .unwrap_or_else(|| STATELESS_FLOW_ID.to_string());
+        Self { id, flow_id }
+    }
+
+    fn namespace(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SessionInstructionState {
+    called: bool,
+    last_seen: Instant,
+}
+
+#[derive(Default)]
+struct InstructionSessionMap {
+    sessions: HashMap<String, SessionInstructionState>,
+}
+
+#[derive(Clone)]
+struct InstructionGate {
+    anonymous_called: Arc<AtomicBool>,
+    sessions: Arc<StdMutex<InstructionSessionMap>>,
+}
+
+impl InstructionGate {
+    fn with_anonymous(called: bool) -> Self {
+        Self {
+            anonymous_called: Arc::new(AtomicBool::new(called)),
+            sessions: Arc::new(StdMutex::new(InstructionSessionMap::default())),
+        }
+    }
+
+    fn prune_sessions(state: &mut InstructionSessionMap, now: Instant) {
+        state
+            .sessions
+            .retain(|_, session| now.duration_since(session.last_seen) <= MCP_SESSION_TTL);
+    }
+
+    fn is_called(&self, session: &ClientSession) -> bool {
+        let Some(session_id) = session.namespace() else {
+            return self.anonymous_called.load(Ordering::Acquire);
+        };
+        let now = Instant::now();
+        let mut state = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_sessions(&mut state, now);
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return false;
+        };
+        session.last_seen = now;
+        session.called
+    }
+
+    fn mark_called(&self, session: &ClientSession) {
+        let Some(session_id) = session.namespace() else {
+            self.anonymous_called.store(true, Ordering::Release);
+            return;
+        };
+        let now = Instant::now();
+        let mut state = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_sessions(&mut state, now);
+        if !state.sessions.contains_key(session_id) && state.sessions.len() >= MAX_TRACKED_MCP_SESSIONS {
+            if let Some(oldest) = state
+                .sessions
+                .iter()
+                .min_by_key(|(_, session)| session.last_seen)
+                .map(|(id, _)| id.clone())
+            {
+                state.sessions.remove(&oldest);
+            }
+        }
+        state.sessions.insert(
+            session_id.to_string(),
+            SessionInstructionState {
+                called: true,
+                last_seen: now,
+            },
+        );
+    }
+}
 
 #[derive(Clone)]
 struct ServerState {
@@ -32,7 +140,7 @@ struct ServerState {
     devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     command_jobs: CommandJobManager,
     ui_events: Sender<ServerUiEvent>,
-    catdesk_instruction_called: Arc<AtomicBool>,
+    catdesk_instruction_called: InstructionGate,
 }
 
 /// Build the axum router.
@@ -48,7 +156,7 @@ pub fn router(
         devtools,
         command_jobs,
         ui_events,
-        catdesk_instruction_called: Arc::new(AtomicBool::new(false)),
+        catdesk_instruction_called: InstructionGate::with_anonymous(false),
     };
     let secret_prefix = mcp_path
         .strip_suffix("/mcp")
@@ -109,7 +217,7 @@ fn with_widget_action_cors(
     );
     builder = builder.header(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        "content-type, ngrok-skip-browser-warning",
+        "content-type, ngrok-skip-browser-warning, mcp-session-id",
     );
     builder = builder.header(header::CACHE_CONTROL, "no-store");
     builder
@@ -1527,7 +1635,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
-            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
         };
 
         sync_show_detail_mode_state(&server_state, ShowDetailMode::Disable).await;
@@ -1563,7 +1671,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
-            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
         };
 
         let response = post_mcp(
@@ -1613,7 +1721,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
-            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
         };
 
         let response = post_mcp(
@@ -1671,7 +1779,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
-            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
         };
 
         let response = post_mcp(
@@ -1746,7 +1854,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
-            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
         };
 
         let response = post_mcp(
@@ -1842,6 +1950,12 @@ mod tests {
         modern_mcp_headers(method, name)
     }
 
+    fn modern_mcp_headers_for_session(body: &Bytes, session_id: &str) -> HeaderMap {
+        let mut headers = modern_mcp_headers_for_body(body);
+        headers.insert("mcp-session-id", session_id.parse().expect("session header"));
+        headers
+    }
+
     async fn post_mcp(State(s): State<ServerState>, body: Bytes) -> Response<Body> {
         let headers = modern_mcp_headers_for_body(&body);
         post_mcp_inner(State(s), body, &headers, None).await
@@ -1876,7 +1990,7 @@ mod tests {
         let (ui_events, _receiver) = channel(crate::state::UI_EVENT_CAPACITY);
         let server = ServerState {
             app: state.clone(), devtools: None, command_jobs: CommandJobManager::new(),
-            ui_events, catdesk_instruction_called: Arc::new(AtomicBool::new(false)),
+            ui_events, catdesk_instruction_called: InstructionGate::with_anonymous(false),
         };
         let _locked = state.lock().await;
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), post_mcp_http(
@@ -1907,7 +2021,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
-            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
         };
 
         let discover = post_mcp_http(
@@ -2054,7 +2168,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
-            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
         };
 
         let legacy_shape = post_mcp_http(
@@ -2423,7 +2537,7 @@ mod tests {
             devtools: None,
             command_jobs: command_jobs.clone(),
             ui_events: ui_tx,
-            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
         };
         let command = if cfg!(windows) {
             "Start-Sleep -Milliseconds 250; Write-Output http-job-done"
@@ -2535,7 +2649,7 @@ mod tests {
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
-        let instruction_called = Arc::new(AtomicBool::new(false));
+        let instruction_called = InstructionGate::with_anonymous(false);
         let server_state = ServerState {
             app: app_state,
             devtools: None,
@@ -2578,7 +2692,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some("CATDESK_INSTRUCTION_REQUIRED")
         );
-        assert!(!instruction_called.load(Ordering::Acquire));
+        assert!(!instruction_called.is_called(&ClientSession::from_headers(&HeaderMap::new())));
 
         let instruction_response = post_mcp(
             State(server_state.clone()),
@@ -2598,7 +2712,7 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
-        assert!(instruction_called.load(Ordering::Acquire));
+        assert!(instruction_called.is_called(&ClientSession::from_headers(&HeaderMap::new())));
 
         let allowed_response = post_mcp(
             State(server_state),
@@ -2627,6 +2741,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn instruction_gate_is_isolated_between_mcp_sessions() {
+        let workspace_root = unique_temp_path("catdesk-session-instruction-workspace");
+        let config_root = unique_temp_path("catdesk-session-instruction-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+        std::fs::write(workspace_root.join("hello.txt"), "hello world\n").expect("write file");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, mut ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: InstructionGate::with_anonymous(false),
+        };
+
+        let instruction_body = tool_call_body("catdesk_instruction", json!({}));
+        let instruction = post_mcp_http(
+            State(server_state.clone()),
+            modern_mcp_headers_for_session(&instruction_body, "client-a-secret-session"),
+            instruction_body,
+        )
+        .await;
+        assert_eq!(instruction.status(), StatusCode::OK);
+
+        let read_a_body = tool_call_body("read", json!({ "paths": ["hello.txt"] }));
+        let read_a = post_mcp_http(
+            State(server_state.clone()),
+            modern_mcp_headers_for_session(&read_a_body, "client-a-secret-session"),
+            read_a_body,
+        )
+        .await;
+        let read_a_body = to_bytes(read_a.into_body(), usize::MAX).await.unwrap();
+        let read_a_payload: Value = serde_json::from_slice(&read_a_body).unwrap();
+        assert_eq!(
+            read_a_payload
+                .pointer("/result/structuredContent/files/0/text")
+                .and_then(Value::as_str),
+            Some("hello world\n"),
+            "the session that called catdesk_instruction must stay unlocked"
+        );
+
+        let read_b_body = tool_call_body("read", json!({ "paths": ["hello.txt"] }));
+        let read_b = post_mcp_http(
+            State(server_state),
+            modern_mcp_headers_for_session(&read_b_body, "client-b-secret-session"),
+            read_b_body,
+        )
+        .await;
+        let read_b_body = to_bytes(read_b.into_body(), usize::MAX).await.unwrap();
+        let read_b_payload: Value = serde_json::from_slice(&read_b_body).unwrap();
+        assert_eq!(
+            read_b_payload
+                .pointer("/result/structuredContent/errorCode")
+                .and_then(Value::as_str),
+            Some("CATDESK_INSTRUCTION_REQUIRED"),
+            "one MCP client's instruction call must not unlock another client"
+        );
+
+        let mut session_flow_ids = Vec::new();
+        while let Ok(event) = ui_rx.try_recv() {
+            if let ServerUiEvent::RecordFlow { flow_id, .. } = event {
+                session_flow_ids.push(flow_id);
+            }
+        }
+        assert!(session_flow_ids.iter().any(|flow_id| flow_id != STATELESS_FLOW_ID));
+        assert!(session_flow_ids.iter().all(|flow_id| !flow_id.contains("client-a-secret-session")));
+        assert!(session_flow_ids.iter().all(|flow_id| !flow_id.contains("client-b-secret-session")));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
     async fn disabled_show_detail_mode_hides_widgets_across_mcp_flow() {
         let workspace_root = unique_temp_path("catdesk-disable-mcp-flow-workspace");
         let config_root = unique_temp_path("catdesk-disable-mcp-flow-config");
@@ -2644,7 +2840,7 @@ mod tests {
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
-        let instruction_called = Arc::new(AtomicBool::new(false));
+        let instruction_called = InstructionGate::with_anonymous(false);
         let server_state = ServerState {
             app: app_state.clone(),
             devtools: None,
@@ -2733,7 +2929,7 @@ mod tests {
                 .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
                 .is_none()
         );
-        assert!(instruction_called.load(Ordering::Acquire));
+        assert!(instruction_called.is_called(&ClientSession::from_headers(&HeaderMap::new())));
 
         let allowed = post_mcp_json_with_show_detail_mode(
             &server_state,
@@ -2824,7 +3020,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
-            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
         };
 
         let response = post_mcp(
@@ -2974,6 +3170,8 @@ async fn post_mcp_inner(
     crate::diagnostics::rpc_request(&body);
     let _ = s.ui_events.try_send(ServerUiEvent::IncrementRequestCount);
     let _ = s.ui_events.try_send(ServerUiEvent::SetRemoteConnected(true));
+    let client_session = ClientSession::from_headers(headers);
+    let flow_id = client_session.flow_id.clone();
 
     let has_method = body.get("method").and_then(Value::as_str).is_some();
     if !has_method {
@@ -3005,7 +3203,7 @@ async fn post_mcp_inner(
     let request_flow_event = request_flow_label(&body);
 
     let _ = s.ui_events.try_send(ServerUiEvent::RecordFlow {
-        flow_id: STATELESS_FLOW_ID.to_string(),
+        flow_id: flow_id.clone(),
         events: vec![request_flow_event.clone()],
         direction: FlowDirection::Forward,
     });
@@ -3075,7 +3273,7 @@ async fn post_mcp_inner(
         mode,
         tool_mode,
         set_catdesk_as_co_author,
-        s.catdesk_instruction_called.load(Ordering::Acquire),
+        s.catdesk_instruction_called.is_called(&client_session),
         &s.command_jobs,
         &s.devtools,
         show_detail_mode,
@@ -3092,7 +3290,7 @@ async fn post_mcp_inner(
                     result.get("isError").and_then(Value::as_bool) != Some(true)
                 })
             {
-                s.catdesk_instruction_called.store(true, Ordering::Release);
+                s.catdesk_instruction_called.mark_called(&client_session);
             }
             let turn_token_usage = turn_token_usage_for_response(&req, resp.result.as_ref());
             let usage_totals = {
@@ -3100,7 +3298,7 @@ async fn post_mcp_inner(
                 if let Some((tool_input_tokens, tool_output_tokens)) = turn_token_usage {
                     app.record_turn_usage(tool_input_tokens, tool_output_tokens);
                     let _ = s.ui_events.try_send(ServerUiEvent::RecordTurnUsage {
-                        flow_id: STATELESS_FLOW_ID.to_string(),
+                        flow_id: flow_id.clone(),
                         tool_input_tokens,
                         tool_output_tokens,
                     });
@@ -3132,7 +3330,7 @@ async fn post_mcp_inner(
                 let _ = s
                     .ui_events
                     .try_send(ServerUiEvent::RecordBootstrapDiscoverResponse {
-                        flow_id: STATELESS_FLOW_ID.to_string(),
+                        flow_id: flow_id.clone(),
                         success: response_succeeded,
                     });
             }
@@ -3144,7 +3342,7 @@ async fn post_mcp_inner(
                 let _ = s
                     .ui_events
                     .try_send(ServerUiEvent::RecordBootstrapToolsListResponse {
-                        flow_id: STATELESS_FLOW_ID.to_string(),
+                        flow_id: flow_id.clone(),
                         success: response_succeeded,
                         widgets,
                     });
@@ -3158,7 +3356,7 @@ async fn post_mcp_inner(
                     let _ = s
                         .ui_events
                         .try_send(ServerUiEvent::RecordBootstrapWidgetReadResponse {
-                            flow_id: STATELESS_FLOW_ID.to_string(),
+                            flow_id: flow_id.clone(),
                             tool_name: tool_name.to_string(),
                             success: response_succeeded,
                         });
@@ -3168,7 +3366,7 @@ async fn post_mcp_inner(
         }
 
         let _ = s.ui_events.try_send(ServerUiEvent::RecordFlow {
-            flow_id: STATELESS_FLOW_ID.to_string(),
+            flow_id: flow_id.clone(),
             events: vec![request_flow_event.clone()],
             direction: FlowDirection::Backward,
         });
@@ -3248,10 +3446,13 @@ async fn get_mcp() -> Response<Body> {
 
 // ── DELETE /<slug>/mcp ──────────────────────────────────────
 
-async fn delete_mcp(State(s): State<ServerState>) -> Response<Body> {
-    let _ = s.ui_events.try_send(ServerUiEvent::SetRemoteConnected(false));
+async fn delete_mcp(State(s): State<ServerState>, headers: HeaderMap) -> Response<Body> {
+    let client_session = ClientSession::from_headers(&headers);
+    if client_session.namespace().is_none() {
+        let _ = s.ui_events.try_send(ServerUiEvent::SetRemoteConnected(false));
+    }
     let _ = s.ui_events.try_send(ServerUiEvent::BeginFlowClose {
-        flow_id: STATELESS_FLOW_ID.to_string(),
+        flow_id: client_session.flow_id,
     });
     let _ = s.ui_events.try_send(ServerUiEvent::Log {
         level: "INFO",
