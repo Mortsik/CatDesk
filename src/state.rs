@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -14,6 +14,7 @@ use crate::command_jobs::CommandJobManager;
 // UI telemetry is best-effort. A stalled terminal must not grow an unbounded
 // queue of request events in memory or block the server trying to publish them.
 pub(crate) const UI_EVENT_CAPACITY: usize = 2048;
+static APP_CONFIG_IO_LOCK: StdMutex<()> = StdMutex::new(());
 use crate::mascot::{self, MascotPack};
 use crate::theme;
 
@@ -391,23 +392,42 @@ impl AppConfig {
         }
 
         let text = toml::to_string_pretty(&config).map_err(std::io::Error::other)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.toml");
+        let temp_path = parent.join(format!(
+            ".{file_name}.tmp-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
         let mut options = OpenOptions::new();
-        options.create(true).write(true).truncate(true);
+        options.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(path)?;
-        use std::io::Write as _;
-        file.write_all(text.as_bytes())?;
-        file.flush()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = options.open(&temp_path)?;
+            use std::io::Write as _;
+            file.write_all(text.as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp_path, path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
         }
-        Ok(())
+        write_result
     }
 }
 
@@ -674,11 +694,23 @@ pub fn load_ngrok_authtoken() -> std::io::Result<Option<String>> {
     Ok(load_app_config()?.ngrok_authtoken)
 }
 
+fn update_app_config_at_path<F>(path: &Path, update: F) -> std::io::Result<()>
+where
+    F: FnOnce(&mut AppConfig),
+{
+    let _guard = APP_CONFIG_IO_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut config = AppConfig::load_from_path(path)?;
+    update(&mut config);
+    config.save_to_path(path)
+}
+
 pub fn save_ngrok_authtoken(token: &str) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.ngrok_authtoken = Some(token.to_string());
-    config.save_to_path(&path)?;
+    update_app_config_at_path(&path, |config| {
+        config.ngrok_authtoken = Some(token.to_string());
+    })?;
     Ok(path)
 }
 
@@ -688,33 +720,27 @@ pub fn load_ngrok_domain() -> std::io::Result<Option<String>> {
 
 pub fn save_ngrok_domain(domain: &str) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.ngrok_domain = Some(domain.to_string());
-    config.save_to_path(&path)?;
+    update_app_config_at_path(&path, |config| {
+        config.ngrok_domain = Some(domain.to_string());
+    })?;
     Ok(path)
 }
 
 pub fn save_agents_path_mode(mode: AgentsPathMode) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.agents_path_mode = mode;
-    config.save_to_path(&path)?;
+    update_app_config_at_path(&path, |config| config.agents_path_mode = mode)?;
     Ok(path)
 }
 
 pub fn save_token_stats_layout(layout: TokenStatsLayout) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.token_stats_layout = layout;
-    config.save_to_path(&path)?;
+    update_app_config_at_path(&path, |config| config.token_stats_layout = layout)?;
     Ok(path)
 }
 
 pub fn save_show_detail_mode(mode: ShowDetailMode) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.show_detail_mode = mode;
-    config.save_to_path(&path)?;
+    update_app_config_at_path(&path, |config| config.show_detail_mode = mode)?;
     Ok(path)
 }
 
@@ -724,9 +750,7 @@ pub fn load_macos_terminal_profile() -> std::io::Result<Option<bool>> {
 
 pub fn save_macos_terminal_profile(enabled: bool) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.macos_terminal_profile = Some(enabled);
-    config.save_to_path(&path)?;
+    update_app_config_at_path(&path, |config| config.macos_terminal_profile = Some(enabled))?;
     Ok(path)
 }
 
@@ -1037,6 +1061,9 @@ impl AppState {
     }
 
     pub fn persist_state(&self) -> std::io::Result<()> {
+        let _guard = APP_CONFIG_IO_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.app_config()?.save_to_path(&self.config_path)
     }
 
@@ -1266,11 +1293,15 @@ impl AppState {
         tool_input_tokens: u64,
         tool_output_tokens: u64,
     ) {
-        let flow = self
+        let Some(flow) = self
             .flows
             .iter_mut()
             .find(|flow| flow.flow_id == flow_id)
-            .expect("tool usage received for unknown flow");
+        else {
+            // UI events are best-effort. A saturated bounded channel may drop
+            // the flow event while a later usage event still arrives.
+            return;
+        };
         let mut usage = UsageTotals::default();
         usage.accumulate(tool_input_tokens, tool_output_tokens, 1);
         flow.turn_usage = Some(usage);
@@ -1626,6 +1657,56 @@ toolCallCount = 1
     }
 
     #[test]
+    fn serialized_config_updates_preserve_independent_fields() {
+        use std::sync::{Arc as StdArc, Barrier};
+
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-config-race-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create temp config dir");
+        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
+        AppConfig::default()
+            .save_to_path(&config_path)
+            .expect("seed config");
+        let barrier = StdArc::new(Barrier::new(3));
+
+        let first_path = config_path.clone();
+        let first_barrier = barrier.clone();
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            update_app_config_at_path(&first_path, |config| {
+                config.agents_path_mode = AgentsPathMode::Codex;
+            })
+        });
+        let second_path = config_path.clone();
+        let second_barrier = barrier.clone();
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            update_app_config_at_path(&second_path, |config| {
+                config.token_stats_layout = TokenStatsLayout::Bottom;
+            })
+        });
+        barrier.wait();
+        first.join().expect("join first update").expect("first update");
+        second.join().expect("join second update").expect("second update");
+
+        let saved = AppConfig::load_from_path(&config_path).expect("load config");
+        assert!(matches!(saved.agents_path_mode, AgentsPathMode::Codex));
+        assert!(matches!(saved.token_stats_layout, TokenStatsLayout::Bottom));
+        let leftovers = std::fs::read_dir(&workspace)
+            .expect("read config dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path() != config_path)
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "temporary config files leaked: {leftovers:?}");
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn persist_state_writes_single_config_file() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1936,6 +2017,21 @@ toolCallCount = 0
         assert!(!flow.bootstrap_status_active);
         assert_eq!(flow.bootstrap_progress, FlowBootstrapProgress::default());
 
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn dropped_flow_event_does_not_make_later_usage_event_panic() {
+        let (mut app, workspace, config_path) = test_app("catdesk-flow-dropped-usage");
+
+        app.apply_server_ui_event(ServerUiEvent::RecordTurnUsage {
+            flow_id: "dropped-flow".to_string(),
+            tool_input_tokens: 123,
+            tool_output_tokens: 45,
+        });
+
+        assert!(app.flows.is_empty());
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
     }
