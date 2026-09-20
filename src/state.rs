@@ -118,6 +118,15 @@ impl UsageTotals {
     }
 }
 
+pub(crate) const LIVE_USAGE_WINDOW_MS: u128 = 60_000;
+
+#[derive(Clone, Debug)]
+struct UsageRateSample {
+    recorded_at_ms: u128,
+    tool_input_tokens: u64,
+    tool_output_tokens: u64,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyUsageTotals {
@@ -685,9 +694,11 @@ pub struct AppState {
     next_log_id: u64,
     pub flows: Vec<FlowLane>,
     pub flow_bootstrap_progress: HashMap<String, FlowBootstrapProgress>,
+    connected_chat_ids: HashSet<String>,
     pub request_count: u64,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
+    usage_rate_samples: VecDeque<UsageRateSample>,
     pub command_jobs: CommandJobManager,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -1057,9 +1068,11 @@ impl AppState {
             next_log_id: 0,
             flows: Vec::new(),
             flow_bootstrap_progress: HashMap::new(),
+            connected_chat_ids: HashSet::new(),
             request_count: 0,
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
+            usage_rate_samples: VecDeque::new(),
             command_jobs: crate::job_store::JobStore::default_dir()
                 .map(CommandJobManager::with_store)
                 .unwrap_or_else(CommandJobManager::new),
@@ -1149,12 +1162,47 @@ impl AppState {
     }
 
     pub fn record_turn_usage(&mut self, tool_input_tokens: u64, tool_output_tokens: u64) {
+        self.record_turn_usage_at(tool_input_tokens, tool_output_tokens, now_unix_millis());
+    }
+
+    fn record_turn_usage_at(
+        &mut self,
+        tool_input_tokens: u64,
+        tool_output_tokens: u64,
+        now_ms: u128,
+    ) {
         self.usage_by_model
             .entry(CURRENT_USAGE_BUCKET.to_string())
             .or_default()
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
         self.session_usage_totals
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
+        self.usage_rate_samples.push_back(UsageRateSample {
+            recorded_at_ms: now_ms,
+            tool_input_tokens,
+            tool_output_tokens,
+        });
+        while self.usage_rate_samples.front().is_some_and(|sample| {
+            now_ms.saturating_sub(sample.recorded_at_ms) > LIVE_USAGE_WINDOW_MS
+        }) {
+            self.usage_rate_samples.pop_front();
+        }
+    }
+
+    pub fn rolling_usage_totals(&self, now_ms: u128, window_ms: u128) -> UsageTotals {
+        let mut totals = UsageTotals::default();
+        for sample in self
+            .usage_rate_samples
+            .iter()
+            .filter(|sample| now_ms.saturating_sub(sample.recorded_at_ms) <= window_ms)
+        {
+            totals.accumulate(sample.tool_input_tokens, sample.tool_output_tokens, 1);
+        }
+        totals
+    }
+
+    pub fn connected_chat_count(&self) -> usize {
+        self.connected_chat_ids.len()
     }
 
     pub fn apply_server_ui_event(&mut self, event: ServerUiEvent) {
@@ -1168,6 +1216,7 @@ impl AppState {
                     self.last_remote_activity_ms = Some(now_unix_millis());
                 } else {
                     self.last_remote_activity_ms = None;
+                    self.connected_chat_ids.clear();
                 }
             }
             ServerUiEvent::RecordFlow {
@@ -1219,6 +1268,7 @@ impl AppState {
         let now_ms = now_unix_millis();
         self.last_remote_activity_ms = Some(now_ms);
         self.remote_connected = true;
+        self.connected_chat_ids.insert(flow_id.to_string());
         let step_ms = derive_flow_step_ms();
         let starts_bootstrap_status = events_start_bootstrap_status(events);
         let only_bootstrap_status_events = events_are_bootstrap_status_events(events);
@@ -1376,6 +1426,7 @@ impl AppState {
 
     pub fn begin_flow_close(&mut self, flow_id: &str) {
         let now_ms = now_unix_millis();
+        self.connected_chat_ids.remove(flow_id);
         self.flow_bootstrap_progress.remove(flow_id);
         if let Some(flow) = self.flows.iter_mut().find(|flow| flow.flow_id == flow_id) {
             if flow.closing_started_ms.is_none() {
@@ -2144,6 +2195,71 @@ toolCallCount = 0
                 .turn_usage
                 .is_none()
         );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn rolling_usage_totals_only_include_the_requested_window() {
+        let (mut app, workspace, config_path) = test_app("catdesk-rolling-usage");
+        app.record_turn_usage_at(100, 10, 1_000);
+        app.record_turn_usage_at(200, 20, 30_000);
+        app.record_turn_usage_at(300, 30, 61_001);
+
+        let rolling = app.rolling_usage_totals(61_001, 60_000);
+        assert_eq!(rolling.tool_input_tokens, 500);
+        assert_eq!(rolling.tool_output_tokens, 50);
+        assert_eq!(rolling.total_tokens, 550);
+        assert_eq!(rolling.tool_call_count, 2);
+
+        let session = app.session_usage_totals.clone();
+        assert_eq!(session.tool_input_tokens, 600);
+        assert_eq!(session.tool_output_tokens, 60);
+        assert_eq!(session.total_tokens, 660);
+        assert_eq!(session.tool_call_count, 3);
+        assert_eq!(app.all_time_usage_totals(), session);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn rolling_usage_samples_are_pruned_to_the_live_window() {
+        let (mut app, workspace, config_path) = test_app("catdesk-rolling-usage-prune");
+        app.record_turn_usage_at(10, 1, 1_000);
+        app.record_turn_usage_at(20, 2, 61_001);
+
+        assert_eq!(app.usage_rate_samples.len(), 1);
+        let rolling = app.rolling_usage_totals(61_001, 60_000);
+        assert_eq!(rolling.tool_input_tokens, 20);
+        assert_eq!(rolling.tool_output_tokens, 2);
+        assert_eq!(rolling.tool_call_count, 1);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn connected_chat_count_tracks_independent_flow_lifecycles() {
+        let (mut app, workspace, config_path) = test_app("catdesk-connected-chats");
+        app.record_flow(
+            "session:a",
+            &["tools/call:read".to_string()],
+            FlowDirection::Forward,
+        );
+        app.record_flow(
+            "session:b",
+            &["tools/call:read".to_string()],
+            FlowDirection::Forward,
+        );
+        assert_eq!(app.connected_chat_count(), 2);
+
+        app.begin_flow_close("session:a");
+        assert_eq!(app.connected_chat_count(), 1);
+
+        app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected(false));
+        assert_eq!(app.connected_chat_count(), 0);
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);

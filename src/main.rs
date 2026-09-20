@@ -43,11 +43,11 @@ use ratatui::{
 };
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
-    GPT_5_6_AND_EARLIER_USAGE_BUCKET, LogEntry, Mode, ServerUiEvent, SharedState, ShowDetailMode,
-    ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle, app_config_path, flow_anim_lit_count,
-    load_app_config, load_macos_terminal_profile, load_ngrok_authtoken, load_ngrok_domain,
-    local_now, save_macos_terminal_profile, save_ngrok_authtoken, save_ngrok_domain,
-    save_widget_corner_style, user_home_dir,
+    GPT_5_6_AND_EARLIER_USAGE_BUCKET, LIVE_USAGE_WINDOW_MS, LogEntry, Mode, ServerUiEvent,
+    SharedState, ShowDetailMode, ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle,
+    app_config_path, flow_anim_lit_count, load_app_config, load_macos_terminal_profile,
+    load_ngrok_authtoken, load_ngrok_domain, local_now, save_macos_terminal_profile,
+    save_ngrok_authtoken, save_ngrok_domain, save_widget_corner_style, user_home_dir,
 };
 use std::collections::HashMap;
 use std::io::{Write, stdout};
@@ -63,6 +63,7 @@ const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
 const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
 const REMOTE_CONNECT_UI_GRACE_MS: u128 = 8_000;
 const UI_POLL_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+const LIVE_TELEMETRY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const MCP_URL_REVEAL_DURATION: Duration = Duration::from_secs(10);
 const MCP_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓▓▓/mcp";
 const MCP_PATH_MASK: &str = "/▓▓▓▓▓▓▓▓/mcp";
@@ -771,6 +772,49 @@ fn usage_line(
             format!("{:<width$}", values[4], width = value_widths[4]),
             price_style,
         ),
+    ])
+}
+
+fn live_usage_rate_line(
+    usage: &UsageTotals,
+    cost_per_min_usd: f64,
+    status_label: Span<'static>,
+    palette: &theme::Palette,
+) -> Line<'static> {
+    let label_style = Style::default().fg(palette.muted_fg);
+    let value_style = Style::default()
+        .fg(palette.secondary_fg)
+        .add_modifier(Modifier::BOLD);
+    let price_style = Style::default()
+        .fg(palette.success_fg)
+        .add_modifier(Modifier::BOLD);
+    let input = format_token_compact(usage.tool_input_tokens);
+    let output = format_token_compact(usage.tool_output_tokens);
+    let total = format_token_compact(usage.total_tokens);
+    let cost_per_min = format_usd_compact(cost_per_min_usd);
+    let cost_per_hour = format_usd_compact(cost_per_min_usd * 60.0);
+
+    Line::from(vec![
+        status_label,
+        Span::styled("↓", label_style),
+        Span::styled(input, value_style),
+        Span::styled("/min", label_style),
+        Span::raw("  "),
+        Span::styled("↑", label_style),
+        Span::styled(output, value_style),
+        Span::styled("/min", label_style),
+        Span::raw("  "),
+        Span::styled("Σ", label_style),
+        Span::styled(total, value_style),
+        Span::styled("/min", label_style),
+        Span::raw("  "),
+        Span::styled("$", label_style),
+        Span::styled(cost_per_min, price_style),
+        Span::styled("/min", label_style),
+        Span::raw("  "),
+        Span::styled("$", label_style),
+        Span::styled(cost_per_hour, price_style),
+        Span::styled("/h", label_style),
     ])
 }
 
@@ -3023,6 +3067,7 @@ mod tests {
                     frame,
                     &app,
                     0,
+                    0,
                     true,
                     &mut log_view,
                     None,
@@ -3041,6 +3086,9 @@ mod tests {
             "伺服器",
             "工作區",
             "遠端已連線",
+            "聊天數",
+            "工作數",
+            "60秒速率",
             "本次工作階段",
             "累計",
             "本機瀏覽器",
@@ -3061,6 +3109,60 @@ mod tests {
             assert!(
                 text.contains(expected),
                 "missing translated text: {expected}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn main_dashboard_renders_live_telemetry() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-main-live-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let config_path = workspace.join("config.toml");
+        let mut app =
+            AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+                .expect("create app");
+        app.record_flow(
+            "session:a",
+            &["tools/call:read".to_string()],
+            super::FlowDirection::Forward,
+        );
+        app.record_flow(
+            "session:b",
+            &["tools/call:search".to_string()],
+            super::FlowDirection::Forward,
+        );
+        app.record_turn_usage(1_200, 300);
+
+        let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
+        let mut log_view = None;
+        let revealed_logs = HashMap::new();
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    &app,
+                    3,
+                    0,
+                    true,
+                    &mut log_view,
+                    None,
+                    None,
+                    &revealed_logs,
+                )
+            })
+            .expect("draw main dashboard");
+
+        let text = terminal_buffer_text(&terminal);
+        for expected in ["Chats 2", "Jobs 3", "60s rate", "/min", "/h"] {
+            assert!(
+                text.contains(expected),
+                "missing live telemetry text: {expected}"
             );
         }
 
@@ -4987,8 +5089,20 @@ async fn run_tui(
     let mut mcp_url_revealed_until: Option<Instant> = None;
     let mut log_secret_revealed_until: HashMap<u64, Instant> = HashMap::new();
     let mut current_ui_language = UiLanguage::English;
+    let mut active_job_count = 0usize;
+    let mut last_live_telemetry_refresh = Instant::now()
+        .checked_sub(LIVE_TELEMETRY_REFRESH_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     loop {
+        if last_live_telemetry_refresh.elapsed() >= LIVE_TELEMETRY_REFRESH_INTERVAL {
+            let command_jobs = state.try_lock().ok().map(|app| app.command_jobs.clone());
+            if let Some(command_jobs) = command_jobs {
+                active_job_count = command_jobs.active_job_count().await;
+                last_live_telemetry_refresh = Instant::now();
+            }
+        }
+
         // Persistence or another service may temporarily own the state. Keep
         // polling the keyboard against the last frame, especially the quit key.
         if let Ok(mut app) = state.try_lock() {
@@ -5014,6 +5128,7 @@ async fn run_tui(
                 draw_ui(
                     f,
                     &app,
+                    active_job_count,
                     log_scroll,
                     log_follow_tail,
                     &mut latest_log_view,
@@ -5333,6 +5448,7 @@ async fn run_tui(
 fn draw_ui(
     f: &mut Frame,
     app: &AppState,
+    active_job_count: usize,
     log_scroll: usize,
     log_follow_tail: bool,
     log_view: &mut Option<LogView>,
@@ -5485,6 +5601,8 @@ fn draw_ui(
     let status_content_height = status_height.saturating_sub(4) as usize;
     let flow_block_lines = 3;
 
+    let rolling_usage_totals = app.rolling_usage_totals(now_millis, LIVE_USAGE_WINDOW_MS);
+    let rolling_usage_cost_usd = estimate_gpt_5_6_and_earlier_usage_cost_usd(&rolling_usage_totals);
     let all_time_usage_totals = app.all_time_usage_totals();
     let session_usage_cost_usd =
         estimate_gpt_5_6_and_earlier_usage_cost_usd(&app.session_usage_totals);
@@ -5622,8 +5740,36 @@ fn draw_ui(
                         .add_modifier(Modifier::BOLD),
                 ));
             }
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("{} ", ui_language.text("Chats", "聊天數")),
+                Style::default().fg(palette.muted_fg),
+            ));
+            spans.push(Span::styled(
+                app.connected_chat_count().to_string(),
+                Style::default()
+                    .fg(palette.secondary_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("{} ", ui_language.text("Jobs", "工作數")),
+                Style::default().fg(palette.muted_fg),
+            ));
+            spans.push(Span::styled(
+                active_job_count.to_string(),
+                Style::default()
+                    .fg(palette.secondary_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
             Line::from(spans)
         },
+        live_usage_rate_line(
+            &rolling_usage_totals,
+            rolling_usage_cost_usd,
+            status_label(ui_language.text("60s rate", "60 秒速率")),
+            &palette,
+        ),
         usage_line(
             &app.session_usage_totals,
             session_usage_cost_usd,
