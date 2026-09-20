@@ -14,6 +14,7 @@ mod mcp;
 mod request_workers;
 mod ngrok;
 mod process_runner;
+mod project_scope;
 mod server;
 mod startup;
 mod state;
