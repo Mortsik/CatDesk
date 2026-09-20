@@ -569,6 +569,11 @@ pub async fn spawn_shell_command(
     workspace_root: &Path,
     cwd: &Path,
 ) -> io::Result<SpawnedProcess> {
+    // Operator-only actions are denied before spawn so the explanation lands
+    // in the command's own error channel (see command_policy for the why).
+    if let Err(denied) = crate::command_policy::check_vm_bounce(command) {
+        return Err(io::Error::other(denied));
+    }
     #[cfg(target_os = "linux")]
     {
         let prepared = prepare_linux_command_async(
@@ -875,6 +880,26 @@ mod tests {
             let _ = process.wait().await;
         });
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn spawn_shell_command_denies_wsl_shutdown_before_spawn() {
+        let root = workspace("deny-vm-bounce");
+        let error = match spawn_shell_command(
+            "/mnt/c/Windows/System32/wsl.exe --shutdown",
+            &root,
+            &root,
+        )
+        .await
+        {
+            Ok(_) => panic!("wsl --shutdown must be denied before spawn"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("DENIED (operator-only)"),
+            "unexpected error: {error}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
