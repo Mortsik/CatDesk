@@ -38,6 +38,9 @@ const CATDESK_WIDGET_HTML: &str = include_str!("widget/catdesk_dashboard.html");
 const REENABLE_WIDGET_PNG: &[u8] = include_bytes!("widget/assets/reenable_widget.png");
 const REFRESH_CATDESK_PNG: &[u8] = include_bytes!("widget/assets/refresh_catdesk.png");
 const REMOVE_CATDESK_PNG: &[u8] = include_bytes!("widget/assets/remove_catdesk.png");
+static REENABLE_WIDGET_IMAGE: OnceLock<String> = OnceLock::new();
+static REFRESH_CATDESK_IMAGE: OnceLock<String> = OnceLock::new();
+static REMOVE_CATDESK_IMAGE: OnceLock<String> = OnceLock::new();
 const WIDGET_RESOURCE_URI_PLACEHOLDER: &str = "__catdeskWidgetResourceUriPlaceholder__";
 const REENABLE_WIDGET_IMAGE_PLACEHOLDER: &str = "__catdeskReenableWidgetImageDataUriPlaceholder__";
 const REFRESH_CATDESK_IMAGE_PLACEHOLDER: &str = "__catdeskRefreshCatdeskImageDataUriPlaceholder__";
@@ -413,27 +416,29 @@ fn initial_tool_name_from_resource_uri(resource_uri: &str) -> &str {
     query_param_value(resource_uri, "toolName").unwrap_or_default()
 }
 
+fn cached_data_uri<'a>(cache: &'a OnceLock<String>, bytes: &[u8]) -> &'a str {
+    cache
+        .get_or_init(|| {
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        })
+        .as_str()
+}
+
 fn render_widget_html(resource_uri: &str, mascot_seed: u64) -> String {
     let initial_mascot_outline =
         serde_json::to_string(&mascot::build_widget_mascot_outline(mascot_seed))
             .unwrap_or_else(|_| "{}".to_string());
-    let reenable_widget_image = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(REENABLE_WIDGET_PNG)
-    );
-    let refresh_catdesk_image = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(REFRESH_CATDESK_PNG)
-    );
-    let remove_catdesk_image = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(REMOVE_CATDESK_PNG)
-    );
+    let reenable_widget_image = cached_data_uri(&REENABLE_WIDGET_IMAGE, REENABLE_WIDGET_PNG);
+    let refresh_catdesk_image = cached_data_uri(&REFRESH_CATDESK_IMAGE, REFRESH_CATDESK_PNG);
+    let remove_catdesk_image = cached_data_uri(&REMOVE_CATDESK_IMAGE, REMOVE_CATDESK_PNG);
     CATDESK_WIDGET_HTML
         .replace(WIDGET_RESOURCE_URI_PLACEHOLDER, resource_uri)
-        .replace(REENABLE_WIDGET_IMAGE_PLACEHOLDER, &reenable_widget_image)
-        .replace(REFRESH_CATDESK_IMAGE_PLACEHOLDER, &refresh_catdesk_image)
-        .replace(REMOVE_CATDESK_IMAGE_PLACEHOLDER, &remove_catdesk_image)
+        .replace(REENABLE_WIDGET_IMAGE_PLACEHOLDER, reenable_widget_image)
+        .replace(REFRESH_CATDESK_IMAGE_PLACEHOLDER, refresh_catdesk_image)
+        .replace(REMOVE_CATDESK_IMAGE_PLACEHOLDER, remove_catdesk_image)
         .replace(
             INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER,
             current_token_stats_layout().as_str(),
@@ -4376,6 +4381,16 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_widget_image_encoding_is_reused() {
+        let cache = OnceLock::new();
+        let first = cached_data_uri(&cache, b"static-png");
+        let second = cached_data_uri(&cache, b"static-png");
+
+        assert_eq!(first, second);
+        assert!(std::ptr::eq(first, second), "cached URI must reuse one allocation");
+    }
 
     #[test]
     fn metadata_cache_reuses_unchanged_value_and_reloads_after_file_changes() {
