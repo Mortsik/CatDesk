@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant};
+use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, watch};
 use tokio::time::{Duration, timeout};
@@ -31,7 +31,17 @@ const MAX_POLL_OUTPUT_BYTES: usize = 128 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(1);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+// Elapsed time is Unix-milliseconds-based, not Instant-based, so jobs
+// recovered from persisted records can report honest durations without
+// reconstructing a monotonic clock across process boundaries.
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandJobState {
     Running,
@@ -39,6 +49,7 @@ pub enum CommandJobState {
     Failed,
     Cancelled,
     TimedOut,
+    Interrupted,
 }
 
 impl CommandJobState {
@@ -49,6 +60,7 @@ impl CommandJobState {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::TimedOut => "timed_out",
+            Self::Interrupted => "interrupted",
         }
     }
 
@@ -91,6 +103,7 @@ struct JobRuntime {
     state: CommandJobState,
     exit_code: Option<i32>,
     finished_at: Option<Instant>,
+    final_elapsed_ms: Option<u64>,
     events: VecDeque<CommandOutputEvent>,
     retained_output_bytes: usize,
     next_seq: u64,
@@ -103,6 +116,7 @@ impl Default for JobRuntime {
             state: CommandJobState::Running,
             exit_code: None,
             finished_at: None,
+            final_elapsed_ms: None,
             events: VecDeque::new(),
             retained_output_bytes: 0,
             next_seq: 1,
@@ -118,7 +132,7 @@ struct CommandJob {
     workspace_root: PathBuf,
     cwd: PathBuf,
     owner_session: Option<String>,
-    started_at: Instant,
+    started_at_unix_ms: u64,
     timeout_ms: u64,
     change_session: Option<ChangeSession>,
     runtime: Mutex<JobRuntime>,
@@ -148,7 +162,7 @@ impl CommandJob {
                 workspace_root,
                 cwd,
                 owner_session,
-                started_at: Instant::now(),
+                started_at_unix_ms: unix_now_ms(),
                 timeout_ms,
                 change_session,
                 runtime: Mutex::new(JobRuntime::default()),
@@ -194,6 +208,7 @@ impl CommandJob {
         runtime.state = state;
         runtime.exit_code = exit_code;
         runtime.finished_at = Some(Instant::now());
+        runtime.final_elapsed_ms = Some(unix_now_ms().saturating_sub(self.started_at_unix_ms));
         drop(runtime);
         self.changed.notify_waiters();
     }
@@ -229,7 +244,9 @@ impl CommandJob {
             command: self.command.clone(),
             cwd: self.cwd.to_string_lossy().into_owned(),
             state: runtime.state,
-            elapsed_ms: self.started_at.elapsed().as_millis() as u64,
+            elapsed_ms: runtime
+                .final_elapsed_ms
+                .unwrap_or_else(|| unix_now_ms().saturating_sub(self.started_at_unix_ms)),
             exit_code: runtime.exit_code,
             events,
             next_cursor,
@@ -810,7 +827,10 @@ async fn run_job(
         Completion::Exited(Ok(status)) => {
             process.disarm().await;
             if status.success() {
-                (CommandJobState::Succeeded, Some(exit_code_for_status(&status)))
+                (
+                    CommandJobState::Succeeded,
+                    Some(exit_code_for_status(&status)),
+                )
             } else {
                 if let Some(signal) = process_runner::exit_status_signal_diagnostic(&status) {
                     job.append_output("stderr", format!("{signal}\n").as_bytes())
@@ -1399,6 +1419,16 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_state_serializes_snake_case_and_roundtrips() {
+        assert_eq!(
+            serde_json::to_string(&CommandJobState::Interrupted).expect("serialize"),
+            "\"interrupted\""
+        );
+        let state: CommandJobState = serde_json::from_str("\"interrupted\"").expect("deserialize");
+        assert!(state.is_terminal());
+    }
+
+    #[test]
     fn background_timeout_validation_covers_boundaries() {
         assert_eq!(
             CommandJobManager::normalize_timeout(None).expect("default timeout"),
@@ -1432,7 +1462,10 @@ mod tests {
             .expect("start background command");
 
         let busy = manager.try_acquire_process();
-        assert!(busy.is_err(), "background job must consume shared process capacity");
+        assert!(
+            busy.is_err(),
+            "background job must consume shared process capacity"
+        );
 
         manager
             .cancel(&started.snapshot.job_id)

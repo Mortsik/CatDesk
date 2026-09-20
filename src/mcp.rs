@@ -1465,6 +1465,10 @@ fn command_job_output_text(snapshot: &CommandJobSnapshot) -> String {
     if snapshot.events.is_empty() {
         return match snapshot.state {
             CommandJobState::Running => "(no new output; command is still running)".to_string(),
+            CommandJobState::Interrupted => {
+                "(command interrupted: CatDesk exited before the command finished; output was not retained)"
+                    .to_string()
+            }
             _ => "(no new output)".to_string(),
         };
     }
@@ -1492,9 +1496,10 @@ fn command_job_id_from_response(response: &JsonRpcResponse) -> Option<&str> {
 fn command_job_structured(tool_name: &str, snapshot: &CommandJobSnapshot) -> Value {
     let command_success = match snapshot.state {
         CommandJobState::Succeeded => Some(true),
-        CommandJobState::Failed | CommandJobState::Cancelled | CommandJobState::TimedOut => {
-            Some(false)
-        }
+        CommandJobState::Failed
+        | CommandJobState::Cancelled
+        | CommandJobState::TimedOut
+        | CommandJobState::Interrupted => Some(false),
         CommandJobState::Running => None,
     };
     json!({
@@ -3237,6 +3242,7 @@ fn build_command_job_widget_payload(
         "cancelled" => ("Command Cancelled", "done"),
         "failed" => ("Command Failed", "failed"),
         "timed_out" => ("Command Timed Out", "failed"),
+        "interrupted" => ("Command Interrupted", "failed"),
         _ => ("Command Job", "waiting"),
     };
     let mut output = structured
@@ -4887,6 +4893,24 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_snapshot_text_explains_restart() {
+        let snapshot = CommandJobSnapshot {
+            job_id: "j".into(),
+            command: "sleep 1".into(),
+            cwd: "/w".into(),
+            state: CommandJobState::Interrupted,
+            elapsed_ms: 5,
+            exit_code: None,
+            events: Vec::new(),
+            next_cursor: 0,
+            has_more_output: false,
+            output_truncated: false,
+            timeout_ms: 1_000,
+        };
+        assert!(command_job_output_text(&snapshot).contains("interrupted"));
+    }
+
+    #[test]
     fn command_job_widget_state_matrix_preserves_command_ui_contract() {
         let cases = [
             ("start_command", "running", "Command Started", "waiting"),
@@ -4895,6 +4919,7 @@ mod tests {
             ("poll_command", "failed", "Command Failed", "failed"),
             ("cancel_command", "cancelled", "Command Cancelled", "done"),
             ("poll_command", "timed_out", "Command Timed Out", "failed"),
+            ("poll_command", "interrupted", "Command Interrupted", "failed"),
         ];
 
         for (tool_name, state, expected_title, expected_widget_state) in cases {
