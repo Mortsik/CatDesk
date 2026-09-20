@@ -65,7 +65,7 @@ impl JobStore {
             let tmp_path = dir.join(format!("{}.json.tmp", record.job_id));
             let payload = serde_json::to_vec(record).map_err(std::io::Error::other)?;
             write_private_file(&tmp_path, &payload)?;
-            std::fs::rename(&tmp_path, &final_path)
+            replace_file(&tmp_path, &final_path)
         });
         if result.is_err() {
             crate::diagnostics::event("job_store_write_failed");
@@ -89,7 +89,7 @@ impl JobStore {
             match Self::parse(&path) {
                 Some(record) => records.push(record),
                 None => {
-                    let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
+                    let _ = replace_file(&path, &path.with_extension("json.corrupt"));
                     crate::diagnostics::event("job_store_record_corrupt");
                 }
             }
@@ -108,6 +108,42 @@ impl JobStore {
         let bytes = std::fs::read(path).ok()?;
         let record: JobRecord = serde_json::from_slice(&bytes).ok()?;
         (record.schema_version == JOB_RECORD_SCHEMA_VERSION).then_some(record)
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -163,6 +199,19 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].job_id, "job-1");
         assert_eq!(records[0].state, CommandJobState::Succeeded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn second_write_replaces_existing_record() {
+        let (store, dir) = temp_store();
+        store.write(&sample_record(CommandJobState::Running));
+        store.write(&sample_record(CommandJobState::Succeeded));
+
+        let records = store.read_all();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, CommandJobState::Succeeded);
+        assert_eq!(records[0].exit_code, Some(0));
         let _ = std::fs::remove_dir_all(dir);
     }
 
