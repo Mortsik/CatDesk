@@ -11,6 +11,7 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use crate::change_tracking::{ChangeSession, FileChange};
+use crate::job_store::{JobRecord, JobStore};
 use crate::process_exit::{
     EXIT_CODE_CANCELLED, EXIT_CODE_INTERNAL_ERROR, EXIT_CODE_TIMEOUT, exit_code_for_status,
 };
@@ -135,6 +136,7 @@ struct CommandJob {
     started_at_unix_ms: u64,
     timeout_ms: u64,
     change_session: Option<ChangeSession>,
+    store: JobStore,
     runtime: Mutex<JobRuntime>,
     changed: Notify,
     cancel_tx: watch::Sender<bool>,
@@ -143,7 +145,15 @@ struct CommandJob {
 impl CommandJob {
     #[cfg(test)]
     fn new(command: String, cwd: PathBuf, timeout_ms: u64) -> (Arc<Self>, watch::Receiver<bool>) {
-        Self::new_with_change_session(command, cwd.clone(), cwd, timeout_ms, None, None)
+        Self::new_with_change_session(
+            command,
+            cwd.clone(),
+            cwd,
+            timeout_ms,
+            None,
+            None,
+            JobStore::disabled(),
+        )
     }
 
     fn new_with_change_session(
@@ -153,6 +163,7 @@ impl CommandJob {
         timeout_ms: u64,
         change_session: Option<ChangeSession>,
         owner_session: Option<String>,
+        store: JobStore,
     ) -> (Arc<Self>, watch::Receiver<bool>) {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         (
@@ -165,12 +176,79 @@ impl CommandJob {
                 started_at_unix_ms: unix_now_ms(),
                 timeout_ms,
                 change_session,
+                store,
                 runtime: Mutex::new(JobRuntime::default()),
                 changed: Notify::new(),
                 cancel_tx,
             }),
             cancel_rx,
         )
+    }
+
+    fn to_record(&self, runtime: &JobRuntime) -> JobRecord {
+        JobRecord {
+            schema_version: 1,
+            job_id: self.id.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.to_string_lossy().into_owned(),
+            workspace_root: self.workspace_root.to_string_lossy().into_owned(),
+            owner_session: self.owner_session.clone(),
+            timeout_ms: self.timeout_ms,
+            started_at_ms: self.started_at_unix_ms,
+            state: runtime.state,
+            exit_code: runtime.exit_code,
+            finished_at_ms: runtime
+                .final_elapsed_ms
+                .map(|elapsed| self.started_at_unix_ms.saturating_add(elapsed)),
+            elapsed_ms: runtime.final_elapsed_ms,
+        }
+    }
+
+    async fn persist(&self) {
+        let record = {
+            let runtime = self.runtime.lock().await;
+            self.to_record(&runtime)
+        };
+        self.store.write(&record);
+    }
+
+    fn recovered(record: JobRecord, state: CommandJobState, store: JobStore) -> Arc<Self> {
+        let now_ms = unix_now_ms();
+        let was_running = record.state == CommandJobState::Running;
+        let final_elapsed_ms = Some(
+            record
+                .elapsed_ms
+                .unwrap_or_else(|| now_ms.saturating_sub(record.started_at_ms)),
+        );
+        let finished_at = if was_running {
+            Instant::now()
+        } else {
+            let age = StdDuration::from_millis(
+                now_ms.saturating_sub(record.finished_at_ms.unwrap_or(now_ms)),
+            );
+            Instant::now().checked_sub(age).unwrap_or_else(Instant::now)
+        };
+        let (cancel_tx, _) = watch::channel(false);
+        Arc::new(Self {
+            id: record.job_id,
+            command: record.command,
+            workspace_root: PathBuf::from(record.workspace_root),
+            cwd: PathBuf::from(record.cwd),
+            owner_session: record.owner_session,
+            started_at_unix_ms: record.started_at_ms,
+            timeout_ms: record.timeout_ms,
+            change_session: None,
+            store,
+            runtime: Mutex::new(JobRuntime {
+                state,
+                exit_code: record.exit_code,
+                finished_at: Some(finished_at),
+                final_elapsed_ms,
+                ..JobRuntime::default()
+            }),
+            changed: Notify::new(),
+            cancel_tx,
+        })
     }
 
     async fn append_output(&self, stream: &'static str, bytes: &[u8]) {
@@ -201,15 +279,18 @@ impl CommandJob {
     }
 
     async fn finish(&self, state: CommandJobState, exit_code: Option<i32>) {
-        let mut runtime = self.runtime.lock().await;
-        if runtime.state.is_terminal() {
-            return;
-        }
-        runtime.state = state;
-        runtime.exit_code = exit_code;
-        runtime.finished_at = Some(Instant::now());
-        runtime.final_elapsed_ms = Some(unix_now_ms().saturating_sub(self.started_at_unix_ms));
-        drop(runtime);
+        let record = {
+            let mut runtime = self.runtime.lock().await;
+            if runtime.state.is_terminal() {
+                return;
+            }
+            runtime.state = state;
+            runtime.exit_code = exit_code;
+            runtime.finished_at = Some(Instant::now());
+            runtime.final_elapsed_ms = Some(unix_now_ms().saturating_sub(self.started_at_unix_ms));
+            self.to_record(&runtime)
+        };
+        self.store.write(&record);
         self.changed.notify_waiters();
     }
 
@@ -281,6 +362,8 @@ pub struct CommandJobManager {
     // trees remains bounded independently.
     process_budget: Arc<Semaphore>,
     process_limit: usize,
+    store: JobStore,
+    recovered: Arc<AtomicBool>,
 }
 
 impl Default for CommandJobManager {
@@ -294,6 +377,13 @@ impl CommandJobManager {
         Self::default()
     }
 
+    pub fn with_store(dir: PathBuf) -> Self {
+        Self {
+            store: JobStore::open(dir),
+            ..Self::with_process_limit(MAX_ACTIVE_PROCESSES)
+        }
+    }
+
     fn with_process_limit(limit: usize) -> Self {
         Self {
             inner: Arc::new(RwLock::new(ManagerState::default())),
@@ -301,6 +391,8 @@ impl CommandJobManager {
             shutting_down: Arc::new(AtomicBool::new(false)),
             process_budget: Arc::new(Semaphore::new(limit)),
             process_limit: limit,
+            store: JobStore::disabled(),
+            recovered: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -429,6 +521,7 @@ impl CommandJobManager {
             timeout_ms,
             change_session,
             owner_session.map(str::to_owned),
+            self.store.clone(),
         );
         let job_id = job.id.clone();
         {
@@ -441,6 +534,7 @@ impl CommandJobManager {
             }
         }
 
+        job.persist().await;
         tokio::spawn(run_job(job.clone(), cancel_rx, Some(process_permit)));
         Ok(StartCommandResult {
             snapshot: job.snapshot(0).await,
@@ -620,7 +714,37 @@ impl CommandJobManager {
         }
     }
 
+    async fn recover(&self) {
+        let records = self.store.read_all();
+        if records.is_empty() {
+            return;
+        }
+
+        let mut recovered_jobs = Vec::with_capacity(records.len());
+        for record in records {
+            let was_running = record.state == CommandJobState::Running;
+            let state = if was_running {
+                CommandJobState::Interrupted
+            } else {
+                record.state
+            };
+            let job = CommandJob::recovered(record, state, self.store.clone());
+            if was_running {
+                job.persist().await;
+            }
+            recovered_jobs.push(job);
+        }
+
+        let mut manager = self.inner.write().await;
+        for job in recovered_jobs {
+            manager.jobs.insert(job.id.clone(), job);
+        }
+    }
+
     pub async fn cleanup(&self) {
+        if !self.recovered.swap(true, Ordering::AcqRel) {
+            self.recover().await;
+        }
         {
             let mut manager = self.inner.write().await;
             if manager
@@ -695,6 +819,10 @@ impl CommandJobManager {
         manager.request_jobs.retain(|_, (job_id, created_at)| {
             created_at.elapsed() <= IDEMPOTENCY_WINDOW && live_job_ids.contains(job_id)
         });
+        drop(manager);
+        for id in &expired {
+            self.store.remove(id);
+        }
     }
 }
 
@@ -911,6 +1039,138 @@ mod tests {
             "command never reached ready state: {}",
             path.display()
         );
+    }
+
+    fn manager_with_store() -> (CommandJobManager, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("catdesk-jobstore-{}", Uuid::new_v4()));
+        (CommandJobManager::with_store(dir.clone()), dir)
+    }
+
+    #[tokio::test]
+    async fn start_persists_running_record_and_finish_updates_it() {
+        let (manager, dir) = manager_with_store();
+        let started = manager
+            .start("printf 'done\\n'".into(), dir.clone(), 5_000, None)
+            .await
+            .expect("start job");
+        let records = manager.store.read_all();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, CommandJobState::Running);
+
+        let terminal = wait_terminal(&manager, &started.snapshot.job_id).await;
+        assert_eq!(terminal.state, CommandJobState::Succeeded);
+        let records = manager.store.read_all();
+        assert_eq!(records[0].state, CommandJobState::Succeeded);
+        assert_eq!(records[0].exit_code, Some(0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn recovery_marks_running_records_interrupted_and_rewrites_them() {
+        let (manager, dir) = manager_with_store();
+        let started = manager
+            .start_with_change_session(
+                "sleep 30".into(),
+                dir.clone(),
+                dir.clone(),
+                60_000,
+                None,
+                None,
+                Some("session-a"),
+            )
+            .await
+            .expect("start job");
+
+        let restarted = CommandJobManager::with_store(dir.clone());
+        let snapshot = restarted
+            .poll_for_session(&started.snapshot.job_id, 0, 0, Some("session-a"))
+            .await
+            .expect("poll recovered job");
+        assert_eq!(snapshot.state, CommandJobState::Interrupted);
+        assert_eq!(snapshot.exit_code, None);
+        assert!(snapshot.events.is_empty());
+        assert!(!snapshot.has_more_output);
+
+        let records = restarted.store.read_all();
+        assert_eq!(records[0].state, CommandJobState::Interrupted);
+
+        let cross_session = restarted
+            .poll_for_session(&started.snapshot.job_id, 0, 0, Some("session-b"))
+            .await;
+        assert!(
+            cross_session.is_err(),
+            "recovery must preserve job ownership"
+        );
+
+        let _ = manager
+            .cancel_for_session(&started.snapshot.job_id, Some("session-a"))
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn recovery_restores_terminal_records_as_pollable() {
+        let (manager, dir) = manager_with_store();
+        let started = manager
+            .start("printf 'x'".into(), dir.clone(), 5_000, None)
+            .await
+            .expect("start job");
+        let terminal = wait_terminal(&manager, &started.snapshot.job_id).await;
+        assert_eq!(terminal.state, CommandJobState::Succeeded);
+
+        let restarted = CommandJobManager::with_store(dir.clone());
+        let snapshot = restarted
+            .poll(&started.snapshot.job_id, 0, 0)
+            .await
+            .expect("poll restored job");
+        assert_eq!(snapshot.state, CommandJobState::Succeeded);
+        assert_eq!(snapshot.exit_code, Some(0));
+        assert!(snapshot.events.is_empty());
+        assert!(!snapshot.has_more_output);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cleanup_eviction_removes_store_file() {
+        let (manager, dir) = manager_with_store();
+        let started = manager
+            .start("printf 'x'".into(), dir.clone(), 5_000, None)
+            .await
+            .expect("start job");
+        let job_id = started.snapshot.job_id.clone();
+        let _ = wait_terminal(&manager, &job_id).await;
+        assert!(dir.join(format!("{job_id}.json")).exists());
+
+        {
+            let manager_state = manager.inner.read().await;
+            let job = manager_state
+                .jobs
+                .get(&job_id)
+                .expect("job present")
+                .clone();
+            drop(manager_state);
+            job.runtime.lock().await.finished_at =
+                Some(Instant::now() - TERMINAL_JOB_TTL - StdDuration::from_secs(1));
+        }
+        manager.inner.write().await.last_cleanup = None;
+        manager.cleanup().await;
+        assert!(!dir.join(format!("{job_id}.json")).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cancel_all_persists_cancelled_state() {
+        let (manager, dir) = manager_with_store();
+        let _started = manager
+            .start("sleep 5".into(), dir.clone(), 60_000, None)
+            .await
+            .expect("start job");
+        manager.cancel_all().await;
+        let records = manager.store.read_all();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, CommandJobState::Cancelled);
+        assert_eq!(records[0].exit_code, Some(EXIT_CODE_CANCELLED));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

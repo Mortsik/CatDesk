@@ -20,6 +20,8 @@ pub struct JobRecord {
     pub command: String,
     pub cwd: String,
     pub workspace_root: String,
+    #[serde(default)]
+    pub owner_session: Option<String>,
     pub timeout_ms: u64,
     pub started_at_ms: u64,
     pub state: CommandJobState,
@@ -28,7 +30,7 @@ pub struct JobRecord {
     pub elapsed_ms: Option<u64>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct JobStore {
     dir: Option<Arc<PathBuf>>,
 }
@@ -121,6 +123,7 @@ mod tests {
             command: "sleep 1".into(),
             cwd: "/w".into(),
             workspace_root: "/w".into(),
+            owner_session: None,
             timeout_ms: 60_000,
             started_at_ms: 1_000,
             state,
