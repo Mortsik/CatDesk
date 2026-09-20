@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Per-file cap; MAX_READ_BATCH_BYTES caps the whole batch.
@@ -33,6 +33,8 @@ const HARD_LIST_LIMIT: usize = 1000;
 const DEFAULT_SEARCH_LIMIT: usize = 100;
 const HARD_SEARCH_LIMIT: usize = 500;
 const HARD_SEARCH_CONTEXT_LINES: usize = 20;
+static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static GREP_AVAILABLE: OnceLock<bool> = OnceLock::new();
 /// Hard wall-clock bound for one text search. A rare pattern never reaches
 /// the `max_matches` cap, and without a deadline rg walks the whole tree
 /// (measured: 17+ min per search while six duplicates pinned every CPU and
@@ -930,7 +932,23 @@ pub fn search_text(
     )
 }
 
+fn cached_command_available(
+    cache: &OnceLock<bool>,
+    program: &str,
+    probe: impl FnOnce(&str) -> bool,
+) -> bool {
+    *cache.get_or_init(|| probe(program))
+}
+
 fn command_available(program: &str) -> bool {
+    match program {
+        "rg" => cached_command_available(&RG_AVAILABLE, program, probe_command_available),
+        "grep" => cached_command_available(&GREP_AVAILABLE, program, probe_command_available),
+        _ => probe_command_available(program),
+    }
+}
+
+fn probe_command_available(program: &str) -> bool {
     match ProcessCommand::new(program)
         .arg("--version")
         .stdout(Stdio::null())
@@ -1920,6 +1938,22 @@ pub fn edit_file(
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn named_backend_probe_is_cached_once() {
+        let cache = std::sync::OnceLock::new();
+        let calls = std::cell::Cell::new(0usize);
+
+        assert!(cached_command_available(&cache, "rg", |_| {
+            calls.set(calls.get() + 1);
+            true
+        }));
+        assert!(cached_command_available(&cache, "rg", |_| {
+            calls.set(calls.get() + 1);
+            false
+        }));
+        assert_eq!(calls.get(), 1, "backend availability should be probed once");
+    }
 
     fn test_workspace(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("catdesk-workspace-tools-{name}-{}", Uuid::new_v4()))
