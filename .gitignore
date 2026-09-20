@@ -1,4 +1,6 @@
 /target
+/target-durability-release
+/target-lld
 /npm/bin
 /.worktrees/
 log.txt
