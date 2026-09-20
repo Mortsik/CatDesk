@@ -1,6 +1,9 @@
 pub(crate) const EXIT_CODE_TIMEOUT: i32 = 124;
 pub(crate) const EXIT_CODE_INTERNAL_ERROR: i32 = 125;
 pub(crate) const EXIT_CODE_CANCELLED: i32 = 130;
+// CatDesk-initiated synthetic codes keep the conventional range; 131 marks a
+// job ended because no agent poll arrived within the abandon window.
+pub(crate) const EXIT_CODE_ABANDONED: i32 = 131;
 
 #[cfg(unix)]
 pub(crate) fn exit_code_for_status(status: &std::process::ExitStatus) -> i32 {
@@ -36,5 +39,6 @@ mod tests {
         assert_eq!(EXIT_CODE_TIMEOUT, 124);
         assert_eq!(EXIT_CODE_INTERNAL_ERROR, 125);
         assert_eq!(EXIT_CODE_CANCELLED, 130);
+        assert_eq!(EXIT_CODE_ABANDONED, 131);
     }
 }

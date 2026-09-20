@@ -13,12 +13,16 @@ use uuid::Uuid;
 use crate::change_tracking::{ChangeSession, FileChange};
 use crate::job_store::{JobRecord, JobStore};
 use crate::process_exit::{
-    EXIT_CODE_CANCELLED, EXIT_CODE_INTERNAL_ERROR, EXIT_CODE_TIMEOUT, exit_code_for_status,
+    EXIT_CODE_ABANDONED, EXIT_CODE_CANCELLED, EXIT_CODE_INTERNAL_ERROR, EXIT_CODE_TIMEOUT,
+    exit_code_for_status,
 };
 use crate::process_runner;
 
 pub const DEFAULT_JOB_TIMEOUT_MS: u64 = 2 * 60 * 60 * 1_000;
 pub const MAX_JOB_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
+// A running job whose owner never polls is reaped after this window; polling
+// is the heartbeat that keeps a still-needed job alive.
+pub const DEFAULT_ABANDON_AFTER_MS: u64 = 30 * 60 * 1_000;
 pub const MAX_POLL_WAIT_MS: u64 = 30_000;
 pub const DEFAULT_POLL_WAIT_MS: u64 = 10_000;
 const MAX_ACTIVE_JOBS: usize = 8;
@@ -50,6 +54,7 @@ pub enum CommandJobState {
     Failed,
     Cancelled,
     TimedOut,
+    Abandoned,
     Interrupted,
 }
 
@@ -61,6 +66,7 @@ impl CommandJobState {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::TimedOut => "timed_out",
+            Self::Abandoned => "abandoned",
             Self::Interrupted => "interrupted",
         }
     }
@@ -135,9 +141,13 @@ struct CommandJob {
     owner_session: Option<String>,
     started_at_unix_ms: u64,
     timeout_ms: u64,
+    abandon_after_ms: u64,
     change_session: Option<ChangeSession>,
     store: JobStore,
     runtime: Mutex<JobRuntime>,
+    // Heartbeat for idle reaping: the most recent poll_command instant. A
+    // std mutex is enough — held only for non-async reads and writes.
+    last_poll: std::sync::Mutex<Instant>,
     changed: Notify,
     cancel_tx: watch::Sender<bool>,
 }
@@ -150,17 +160,20 @@ impl CommandJob {
             cwd.clone(),
             cwd,
             timeout_ms,
+            DEFAULT_ABANDON_AFTER_MS,
             None,
             None,
             JobStore::disabled(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_change_session(
         command: String,
         workspace_root: PathBuf,
         cwd: PathBuf,
         timeout_ms: u64,
+        abandon_after_ms: u64,
         change_session: Option<ChangeSession>,
         owner_session: Option<String>,
         store: JobStore,
@@ -175,14 +188,20 @@ impl CommandJob {
                 owner_session,
                 started_at_unix_ms: unix_now_ms(),
                 timeout_ms,
+                abandon_after_ms,
                 change_session,
                 store,
                 runtime: Mutex::new(JobRuntime::default()),
+                last_poll: std::sync::Mutex::new(Instant::now()),
                 changed: Notify::new(),
                 cancel_tx,
             }),
             cancel_rx,
         )
+    }
+
+    fn mark_polled(&self) {
+        *self.last_poll.lock().expect("last_poll mutex poisoned") = Instant::now();
     }
 
     fn to_record(&self, runtime: &JobRuntime) -> JobRecord {
@@ -237,6 +256,7 @@ impl CommandJob {
             owner_session: record.owner_session,
             started_at_unix_ms: record.started_at_ms,
             timeout_ms: record.timeout_ms,
+            abandon_after_ms: DEFAULT_ABANDON_AFTER_MS,
             change_session: None,
             store,
             runtime: Mutex::new(JobRuntime {
@@ -246,6 +266,7 @@ impl CommandJob {
                 final_elapsed_ms,
                 ..JobRuntime::default()
             }),
+            last_poll: std::sync::Mutex::new(Instant::now()),
             changed: Notify::new(),
             cancel_tx,
         })
@@ -362,6 +383,7 @@ pub struct CommandJobManager {
     // trees remains bounded independently.
     process_budget: Arc<Semaphore>,
     process_limit: usize,
+    abandon_after_ms: u64,
     store: JobStore,
     // Recovery is shared across clones and awaited by every concurrent first
     // request. Marking it complete before recover() finishes would let another
@@ -394,9 +416,16 @@ impl CommandJobManager {
             shutting_down: Arc::new(AtomicBool::new(false)),
             process_budget: Arc::new(Semaphore::new(limit)),
             process_limit: limit,
+            abandon_after_ms: DEFAULT_ABANDON_AFTER_MS,
             store: JobStore::disabled(),
             recovery: Arc::new(OnceCell::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_abandon_after_ms(mut self, ms: u64) -> Self {
+        self.abandon_after_ms = ms;
+        self
     }
 
     #[cfg(test)]
@@ -522,6 +551,7 @@ impl CommandJobManager {
             workspace_root,
             cwd,
             timeout_ms,
+            self.abandon_after_ms,
             change_session,
             owner_session.map(str::to_owned),
             self.store.clone(),
@@ -564,6 +594,8 @@ impl CommandJobManager {
     ) -> Result<CommandJobSnapshot, String> {
         self.cleanup().await;
         let job = self.get_job_for_session(job_id, owner_session).await?;
+        // Polling is the keep-alive heartbeat for a running job.
+        job.mark_polled();
         let wait_ms = wait_ms.min(MAX_POLL_WAIT_MS);
 
         // `Notify::notified()` does not register with `notify_waiters()` until
@@ -948,12 +980,33 @@ async fn run_job(
         Exited(std::io::Result<std::process::ExitStatus>),
         Cancelled,
         TimedOut,
+        Abandoned,
     }
 
-    let completion = tokio::select! {
-        status = process.wait() => Completion::Exited(status),
-        _ = cancel_rx.changed() => Completion::Cancelled,
-        _ = tokio::time::sleep(Duration::from_millis(job.timeout_ms)) => Completion::TimedOut,
+    let timeout_deadline =
+        tokio::time::Instant::from_std(Instant::now() + StdDuration::from_millis(job.timeout_ms));
+    let completion = loop {
+        // The abandon deadline slides with every poll: a job lives as long as
+        // its owner keeps asking about it.
+        let idle_deadline = {
+            let last_poll = *job.last_poll.lock().expect("last_poll mutex poisoned");
+            tokio::time::Instant::from_std(
+                last_poll + StdDuration::from_millis(job.abandon_after_ms),
+            )
+        };
+        tokio::select! {
+            status = process.wait() => break Completion::Exited(status),
+            _ = cancel_rx.changed() => break Completion::Cancelled,
+            _ = tokio::time::sleep_until(timeout_deadline) => break Completion::TimedOut,
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                // A poll may have refreshed the deadline after it was captured;
+                // only abandon once the quiet window has really elapsed.
+                let last_poll = *job.last_poll.lock().expect("last_poll mutex poisoned");
+                if last_poll + StdDuration::from_millis(job.abandon_after_ms) <= Instant::now() {
+                    break Completion::Abandoned;
+                }
+            }
+        }
     };
 
     let (state, exit_code) = match completion {
@@ -998,6 +1051,21 @@ async fn run_job(
             .await;
             let _ = status;
             (CommandJobState::TimedOut, Some(EXIT_CODE_TIMEOUT))
+        }
+        Completion::Abandoned => {
+            process.terminate_tree().await;
+            let status = process.wait().await.ok();
+            job.append_output(
+                "stderr",
+                format!(
+                    "CatDesk abandoned this job: no poll for {} ms\n",
+                    job.abandon_after_ms
+                )
+                .as_bytes(),
+            )
+            .await;
+            let _ = status;
+            (CommandJobState::Abandoned, Some(EXIT_CODE_ABANDONED))
         }
     };
 
@@ -1216,6 +1284,44 @@ mod tests {
         assert_eq!(snapshot.exit_code, Some(0));
         assert!(snapshot.events.is_empty());
         assert!(!snapshot.has_more_output);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn recovery_restores_abandoned_records_as_pollable() {
+        let root = workspace("abandon-recovery");
+        let (manager, dir) = manager_with_store();
+        let manager = manager.with_abandon_after_ms(150);
+        let started = manager
+            .start("sleep 3".into(), root.clone(), 10_000, None)
+            .await
+            .expect("start job");
+
+        // Wait for the abandon decision without polling the job itself.
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        loop {
+            if manager
+                .store
+                .read_all()
+                .iter()
+                .any(|record| record.state == CommandJobState::Abandoned)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "job was never abandoned");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let restarted = CommandJobManager::with_store(dir.clone());
+        let snapshot = restarted
+            .poll(&started.snapshot.job_id, 0, 0)
+            .await
+            .expect("poll recovered abandoned job");
+        assert_eq!(snapshot.state, CommandJobState::Abandoned);
+        assert_eq!(snapshot.exit_code, Some(EXIT_CODE_ABANDONED));
+        assert!(snapshot.events.is_empty());
+        assert!(!snapshot.has_more_output);
+        let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1511,6 +1617,153 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn idle_job_without_polls_is_abandoned_and_terminates_process_tree() {
+        let root = workspace("abandoned");
+        let sentinel = root.join("sentinel.txt");
+        let (manager, store_dir) = manager_with_store();
+        let manager = manager.with_abandon_after_ms(150);
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 2000; Set-Content sentinel.txt survived"
+        } else {
+            "sleep 2; printf survived > sentinel.txt"
+        };
+        let started = manager
+            .start(command.to_string(), root.clone(), 10_000, None)
+            .await
+            .expect("start job");
+
+        // Observe through the persisted record only: polling the job would
+        // itself count as agent interest once heartbeat refresh exists.
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        loop {
+            let abandoned = manager
+                .store
+                .read_all()
+                .iter()
+                .any(|record| record.state == CommandJobState::Abandoned);
+            if abandoned {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job was not abandoned without polls"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A poll after the terminal transition must explain why the job ended.
+        let terminal = manager
+            .poll(&started.snapshot.job_id, 0, 0)
+            .await
+            .expect("poll abandoned job");
+        assert_eq!(terminal.state, CommandJobState::Abandoned);
+        assert_eq!(terminal.exit_code, Some(EXIT_CODE_ABANDONED));
+        let events_text = terminal
+            .events
+            .iter()
+            .map(|event| event.text.as_str())
+            .collect::<String>();
+        assert!(
+            events_text.contains("no poll"),
+            "expected abandon reason in output, got: {events_text}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        assert!(
+            !sentinel.exists(),
+            "abandoned job survived and wrote sentinel"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[tokio::test]
+    async fn poll_refreshes_the_abandon_deadline() {
+        let root = workspace("abandon-refresh");
+        let (manager, store_dir) = manager_with_store();
+        let manager = manager.with_abandon_after_ms(300);
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 3"
+        } else {
+            "sleep 3"
+        };
+        let started = manager
+            .start(command.to_string(), root.clone(), 10_000, None)
+            .await
+            .expect("start job");
+
+        // A poll halfway through the first quiet window must push the abandon
+        // deadline out; the job still runs 100 ms after the original deadline.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        manager
+            .poll(&started.snapshot.job_id, 0, 0)
+            .await
+            .expect("poll running job");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let records = manager.store.read_all();
+        assert_eq!(
+            records[0].state,
+            CommandJobState::Running,
+            "poll did not extend the abandon deadline"
+        );
+
+        // Silence from here on: the job must still be reaped relative to the
+        // refreshed deadline, not the original one.
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        loop {
+            let state = manager.store.read_all()[0].state;
+            if state == CommandJobState::Abandoned {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job was not abandoned after the refreshed deadline passed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let _ = manager.cancel(&started.snapshot.job_id).await;
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[tokio::test]
+    async fn regular_polling_keeps_a_job_alive_until_it_finishes() {
+        let root = workspace("abandon-heartbeat");
+        let manager = CommandJobManager::new().with_abandon_after_ms(200);
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 1200"
+        } else {
+            "sleep 1.2"
+        };
+        let started = manager
+            .start(command.to_string(), root.clone(), 10_000, None)
+            .await
+            .expect("start job");
+
+        // Heartbeat: poll far more often than the abandon window.
+        let mut cursor = 0;
+        let terminal = loop {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let snapshot = manager
+                .poll(&started.snapshot.job_id, cursor, 0)
+                .await
+                .expect("poll job");
+            cursor = snapshot.next_cursor;
+            if snapshot.state.is_terminal() {
+                break snapshot;
+            }
+        };
+        assert_eq!(
+            terminal.state,
+            CommandJobState::Succeeded,
+            "heartbeat polling must keep a needed job alive"
+        );
+        assert_eq!(terminal.exit_code, Some(0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn incremental_utf8_decoder_preserves_split_multibyte_characters() {
         let bytes = "build ✓ 🚀".as_bytes();
@@ -1774,6 +2027,16 @@ mod tests {
             "\"interrupted\""
         );
         let state: CommandJobState = serde_json::from_str("\"interrupted\"").expect("deserialize");
+        assert!(state.is_terminal());
+    }
+
+    #[test]
+    fn abandoned_state_serializes_snake_case_and_roundtrips() {
+        assert_eq!(
+            serde_json::to_string(&CommandJobState::Abandoned).expect("serialize"),
+            "\"abandoned\""
+        );
+        let state: CommandJobState = serde_json::from_str("\"abandoned\"").expect("deserialize");
         assert!(state.is_terminal());
     }
 

@@ -193,3 +193,28 @@ Fork-local patch release: `Cargo.toml` version 0.8.0 → 0.8.1. Deploy is
 `cargo build --release` and an app restart, since the launcher runs the
 locally built binary. Restarting the app kills any command jobs running at
 that moment — done deliberately, outside working agent sessions.
+
+## Idle reaping
+
+Time bounds alone do not tell an abandoned job from a wanted one: an agent
+can start a dev server with a 24-hour timeout and never come back. Polling
+is the honest signal of interest, so it doubles as a keep-alive heartbeat.
+
+- Every job tracks `last_poll`, refreshed at the start of each
+  `poll_command` (including the first poll after `start_command`).
+- A running job whose quiet window — `DEFAULT_ABANDON_AFTER_MS`, 30 minutes
+  — elapses with no poll is terminated by its own runner: process tree
+  torn down, one stderr line explaining why (`no poll for … ms`), terminal
+  state `abandoned`, synthetic exit code `131` (`EXIT_CODE_ABANDONED`).
+- The deadline slides: polls push it out, so a long build polled every
+  half minute runs to completion and a chained long-poll keeps a needed
+  server alive indefinitely. The runner recomputes the deadline after
+  every wake-up so a poll landing inside the check gap is never reaped.
+- `abandoned` is terminal like the others: recovered records restore as
+  pollable across restarts, the record schema is unchanged, and the state
+  never counts against the active-job limit.
+- The MCP surface documents the contract on `start_command` /
+  `poll_command` and in `catdesk_instruction`; the widget title mapping
+  renders it as "Command Abandoned" (failed).
+  `CURRENT_CHATGPT_CONNECTOR_REVISION` bumps 7 → 8 for the tool-surface
+  change.
