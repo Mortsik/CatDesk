@@ -4,8 +4,12 @@
 //! transition. Persistence is best-effort: store failures are diagnostic-only
 //! and must never prevent command execution.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde::{Deserialize, Serialize};
 
@@ -56,11 +60,11 @@ impl JobStore {
         let Some(dir) = self.dir.as_deref() else {
             return;
         };
-        let result = std::fs::create_dir_all(dir).and_then(|()| {
+        let result = ensure_private_dir(dir).and_then(|()| {
             let final_path = dir.join(format!("{}.json", record.job_id));
             let tmp_path = dir.join(format!("{}.json.tmp", record.job_id));
             let payload = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-            std::fs::write(&tmp_path, payload)?;
+            write_private_file(&tmp_path, &payload)?;
             std::fs::rename(&tmp_path, &final_path)
         });
         if result.is_err() {
@@ -105,6 +109,24 @@ impl JobStore {
         let record: JobRecord = serde_json::from_slice(&bytes).ok()?;
         (record.schema_version == JOB_RECORD_SCHEMA_VERSION).then_some(record)
     }
+}
+
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn write_private_file(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(payload)
 }
 
 #[cfg(test)]
@@ -182,5 +204,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("catdesk-jobstore-{}", uuid::Uuid::new_v4()));
         let store = JobStore::open(dir.clone());
         assert!(store.read_all().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_job_records_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, dir) = temp_store();
+        store.write(&sample_record(CommandJobState::Succeeded));
+
+        let dir_mode = std::fs::metadata(&dir)
+            .expect("job store directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(dir.join("job-1.json"))
+            .expect("job record")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "job store directory must be private");
+        assert_eq!(file_mode, 0o600, "job record may contain command arguments");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
