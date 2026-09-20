@@ -7,6 +7,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::time::{Duration, timeout};
 
+use crate::process_exit::{EXIT_CODE_INTERNAL_ERROR, EXIT_CODE_TIMEOUT, exit_code_for_status};
+
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 
 #[cfg(unix)]
@@ -704,7 +706,7 @@ pub async fn run_shell_command(
                 stdout: String::new(),
                 stderr: format!("Failed to execute: {error}"),
                 success: false,
-                exit_code: None,
+                exit_code: Some(EXIT_CODE_INTERNAL_ERROR),
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 timed_out: false,
                 stdout_truncated: false,
@@ -774,7 +776,16 @@ pub async fn run_shell_command(
         append_stderr_diagnostic(&mut stderr, &signal);
     }
 
-    let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
+    let exit_code = if wait_error.is_some() {
+        EXIT_CODE_INTERNAL_ERROR
+    } else if timed_out {
+        EXIT_CODE_TIMEOUT
+    } else {
+        status
+            .as_ref()
+            .map(exit_code_for_status)
+            .unwrap_or(EXIT_CODE_INTERNAL_ERROR)
+    };
     let success = wait_error.is_none()
         && !timed_out
         && status
@@ -785,7 +796,7 @@ pub async fn run_shell_command(
         stdout,
         stderr,
         success,
-        exit_code,
+        exit_code: Some(exit_code),
         elapsed_ms: started.elapsed().as_millis() as u64,
         timed_out,
         stdout_truncated: stdout_capture.truncated,
@@ -910,7 +921,7 @@ mod tests {
         let root = workspace("signal-diagnostic");
         let result = run_shell_command("kill -KILL $$", &root, &root, 5_000, 1024).await;
         assert!(!result.success);
-        assert_eq!(result.exit_code, None);
+        assert_eq!(result.exit_code, Some(137));
         assert!(
             result.stderr.contains("SIGKILL") || result.stderr.contains("signal 9"),
             "missing signal diagnostic: {:?}",
@@ -930,6 +941,7 @@ mod tests {
         };
         let result = run_shell_command(command, &root, &root, 100, 1024).await;
         assert!(result.timed_out);
+        assert_eq!(result.exit_code, Some(EXIT_CODE_TIMEOUT));
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert!(
             !sentinel.exists(),

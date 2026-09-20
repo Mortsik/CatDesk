@@ -10,17 +10,18 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
-use std::sync::{
-    Arc, Mutex as StdMutex,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::{Duration as StdDuration, Instant};
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use tokio::sync::{Mutex, mpsc::Sender};
 
+use crate::command;
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
+use crate::project_scope;
 use crate::request_workers::{RequestClass, RequestScheduler};
+use crate::session_context::{ProjectStateChange, SessionContextStore};
 use crate::state::{
     AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
     TokenStatsLayout, UsageTotals, parse_seed_hex, save_agents_path_mode, save_show_detail_mode,
@@ -29,9 +30,6 @@ use crate::state::{
 
 const STATELESS_FLOW_ID: &str = "stateless";
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
-const MAX_TRACKED_MCP_SESSIONS: usize = 1_024;
-const MCP_SESSION_TTL: StdDuration = StdDuration::from_secs(60 * 60);
-
 #[derive(Clone, Debug)]
 struct ClientSession {
     id: Option<String>,
@@ -62,101 +60,53 @@ impl ClientSession {
     }
 }
 
-#[derive(Clone, Copy)]
-struct SessionInstructionState {
-    called: bool,
-    last_seen: Instant,
-}
-
-#[derive(Default)]
-struct InstructionSessionMap {
-    sessions: HashMap<String, SessionInstructionState>,
-}
-
 #[derive(Clone)]
 struct InstructionGate {
-    anonymous_called: Arc<AtomicBool>,
-    sessions: Arc<StdMutex<InstructionSessionMap>>,
+    contexts: SessionContextStore,
 }
 
 impl InstructionGate {
     fn with_anonymous(called: bool) -> Self {
         Self {
-            anonymous_called: Arc::new(AtomicBool::new(called)),
-            sessions: Arc::new(StdMutex::new(InstructionSessionMap::default())),
-        }
-    }
-
-    fn prune_sessions(state: &mut InstructionSessionMap, now: Instant) {
-        state
-            .sessions
-            .retain(|_, session| now.duration_since(session.last_seen) <= MCP_SESSION_TTL);
-    }
-
-    fn ensure_capacity(state: &mut InstructionSessionMap, session_id: &str) {
-        if !state.sessions.contains_key(session_id) && state.sessions.len() >= MAX_TRACKED_MCP_SESSIONS {
-            if let Some(oldest) = state
-                .sessions
-                .iter()
-                .min_by_key(|(_, session)| session.last_seen)
-                .map(|(id, _)| id.clone())
-            {
-                state.sessions.remove(&oldest);
-            }
+            contexts: SessionContextStore::with_anonymous(called),
         }
     }
 
     fn is_called(&self, session: &ClientSession) -> bool {
-        let Some(session_id) = session.namespace() else {
-            return self.anonymous_called.load(Ordering::Acquire);
-        };
-        let now = Instant::now();
-        let mut state = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::prune_sessions(&mut state, now);
-        Self::ensure_capacity(&mut state, session_id);
-        let session = state
-            .sessions
-            .entry(session_id.to_string())
-            .or_insert(SessionInstructionState {
-                called: false,
-                last_seen: now,
-            });
-        session.last_seen = now;
-        session.called
+        self.contexts.instruction_called(session.namespace())
     }
 
     fn mark_called(&self, session: &ClientSession) {
-        let Some(session_id) = session.namespace() else {
-            self.anonymous_called.store(true, Ordering::Release);
-            return;
-        };
-        let now = Instant::now();
-        let mut state = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::prune_sessions(&mut state, now);
-        Self::ensure_capacity(&mut state, session_id);
-        state.sessions.insert(
-            session_id.to_string(),
-            SessionInstructionState {
-                called: true,
-                last_seen: now,
-            },
-        );
+        self.contexts.mark_instruction_called(session.namespace());
     }
 
     fn forget(&self, session: &ClientSession) {
-        let Some(session_id) = session.namespace() else {
-            self.anonymous_called.store(false, Ordering::Release);
-            return;
-        };
-        let mut state = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.sessions.remove(session_id);
+        self.contexts.forget(session.namespace());
     }
 
     fn has_named_sessions(&self) -> bool {
-        let now = Instant::now();
-        let mut state = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::prune_sessions(&mut state, now);
-        !state.sessions.is_empty()
+        self.contexts.has_named_sessions()
+    }
+
+    fn active_project(&self, session: &ClientSession) -> Option<std::path::PathBuf> {
+        self.contexts.active_project(session.namespace())
+    }
+
+    fn set_active_project(
+        &self,
+        session: &ClientSession,
+        project: std::path::PathBuf,
+    ) -> ProjectStateChange {
+        self.contexts.set_active_project(session.namespace(), project)
+    }
+
+    fn clear_active_project(&self, session: &ClientSession) -> bool {
+        self.contexts.clear_active_project(session.namespace())
+    }
+
+    #[cfg(test)]
+    fn contains_named_session(&self, session_id: &str) -> bool {
+        self.contexts.contains_named_session(session_id)
     }
 }
 
@@ -3040,14 +2990,8 @@ mod tests {
         )
         .await;
         assert_eq!(delete_a.status(), StatusCode::OK);
-        {
-            let sessions = gate
-                .sessions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            assert!(!sessions.sessions.contains_key("session-a"));
-            assert!(sessions.sessions.contains_key("session-b"));
-        }
+        assert!(!gate.contains_named_session("session-a"));
+        assert!(gate.contains_named_session("session-b"));
 
         let a_terminal = loop {
             let snapshot = command_jobs
@@ -3088,6 +3032,266 @@ mod tests {
         assert!(saw_final_disconnect, "deleting the final named session must disconnect remote UI state");
 
         command_jobs.cancel_all().await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
+    async fn named_session_reuses_project_selected_by_successful_explicit_command_cwd() {
+        let workspace_root = unique_temp_path("catdesk-session-project-workspace");
+        let config_root = unique_temp_path("catdesk-session-project-config");
+        let config_path = config_root.join("config.toml");
+        let project = workspace_root.join("repo-a");
+        std::fs::create_dir_all(project.join(".git")).expect("create project");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let gate = InstructionGate::with_anonymous(false);
+        let session_id = "project-session-a";
+        let instruction_body = tool_call_body("catdesk_instruction", json!({}));
+        let session = ClientSession::from_headers(&modern_mcp_headers_for_session(
+            &instruction_body,
+            session_id,
+        ));
+        gate.mark_called(&session);
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: gate.clone(),
+        };
+
+        let explicit_body = tool_call_body(
+            "run_command",
+            json!({ "command": "pwd", "cwd": project.to_string_lossy() }),
+        );
+        let explicit_response = post_mcp_http(
+            State(server_state.clone()),
+            modern_mcp_headers_for_session(&explicit_body, session_id),
+            explicit_body,
+        )
+        .await;
+        assert_eq!(explicit_response.status(), StatusCode::OK);
+        let explicit_bytes = to_bytes(explicit_response.into_body(), usize::MAX)
+            .await
+            .expect("read explicit cwd response");
+        let explicit_payload: Value =
+            serde_json::from_slice(&explicit_bytes).expect("parse explicit cwd response");
+        assert_eq!(
+            explicit_payload
+                .pointer("/result/structuredContent/cwd")
+                .and_then(Value::as_str),
+            Some(project.to_string_lossy().as_ref())
+        );
+
+        let implicit_body = tool_call_body("run_command", json!({ "command": "pwd" }));
+        let implicit_response = post_mcp_http(
+            State(server_state),
+            modern_mcp_headers_for_session(&implicit_body, session_id),
+            implicit_body,
+        )
+        .await;
+        assert_eq!(implicit_response.status(), StatusCode::OK);
+        let implicit_bytes = to_bytes(implicit_response.into_body(), usize::MAX)
+            .await
+            .expect("read implicit cwd response");
+        let implicit_payload: Value =
+            serde_json::from_slice(&implicit_bytes).expect("parse implicit cwd response");
+        assert_eq!(
+            implicit_payload
+                .pointer("/result/structuredContent/cwd")
+                .and_then(Value::as_str),
+            Some(project.to_string_lossy().as_ref()),
+            "named session should reuse the project selected by the successful explicit cwd"
+        );
+        assert_eq!(gate.active_project(&session), Some(project.clone()));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[test]
+    fn project_signal_requires_unambiguous_file_scope_and_ignores_workspace_search_root() {
+        let workspace_root = unique_temp_path("catdesk-project-signal-workspace");
+        let repo_a = workspace_root.join("repo-a");
+        let repo_b = workspace_root.join("repo-b");
+        std::fs::create_dir_all(repo_a.join(".git")).expect("create repo-a");
+        std::fs::create_dir_all(repo_b.join(".git")).expect("create repo-b");
+        std::fs::write(repo_a.join("a.txt"), "a\n").expect("write repo-a file");
+        std::fs::write(repo_b.join("b.txt"), "b\n").expect("write repo-b file");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let parse = |body: Bytes| -> JsonRpcRequest {
+            serde_json::from_slice(&body).expect("parse tool request")
+        };
+        let same_repo = parse(tool_call_body(
+            "read",
+            json!({ "paths": [repo_a.join("a.txt").to_string_lossy()] }),
+        ));
+        assert_eq!(
+            project_signal_for_request(&same_repo, &workspace_root_str),
+            Some(repo_a.canonicalize().expect("canonical repo-a"))
+        );
+
+        let mixed = parse(tool_call_body(
+            "read",
+            json!({
+                "paths": [
+                    repo_a.join("a.txt").to_string_lossy(),
+                    repo_b.join("b.txt").to_string_lossy()
+                ]
+            }),
+        ));
+        assert_eq!(project_signal_for_request(&mixed, &workspace_root_str), None);
+
+        let root_search = parse(tool_call_body(
+            "search",
+            json!({ "pattern": "a", "path": workspace_root.to_string_lossy() }),
+        ));
+        assert_eq!(project_signal_for_request(&root_search, &workspace_root_str), None);
+
+        let repo_search = parse(tool_call_body(
+            "search",
+            json!({ "pattern": "b", "path": repo_b.to_string_lossy() }),
+        ));
+        assert_eq!(
+            project_signal_for_request(&repo_search, &workspace_root_str),
+            Some(repo_b.canonicalize().expect("canonical repo-b"))
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn three_named_sessions_keep_independent_projects_across_command_read_and_search_signals() {
+        let workspace_root = unique_temp_path("catdesk-three-session-project-workspace");
+        let config_root = unique_temp_path("catdesk-three-session-project-config");
+        let config_path = config_root.join("config.toml");
+        let repo_a = workspace_root.join("repo-a");
+        let repo_b = workspace_root.join("repo-b");
+        let repo_c = workspace_root.join("repo-c");
+        for repo in [&repo_a, &repo_b, &repo_c] {
+            std::fs::create_dir_all(repo.join(".git")).expect("create repo git marker");
+        }
+        std::fs::write(repo_b.join("selected.txt"), "selected by read\n")
+            .expect("write repo-b file");
+        std::fs::write(repo_c.join("selected.txt"), "needle selected by search\n")
+            .expect("write repo-c file");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let gate = InstructionGate::with_anonymous(false);
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: gate.clone(),
+        };
+
+        async fn call(
+            state: ServerState,
+            session_id: &str,
+            tool: &str,
+            arguments: Value,
+        ) -> Value {
+            let body = tool_call_body(tool, arguments);
+            let response = post_mcp_http(
+                State(state),
+                modern_mcp_headers_for_session(&body, session_id),
+                body,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "tool {tool}");
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read tool response");
+            let payload: Value = serde_json::from_slice(&bytes).expect("parse tool response");
+            assert_ne!(
+                payload.pointer("/result/isError").and_then(Value::as_bool),
+                Some(true),
+                "tool {tool} failed: {payload}"
+            );
+            payload
+        }
+
+        for session_id in ["session-a", "session-b", "session-c"] {
+            let body = tool_call_body("catdesk_instruction", json!({}));
+            let session = ClientSession::from_headers(&modern_mcp_headers_for_session(
+                &body,
+                session_id,
+            ));
+            gate.mark_called(&session);
+        }
+
+        let _ = call(
+            server_state.clone(),
+            "session-a",
+            "run_command",
+            json!({ "command": "pwd", "cwd": repo_a.to_string_lossy() }),
+        )
+        .await;
+        let _ = call(
+            server_state.clone(),
+            "session-b",
+            "read",
+            json!({ "paths": [repo_b.join("selected.txt").to_string_lossy()] }),
+        )
+        .await;
+        let _ = call(
+            server_state.clone(),
+            "session-c",
+            "search",
+            json!({ "pattern": "needle", "path": repo_c.to_string_lossy() }),
+        )
+        .await;
+
+        let a = call(
+            server_state.clone(),
+            "session-a",
+            "run_command",
+            json!({ "command": "pwd" }),
+        );
+        let b = call(
+            server_state.clone(),
+            "session-b",
+            "run_command",
+            json!({ "command": "pwd" }),
+        );
+        let c = call(
+            server_state,
+            "session-c",
+            "run_command",
+            json!({ "command": "pwd" }),
+        );
+        let (a, b, c) = tokio::join!(a, b, c);
+
+        for (payload, expected) in [(a, &repo_a), (b, &repo_b), (c, &repo_c)] {
+            assert_eq!(
+                payload
+                    .pointer("/result/structuredContent/cwd")
+                    .and_then(Value::as_str),
+                Some(expected.to_string_lossy().as_ref())
+            );
+        }
+
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
         let _ = std::fs::remove_dir_all(config_root);
@@ -3621,6 +3825,67 @@ async fn post_mcp_http(
     }
 }
 
+fn inferred_project_for_request_path(workspace_root: &str, path: &str) -> Option<PathBuf> {
+    let resolved = command::resolve_workspace_path(workspace_root, Some(path)).ok()?;
+    project_scope::infer_project_root(FsPath::new(workspace_root), &resolved).ok()
+}
+
+fn project_signal_for_request(req: &JsonRpcRequest, workspace_root: &str) -> Option<PathBuf> {
+    if req.method != "tools/call" {
+        return None;
+    }
+    let tool_name = req.params.get("name").and_then(Value::as_str)?;
+    let arguments = req.params.get("arguments").and_then(Value::as_object)?;
+
+    match tool_name {
+        "run_command" | "start_command" => arguments
+            .get("cwd")
+            .and_then(Value::as_str)
+            .and_then(|path| inferred_project_for_request_path(workspace_root, path)),
+        "write" | "edit" | "delete" | "read_image" => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| inferred_project_for_request_path(workspace_root, path)),
+        "read" => {
+            let paths = arguments.get("paths")?.as_array()?;
+            let mut projects = paths
+                .iter()
+                .map(Value::as_str)
+                .map(|path| path.and_then(|path| inferred_project_for_request_path(workspace_root, path)));
+            let first = projects.next()??;
+            projects.all(|project| project.as_ref() == Some(&first)).then_some(first)
+        }
+        "search" => {
+            let project = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| inferred_project_for_request_path(workspace_root, path))?;
+            let workspace = FsPath::new(workspace_root).canonicalize().ok()?;
+            (project != workspace).then_some(project)
+        }
+        _ => None,
+    }
+}
+
+fn tool_call_succeeded(resp: &mcp::JsonRpcResponse) -> bool {
+    resp.error.is_none()
+        && resp.result.as_ref().is_some_and(|result| {
+            result.get("isError").and_then(Value::as_bool) != Some(true)
+        })
+}
+
+fn record_project_selection(
+    gate: &InstructionGate,
+    session: &ClientSession,
+    project: PathBuf,
+) {
+    match gate.set_active_project(session, project) {
+        ProjectStateChange::Selected => crate::diagnostics::event("session_project_selected"),
+        ProjectStateChange::Changed => crate::diagnostics::event("session_project_changed"),
+        ProjectStateChange::Ignored | ProjectStateChange::Unchanged => {}
+    }
+}
+
 async fn post_mcp_inner(
     State(s): State<ServerState>,
     body_bytes: Bytes,
@@ -3755,6 +4020,17 @@ async fn post_mcp_inner(
     }
 
     let show_detail_mode = show_detail_mode.unwrap_or(app_show_detail_mode);
+    let stored_active_project = s.catdesk_instruction_called.active_project(&client_session);
+    let active_project = project_scope::valid_active_project(
+        FsPath::new(&workspace_root),
+        stored_active_project.as_deref(),
+    );
+    if stored_active_project.is_some() && active_project.is_none() {
+        if s.catdesk_instruction_called.clear_active_project(&client_session) {
+            crate::diagnostics::event("session_project_cleared");
+        }
+    }
+    let project_signal = project_signal_for_request(&req, &workspace_root);
     let response = mcp::handle_request_with_session(
         &req,
         &workspace_root,
@@ -3768,6 +4044,7 @@ async fn post_mcp_inner(
         &s.devtools,
         show_detail_mode,
         client_session.namespace(),
+        active_project.as_deref(),
     )
     .await;
 
@@ -3775,6 +4052,15 @@ async fn post_mcp_inner(
     if let Some(resp) = response {
         let mut resp = resp;
         if req.method == "tools/call" {
+            if tool_call_succeeded(&resp)
+                && let Some(project) = project_signal.clone()
+            {
+                record_project_selection(
+                    &s.catdesk_instruction_called,
+                    &client_session,
+                    project,
+                );
+            }
             if req.params.get("name").and_then(Value::as_str) == Some("catdesk_instruction")
                 && resp.error.is_none()
                 && resp.result.as_ref().is_some_and(|result| {

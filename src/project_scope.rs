@@ -114,6 +114,25 @@ pub(crate) fn infer_project_root(
     Ok(workspace)
 }
 
+pub(crate) fn command_change_tracking_root(
+    workspace_root: &Path,
+    cwd: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let workspace = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve workspace root: {error}"))?;
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve command cwd: {error}"))?;
+    if !cwd.is_dir() || !cwd.starts_with(&workspace) {
+        return Err(path_escape_error(cwd.as_path()));
+    }
+    if cwd == workspace {
+        return Ok(None);
+    }
+    Ok(Some(cwd))
+}
+
 pub(crate) fn valid_active_project(
     workspace_root: &Path,
     active_project: Option<&Path>,
@@ -122,6 +141,39 @@ pub(crate) fn valid_active_project(
     let workspace = workspace_root.canonicalize().ok()?;
     let project = active_project.canonicalize().ok()?;
     (project.is_dir() && project.starts_with(&workspace)).then_some(project)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CwdSource {
+    Explicit,
+    SessionProject,
+    WorkspaceFallback,
+}
+
+pub(crate) fn select_effective_cwd(
+    workspace_root: &Path,
+    explicit_cwd: Option<PathBuf>,
+    active_project: Option<&Path>,
+) -> Result<(PathBuf, CwdSource), String> {
+    let workspace = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve workspace root: {error}"))?;
+
+    if let Some(explicit_cwd) = explicit_cwd {
+        let explicit = explicit_cwd
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve command cwd: {error}"))?;
+        if !explicit.is_dir() || !explicit.starts_with(&workspace) {
+            return Err(path_escape_error(&explicit_cwd));
+        }
+        return Ok((explicit, CwdSource::Explicit));
+    }
+
+    if let Some(project) = valid_active_project(&workspace, active_project) {
+        return Ok((project, CwdSource::SessionProject));
+    }
+
+    Ok((workspace, CwdSource::WorkspaceFallback))
 }
 
 #[cfg(test)]
@@ -215,6 +267,73 @@ mod tests {
         fs::remove_dir_all(&project).expect("remove project");
 
         assert_eq!(valid_active_project(&root, Some(&selected)), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn effective_cwd_prefers_explicit_then_session_project_then_workspace() {
+        let root = workspace("effective-cwd");
+        let repo = root.join("repo");
+        let explicit = root.join("explicit");
+        fs::create_dir_all(&repo).expect("create session project");
+        fs::create_dir_all(&explicit).expect("create explicit cwd");
+        let repo = canonical(&repo);
+        let explicit = canonical(&explicit);
+        let root_canonical = canonical(&root);
+
+        assert_eq!(
+            select_effective_cwd(&root, Some(explicit.clone()), Some(&repo)),
+            Ok((explicit, CwdSource::Explicit))
+        );
+        assert_eq!(
+            select_effective_cwd(&root, None, Some(&repo)),
+            Ok((repo, CwdSource::SessionProject))
+        );
+        assert_eq!(
+            select_effective_cwd(&root, None, None),
+            Ok((root_canonical, CwdSource::WorkspaceFallback))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_session_project_falls_back_to_workspace() {
+        let root = workspace("effective-cwd-stale");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("create session project");
+        let repo = canonical(&repo);
+        fs::remove_dir_all(&repo).expect("delete session project");
+
+        assert_eq!(
+            select_effective_cwd(&root, None, Some(&repo)),
+            Ok((canonical(&root), CwdSource::WorkspaceFallback))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn broad_workspace_root_disables_recursive_command_change_tracking() {
+        let root = workspace("change-tracking-root");
+        let root_canonical = canonical(&root);
+
+        assert_eq!(
+            command_change_tracking_root(&root, &root_canonical),
+            Ok(None)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_cwd_keeps_recursive_command_change_tracking() {
+        let root = workspace("change-tracking-project");
+        let project = root.join("repo");
+        fs::create_dir_all(&project).expect("create project");
+        let project = canonical(&project);
+
+        assert_eq!(
+            command_change_tracking_root(&root, &project),
+            Ok(Some(project))
+        );
         let _ = fs::remove_dir_all(root);
     }
 

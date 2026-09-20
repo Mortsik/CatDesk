@@ -11,6 +11,9 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use crate::change_tracking::{ChangeSession, FileChange};
+use crate::process_exit::{
+    EXIT_CODE_CANCELLED, EXIT_CODE_INTERNAL_ERROR, EXIT_CODE_TIMEOUT, exit_code_for_status,
+};
 use crate::process_runner;
 
 pub const DEFAULT_JOB_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
@@ -762,7 +765,8 @@ async fn run_job(
 ) {
     let cancelled_before_spawn = *cancel_rx.borrow();
     if cancelled_before_spawn {
-        job.finish(CommandJobState::Cancelled, None).await;
+        job.finish(CommandJobState::Cancelled, Some(EXIT_CODE_CANCELLED))
+            .await;
         return;
     }
 
@@ -777,7 +781,8 @@ async fn run_job(
         Err(error) => {
             job.append_output("stderr", format!("Failed to execute: {error}\n").as_bytes())
                 .await;
-            job.finish(CommandJobState::Failed, None).await;
+            job.finish(CommandJobState::Failed, Some(EXIT_CODE_INTERNAL_ERROR))
+                .await;
             return;
         }
     };
@@ -805,13 +810,13 @@ async fn run_job(
         Completion::Exited(Ok(status)) => {
             process.disarm().await;
             if status.success() {
-                (CommandJobState::Succeeded, status.code())
+                (CommandJobState::Succeeded, Some(exit_code_for_status(&status)))
             } else {
                 if let Some(signal) = process_runner::exit_status_signal_diagnostic(&status) {
                     job.append_output("stderr", format!("{signal}\n").as_bytes())
                         .await;
                 }
-                (CommandJobState::Failed, status.code())
+                (CommandJobState::Failed, Some(exit_code_for_status(&status)))
             }
         }
         Completion::Exited(Err(error)) => {
@@ -822,15 +827,13 @@ async fn run_job(
                 format!("CatDesk failed while waiting for command: {error}\n").as_bytes(),
             )
             .await;
-            (CommandJobState::Failed, None)
+            (CommandJobState::Failed, Some(EXIT_CODE_INTERNAL_ERROR))
         }
         Completion::Cancelled => {
             process.terminate_tree().await;
             let status = process.wait().await.ok();
-            (
-                CommandJobState::Cancelled,
-                status.and_then(|value| value.code()),
-            )
+            let _ = status;
+            (CommandJobState::Cancelled, Some(EXIT_CODE_CANCELLED))
         }
         Completion::TimedOut => {
             process.terminate_tree().await;
@@ -840,10 +843,8 @@ async fn run_job(
                 format!("Command timed out after {} ms\n", job.timeout_ms).as_bytes(),
             )
             .await;
-            (
-                CommandJobState::TimedOut,
-                status.and_then(|value| value.code()),
-            )
+            let _ = status;
+            (CommandJobState::TimedOut, Some(EXIT_CODE_TIMEOUT))
         }
     };
 
@@ -1002,6 +1003,7 @@ mod tests {
         ));
         let terminal = wait_terminal(&manager, &started.snapshot.job_id).await;
         assert_eq!(terminal.state, CommandJobState::Cancelled);
+        assert_eq!(terminal.exit_code, Some(EXIT_CODE_CANCELLED));
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert!(
             !sentinel.exists(),
@@ -1026,6 +1028,7 @@ mod tests {
 
         let snapshot = job.snapshot(0).await;
         assert_eq!(snapshot.state, CommandJobState::Cancelled);
+        assert_eq!(snapshot.exit_code, Some(EXIT_CODE_CANCELLED));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             !sentinel.exists(),
@@ -1092,7 +1095,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn signalled_background_job_reports_signal_in_output() {
+    async fn signalled_background_job_reports_conventional_exit_code_and_signal() {
         let root = workspace("signal-diagnostic");
         let manager = CommandJobManager::new();
         let started = manager
@@ -1101,7 +1104,7 @@ mod tests {
             .expect("start signalled job");
         let terminal = wait_terminal(&manager, &started.snapshot.job_id).await;
         assert_eq!(terminal.state, CommandJobState::Failed);
-        assert_eq!(terminal.exit_code, None);
+        assert_eq!(terminal.exit_code, Some(137));
         let text = terminal
             .events
             .iter()
@@ -1130,6 +1133,7 @@ mod tests {
             .expect("start job");
         let terminal = wait_terminal(&manager, &started.snapshot.job_id).await;
         assert_eq!(terminal.state, CommandJobState::TimedOut);
+        assert_eq!(terminal.exit_code, Some(EXIT_CODE_TIMEOUT));
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert!(
             !sentinel.exists(),
