@@ -3,6 +3,7 @@ mod browser;
 mod change_tracking;
 mod command;
 mod command_jobs;
+mod job_store;
 mod devtools;
 mod diagnostics;
 mod handoff;
