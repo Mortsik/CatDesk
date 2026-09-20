@@ -6,7 +6,7 @@ use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, watch};
+use tokio::sync::{Mutex, Notify, OnceCell, OwnedSemaphorePermit, RwLock, Semaphore, watch};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
@@ -363,7 +363,10 @@ pub struct CommandJobManager {
     process_budget: Arc<Semaphore>,
     process_limit: usize,
     store: JobStore,
-    recovered: Arc<AtomicBool>,
+    // Recovery is shared across clones and awaited by every concurrent first
+    // request. Marking it complete before recover() finishes would let another
+    // request observe an empty in-memory registry during startup.
+    recovery: Arc<OnceCell<()>>,
 }
 
 impl Default for CommandJobManager {
@@ -392,7 +395,7 @@ impl CommandJobManager {
             process_budget: Arc::new(Semaphore::new(limit)),
             process_limit: limit,
             store: JobStore::disabled(),
-            recovered: Arc::new(AtomicBool::new(false)),
+            recovery: Arc::new(OnceCell::new()),
         }
     }
 
@@ -742,9 +745,11 @@ impl CommandJobManager {
     }
 
     pub async fn cleanup(&self) {
-        if !self.recovered.swap(true, Ordering::AcqRel) {
-            self.recover().await;
-        }
+        self.recovery
+            .get_or_init(|| async {
+                self.recover().await;
+            })
+            .await;
         {
             let mut manager = self.inner.write().await;
             if manager
@@ -1062,6 +1067,90 @@ mod tests {
         let records = manager.store.read_all();
         assert_eq!(records[0].state, CommandJobState::Succeeded);
         assert_eq!(records[0].exit_code, Some(0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_first_polls_wait_for_recovery_to_finish() {
+        use std::io::Write;
+
+        let dir = workspace("recovery-race");
+        let job_id = "recovery-race-job".to_string();
+        let fifo = dir.join(format!("{job_id}.json"));
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(
+            status.success(),
+            "mkfifo must be available for the race fixture"
+        );
+
+        let record = JobRecord {
+            schema_version: 1,
+            job_id: job_id.clone(),
+            command: "sleep 1".into(),
+            cwd: dir.to_string_lossy().into_owned(),
+            workspace_root: dir.to_string_lossy().into_owned(),
+            owner_session: None,
+            timeout_ms: 60_000,
+            started_at_ms: unix_now_ms().saturating_sub(1_000),
+            state: CommandJobState::Running,
+            exit_code: None,
+            finished_at_ms: None,
+            elapsed_ms: None,
+        };
+        let payload = serde_json::to_vec(&record).expect("serialize fixture");
+        let (reader_open_tx, reader_open_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo)
+                .expect("open fifo writer");
+            reader_open_tx.send(()).expect("announce recovery read");
+            release_rx
+                .recv_timeout(StdDuration::from_secs(2))
+                .expect("release fifo writer");
+            file.write_all(&payload).expect("write persisted job");
+        });
+
+        let manager = CommandJobManager::with_store(dir.clone());
+        let first_manager = manager.clone();
+        let first_job_id = job_id.clone();
+        let first = tokio::spawn(async move { first_manager.poll(&first_job_id, 0, 0).await });
+
+        tokio::task::spawn_blocking(move || {
+            reader_open_rx
+                .recv_timeout(StdDuration::from_secs(2))
+                .expect("first poll never started recovery")
+        })
+        .await
+        .expect("wait for recovery read");
+
+        let second_manager = manager.clone();
+        let second_job_id = job_id.clone();
+        let mut second =
+            tokio::spawn(async move { second_manager.poll(&second_job_id, 0, 0).await });
+        let premature = tokio::time::timeout(Duration::from_millis(100), &mut second).await;
+        let completed_prematurely = premature.is_ok();
+
+        release_tx.send(()).expect("release recovery read");
+        let first_snapshot = first.await.expect("first poll task").expect("first poll");
+        let second_result = match premature {
+            Ok(joined) => joined.expect("second poll task"),
+            Err(_) => second.await.expect("second poll task"),
+        };
+        writer.join().expect("fifo writer");
+
+        assert!(
+            !completed_prematurely,
+            "a concurrent first poll bypassed in-progress recovery"
+        );
+        let second_snapshot = second_result.expect("second poll after recovery");
+        assert_eq!(first_snapshot.state, CommandJobState::Interrupted);
+        assert_eq!(second_snapshot.state, CommandJobState::Interrupted);
         let _ = std::fs::remove_dir_all(dir);
     }
 
