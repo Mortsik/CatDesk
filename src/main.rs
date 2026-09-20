@@ -3,6 +3,8 @@ mod browser;
 mod change_tracking;
 mod command;
 mod command_jobs;
+mod command_policy;
+mod search_gate;
 mod job_store;
 mod devtools;
 mod diagnostics;

@@ -1,4 +1,5 @@
 use crate::command;
+use crate::search_gate;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use image::imageops::FilterType;
@@ -10,7 +11,12 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Per-file cap; MAX_READ_BATCH_BYTES caps the whole batch.
 const MAX_READ_BYTES: usize = 512 * 1024;
@@ -27,6 +33,22 @@ const HARD_LIST_LIMIT: usize = 1000;
 const DEFAULT_SEARCH_LIMIT: usize = 100;
 const HARD_SEARCH_LIMIT: usize = 500;
 const HARD_SEARCH_CONTEXT_LINES: usize = 20;
+/// Hard wall-clock bound for one text search. A rare pattern never reaches
+/// the `max_matches` cap, and without a deadline rg walks the whole tree
+/// (measured: 17+ min per search while six duplicates pinned every CPU and
+/// the GLM semaphore starved — 2026-09-20).
+const SEARCH_DEADLINE: Duration = Duration::from_secs(60);
+/// Excluded from every search unless the caller explicitly passes
+/// `no_ignore`. Appended AFTER the caller's glob because rg lets the LAST
+/// matching glob decide, so a caller whitelist like `**/*` must not
+/// resurrect these.
+const DEFAULT_SEARCH_EXCLUDES: &[&str] = &[
+    "!**/.git/**",
+    "!**/target/**",
+    "!**/node_modules/**",
+    "!**/.venv/**",
+    "!**/__pycache__/**",
+];
 const MAX_FALLBACK_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_FALLBACK_SEARCH_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FALLBACK_SEARCH_FILES: usize = 2_000;
@@ -185,6 +207,18 @@ struct ResolvedSearchTextOptions<'a> {
 enum SearchBackendError {
     Unavailable,
     Failed(String),
+}
+
+// `Debug` so tests can `.expect()`/`.unwrap_err()` on backend results.
+impl std::fmt::Debug for SearchBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SearchBackendError::Unavailable => write!(f, "SearchBackendError::Unavailable"),
+            SearchBackendError::Failed(message) => {
+                write!(f, "SearchBackendError::Failed({message:?})")
+            }
+        }
+    }
 }
 
 enum SearchMatcher {
@@ -839,6 +873,34 @@ pub fn search_text(
         no_ignore: options.no_ignore,
     };
 
+    // One in-flight search per query, `MAX_CONCURRENT_SEARCHES` per machine:
+    // duplicate re-issues (agent retry storms) and stacked whole-workspace
+    // walks starved the host on 2026-09-20, so redundancy is rejected, not
+    // queued.
+    let _search_permit = match search_gate::acquire(search_gate::SearchKey {
+        pattern: resolved.pattern.to_string(),
+        path: start.to_string_lossy().into_owned(),
+        glob: resolved.glob.map(str::to_string),
+        fixed_strings: resolved.fixed_strings,
+        case_insensitive: resolved.case_insensitive,
+        include_hidden: resolved.include_hidden,
+        no_ignore: resolved.no_ignore,
+    }) {
+        Ok(permit) => permit,
+        Err(search_gate::SearchGateError::DuplicateInFlight) => {
+            return Err(
+                "An identical search is already running; wait for it to finish or narrow the path instead of re-issuing the same query"
+                    .into(),
+            );
+        }
+        Err(search_gate::SearchGateError::Busy) => {
+            return Err(format!(
+                "{} searches are already running; wait for one to finish or narrow the path",
+                search_gate::MAX_CONCURRENT_SEARCHES
+            ));
+        }
+    };
+
     if command_available("rg") {
         return search_text_rg(&root, &start, resolved).map_err(|e| match e {
             SearchBackendError::Unavailable => "ripgrep disappeared while running search".into(),
@@ -881,56 +943,159 @@ fn command_available(program: &str) -> bool {
     }
 }
 
+/// Single source of the rg argument vector, split out so the always-on
+/// excludes are unit-testable without spawning a process.
+fn rg_argument_list(options: ResolvedSearchTextOptions<'_>, start: &Path) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--json",
+        "--one-file-system",
+        "--line-number",
+        "--with-filename",
+        "--no-heading",
+        "--no-messages",
+        "--color",
+        "never",
+    ]
+    .iter()
+    .map(|argument| (*argument).to_string())
+    .collect();
+    if options.fixed_strings {
+        args.push("--fixed-strings".into());
+    }
+    if options.case_insensitive {
+        args.push("--ignore-case".into());
+    }
+    if options.include_hidden {
+        args.push("--hidden".into());
+    }
+    if options.no_ignore {
+        args.push("--no-ignore".into());
+    }
+    if let Some(glob) = options.glob {
+        args.push("--glob".into());
+        args.push(glob.to_string());
+    }
+    // After the caller's glob on purpose: rg lets the LAST matching glob
+    // decide, so a caller whitelist like `**/*` must not resurrect these.
+    if !options.no_ignore {
+        for exclude in DEFAULT_SEARCH_EXCLUDES {
+            args.push("--glob".into());
+            args.push((*exclude).to_string());
+        }
+    }
+    if let Some(value) = options.max_matches_per_file {
+        args.push("--max-count".into());
+        args.push(value.to_string());
+    }
+    if options.before == options.after && options.before > 0 {
+        args.push("--context".into());
+        args.push(options.before.to_string());
+    } else {
+        if options.before > 0 {
+            args.push("--before-context".into());
+            args.push(options.before.to_string());
+        }
+        if options.after > 0 {
+            args.push("--after-context".into());
+            args.push(options.after.to_string());
+        }
+    }
+    args.push("--regexp".into());
+    args.push(options.pattern.to_string());
+    args.push(start.to_string_lossy().into_owned());
+    args
+}
+
+/// Kills the rg child when dropped unless the reader loop finished first —
+/// covers early returns, panics and caller-cancellation paths.
+struct RgChildGuard {
+    child: Option<std::process::Child>,
+    finished: Arc<AtomicBool>,
+}
+
+impl RgChildGuard {
+    fn kill(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+    }
+}
+
+impl Drop for RgChildGuard {
+    fn drop(&mut self) {
+        if !self.finished.load(Ordering::SeqCst) {
+            self.kill();
+            if let Some(mut child) = self.child.take() {
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+/// Returns the "deadline fired" flag. Sleeps until `deadline`, then SIGKILLs
+/// `pid` unless `finished` was set first. Keeps working even when the reader
+/// thread is blocked or its caller walked away — that is the orphaned-search
+/// failure mode from 2026-09-20.
+#[cfg(unix)]
+fn spawn_deadline_watchdog(
+    pid: u32,
+    deadline: Instant,
+    finished: Arc<AtomicBool>,
+) -> Arc<AtomicBool> {
+    let killed = Arc::new(AtomicBool::new(false));
+    let killed_flag = Arc::clone(&killed);
+    std::thread::spawn(move || {
+        let now = Instant::now();
+        if deadline > now {
+            std::thread::sleep(deadline - now);
+        }
+        if !finished.load(Ordering::SeqCst) {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            killed_flag.store(true, Ordering::SeqCst);
+        }
+    });
+    killed
+}
+
+#[cfg(not(unix))]
+fn spawn_deadline_watchdog(
+    _pid: u32,
+    _deadline: Instant,
+    _finished: Arc<AtomicBool>,
+) -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
 fn search_text_rg(
     root: &Path,
     start: &Path,
     options: ResolvedSearchTextOptions<'_>,
 ) -> Result<SearchTextOutput, SearchBackendError> {
+    search_text_rg_with_deadline(root, start, options, Instant::now() + SEARCH_DEADLINE)
+}
+
+fn search_text_rg_with_deadline(
+    root: &Path,
+    start: &Path,
+    options: ResolvedSearchTextOptions<'_>,
+    deadline: Instant,
+) -> Result<SearchTextOutput, SearchBackendError> {
     let mut command = ProcessCommand::new("rg");
-    command
-        .current_dir(&root)
-        .arg("--json")
-        .arg("--one-file-system")
-        .arg("--line-number")
-        .arg("--with-filename")
-        .arg("--no-heading")
-        .arg("--no-messages")
-        .arg("--color")
-        .arg("never");
-    if options.fixed_strings {
-        command.arg("--fixed-strings");
+    command.current_dir(&root);
+    for argument in rg_argument_list(options, start) {
+        command.arg(argument);
     }
-    if options.case_insensitive {
-        command.arg("--ignore-case");
+    // A search is background noise: it must never out-prioritize interactive
+    // traffic (the GLM semaphore stalls when searches pin every CPU).
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            libc::nice(10);
+            Ok(())
+        });
     }
-    if options.include_hidden {
-        command.arg("--hidden");
-    }
-    if options.no_ignore {
-        command.arg("--no-ignore");
-    }
-    if let Some(glob) = options.glob {
-        command.arg("--glob").arg(glob);
-    }
-    if let Some(value) = options.max_matches_per_file {
-        command.arg("--max-count").arg(value.to_string());
-    }
-    if options.before == options.after && options.before > 0 {
-        command.arg("--context").arg(options.before.to_string());
-    } else {
-        if options.before > 0 {
-            command
-                .arg("--before-context")
-                .arg(options.before.to_string());
-        }
-        if options.after > 0 {
-            command
-                .arg("--after-context")
-                .arg(options.after.to_string());
-        }
-    }
-    let include_context = options.before > 0 || options.after > 0;
-    command.arg("--regexp").arg(options.pattern).arg(&start);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = command.spawn().map_err(|e| {
@@ -940,11 +1105,19 @@ fn search_text_rg(
             SearchBackendError::Failed(e.to_string())
         }
     })?;
+    let pid = child.id();
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| SearchBackendError::Failed("Failed to capture ripgrep stdout".into()))?;
+    let finished = Arc::new(AtomicBool::new(false));
+    let killed_by_deadline = spawn_deadline_watchdog(pid, deadline, Arc::clone(&finished));
+    let mut child_guard = RgChildGuard {
+        child: Some(child),
+        finished: Arc::clone(&finished),
+    };
     let mut reader = BufReader::new(stdout);
+    let include_context = options.before > 0 || options.after > 0;
     let mut results: Vec<SearchTextEntry> = Vec::new();
     let mut returned_matches = 0_usize;
     let mut truncated = false;
@@ -966,7 +1139,7 @@ fn search_text_rg(
             Some("match") => {
                 if returned_matches >= options.max_matches {
                     truncated = true;
-                    let _ = child.kill();
+                    child_guard.kill();
                     break;
                 }
                 results.push(
@@ -985,10 +1158,20 @@ fn search_text_rg(
         }
     }
 
-    let output = child
+    finished.store(true, Ordering::SeqCst);
+    let killed_by_deadline = killed_by_deadline.load(Ordering::SeqCst);
+    let output = child_guard
+        .child
+        .take()
+        .expect("rg child consumed exactly once")
         .wait_with_output()
         .map_err(|e| SearchBackendError::Failed(e.to_string()))?;
     let status_code = output.status.code().unwrap_or(2);
+    // A deadline kill surfaces as a signal exit (code None -> 2); that is a
+    // first-class truncated outcome, not a backend failure.
+    if killed_by_deadline {
+        truncated = true;
+    }
     if !truncated && status_code != 0 && status_code != 1 {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let message = stderr.trim();
@@ -1003,7 +1186,11 @@ fn search_text_rg(
         pattern: options.pattern.to_string(),
         path: to_workspace_relative(root, start),
         backend: "rg".into(),
-        backend_note: String::new(),
+        backend_note: if killed_by_deadline {
+            "search exceeded its time budget and was truncated; narrow the path or refine the pattern".into()
+        } else {
+            String::new()
+        },
         match_count: returned_matches,
         truncated,
         limit: options.max_matches,
@@ -2142,6 +2329,120 @@ mod tests {
             "alpha\nbeta\ngamma\n"
         );
 
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    fn rg_args_for(pattern: &str, glob: Option<&str>, no_ignore: bool) -> Vec<String> {
+        rg_argument_list(
+            ResolvedSearchTextOptions {
+                pattern,
+                glob,
+                fixed_strings: false,
+                case_insensitive: false,
+                before: 0,
+                after: 0,
+                max_matches: 10,
+                max_matches_per_file: None,
+                include_hidden: true,
+                no_ignore,
+            },
+            Path::new("/tmp"),
+        )
+    }
+
+    #[test]
+    fn rg_arguments_exclude_heavy_trees_after_caller_glob() {
+        let args = rg_args_for("needle", Some("**/*"), false);
+        let caller_glob = args
+            .iter()
+            .position(|argument| argument == "**/*")
+            .expect("caller glob passed through");
+        let git_exclude = args
+            .iter()
+            .position(|argument| argument == "!**/.git/**")
+            .expect("git exclude always present");
+        assert!(
+            git_exclude > caller_glob,
+            "excludes must come after the caller glob: rg lets the last matching glob decide"
+        );
+        assert!(args.contains(&"!**/target/**".to_string()));
+        assert!(args.contains(&"!**/node_modules/**".to_string()));
+    }
+
+    #[test]
+    fn rg_arguments_respect_no_ignore_escape_hatch() {
+        let args = rg_args_for("needle", Some("**/*"), true);
+        assert!(!args.contains(&"!**/.git/**".to_string()));
+        assert!(args.contains(&"--no-ignore".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_watchdog_kills_a_stuck_child() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let finished = Arc::new(AtomicBool::new(false));
+        let killed = spawn_deadline_watchdog(
+            child.id(),
+            Instant::now() + Duration::from_millis(100),
+            Arc::clone(&finished),
+        );
+        let bail_out = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().expect("poll child").is_none() {
+            assert!(
+                Instant::now() < bail_out,
+                "watchdog failed to kill the stuck child"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(killed.load(Ordering::SeqCst));
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn rg_search_with_tiny_deadline_returns_instead_of_walking() {
+        if !command_available("rg") {
+            return; // backend guard, same skip style as the fallback chain
+        }
+        let workspace_root = test_workspace("search-deadline");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        for index in 0..50 {
+            fs::write(
+                workspace_root.join(format!("file-{index}.txt")),
+                "filler\n",
+            )
+            .expect("write file");
+        }
+        let started = Instant::now();
+        let output = search_text_rg_with_deadline(
+            &workspace_root,
+            &workspace_root,
+            ResolvedSearchTextOptions {
+                pattern: "never-present-needle",
+                glob: None,
+                fixed_strings: false,
+                case_insensitive: false,
+                before: 0,
+                after: 0,
+                max_matches: 100,
+                max_matches_per_file: None,
+                include_hidden: true,
+                no_ignore: false,
+            },
+            Instant::now() + Duration::from_millis(50),
+        )
+        .expect("deadline search completes");
+        assert_eq!(output.backend, "rg");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "deadline must bound the search, took {:?}",
+            started.elapsed()
+        );
         let _ = fs::remove_dir_all(workspace_root);
     }
 }
