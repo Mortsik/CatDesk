@@ -694,6 +694,7 @@ pub struct AppState {
     next_log_id: u64,
     pub flows: Vec<FlowLane>,
     pub flow_bootstrap_progress: HashMap<String, FlowBootstrapProgress>,
+    connected_chat_ids: HashSet<String>,
     pub request_count: u64,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
@@ -1067,6 +1068,7 @@ impl AppState {
             next_log_id: 0,
             flows: Vec::new(),
             flow_bootstrap_progress: HashMap::new(),
+            connected_chat_ids: HashSet::new(),
             request_count: 0,
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
@@ -1197,6 +1199,10 @@ impl AppState {
         totals
     }
 
+    pub fn connected_chat_count(&self) -> usize {
+        self.connected_chat_ids.len()
+    }
+
     pub fn apply_server_ui_event(&mut self, event: ServerUiEvent) {
         match event {
             ServerUiEvent::IncrementRequestCount => {
@@ -1208,6 +1214,7 @@ impl AppState {
                     self.last_remote_activity_ms = Some(now_unix_millis());
                 } else {
                     self.last_remote_activity_ms = None;
+                    self.connected_chat_ids.clear();
                 }
             }
             ServerUiEvent::RecordFlow {
@@ -1259,6 +1266,7 @@ impl AppState {
         let now_ms = now_unix_millis();
         self.last_remote_activity_ms = Some(now_ms);
         self.remote_connected = true;
+        self.connected_chat_ids.insert(flow_id.to_string());
         let step_ms = derive_flow_step_ms();
         let starts_bootstrap_status = events_start_bootstrap_status(events);
         let only_bootstrap_status_events = events_are_bootstrap_status_events(events);
@@ -1416,6 +1424,7 @@ impl AppState {
 
     pub fn begin_flow_close(&mut self, flow_id: &str) {
         let now_ms = now_unix_millis();
+        self.connected_chat_ids.remove(flow_id);
         self.flow_bootstrap_progress.remove(flow_id);
         if let Some(flow) = self.flows.iter_mut().find(|flow| flow.flow_id == flow_id) {
             if flow.closing_started_ms.is_none() {
@@ -2224,6 +2233,31 @@ toolCallCount = 0
         assert_eq!(rolling.tool_input_tokens, 20);
         assert_eq!(rolling.tool_output_tokens, 2);
         assert_eq!(rolling.tool_call_count, 1);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn connected_chat_count_tracks_independent_flow_lifecycles() {
+        let (mut app, workspace, config_path) = test_app("catdesk-connected-chats");
+        app.record_flow(
+            "session:a",
+            &["tools/call:read".to_string()],
+            FlowDirection::Forward,
+        );
+        app.record_flow(
+            "session:b",
+            &["tools/call:read".to_string()],
+            FlowDirection::Forward,
+        );
+        assert_eq!(app.connected_chat_count(), 2);
+
+        app.begin_flow_close("session:a");
+        assert_eq!(app.connected_chat_count(), 1);
+
+        app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected(false));
+        assert_eq!(app.connected_chat_count(), 0);
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);

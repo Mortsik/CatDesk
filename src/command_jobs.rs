@@ -445,6 +445,20 @@ impl CommandJobManager {
             })
     }
 
+    pub async fn active_job_count(&self) -> usize {
+        let jobs = {
+            let manager = self.inner.read().await;
+            manager.jobs.values().cloned().collect::<Vec<_>>()
+        };
+        let mut active = 0usize;
+        for job in jobs {
+            if job.runtime.lock().await.state == CommandJobState::Running {
+                active += 1;
+            }
+        }
+        active
+    }
+
     pub fn normalize_timeout(timeout_ms: Option<u64>) -> Result<u64, String> {
         match timeout_ms {
             None => Ok(DEFAULT_JOB_TIMEOUT_MS),
@@ -2097,6 +2111,28 @@ mod tests {
         .await
         .expect("process capacity did not recover");
         drop(permit);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn active_job_count_tracks_running_jobs() {
+        let root = workspace("active-count");
+        let manager = CommandJobManager::new();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 500"
+        } else {
+            "sleep 0.5"
+        };
+        let started = manager
+            .start(command.to_string(), root.clone(), 5_000, None)
+            .await
+            .expect("start active-count job");
+
+        assert_eq!(manager.active_job_count().await, 1);
+        let terminal = wait_terminal(&manager, &started.snapshot.job_id).await;
+        assert_eq!(terminal.state, CommandJobState::Succeeded);
+        assert_eq!(manager.active_job_count().await, 0);
+
         let _ = std::fs::remove_dir_all(root);
     }
 
