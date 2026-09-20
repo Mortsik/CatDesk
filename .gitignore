@@ -1,4 +1,5 @@
 /target
 /npm/bin
+/.worktrees/
 log.txt
 log_old.txt
