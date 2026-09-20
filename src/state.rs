@@ -1191,9 +1191,11 @@ impl AppState {
 
     pub fn rolling_usage_totals(&self, now_ms: u128, window_ms: u128) -> UsageTotals {
         let mut totals = UsageTotals::default();
-        for sample in self.usage_rate_samples.iter().filter(|sample| {
-            now_ms.saturating_sub(sample.recorded_at_ms) <= window_ms
-        }) {
+        for sample in self
+            .usage_rate_samples
+            .iter()
+            .filter(|sample| now_ms.saturating_sub(sample.recorded_at_ms) <= window_ms)
+        {
             totals.accumulate(sample.tool_input_tokens, sample.tool_output_tokens, 1);
         }
         totals
