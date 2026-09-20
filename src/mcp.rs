@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use crate::change_tracking::{ChangeScope, ChangeSession, ChangeTarget, FileChange};
 use crate::command;
 use crate::command_jobs::{
-    CommandJobManager, CommandJobSnapshot, CommandJobState, DEFAULT_JOB_TIMEOUT_MS,
-    DEFAULT_POLL_WAIT_MS, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
+    CommandJobManager, CommandJobSnapshot, CommandJobState, DEFAULT_ABANDON_AFTER_MS,
+    DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
 use crate::devtools::DevtoolsBridge;
 use crate::handoff;
@@ -902,7 +902,10 @@ async fn handle_tools_list_with_show_detail_mode(
             tools.push(json!({
                 "name": "start_command",
                 "title": "Start command",
-                "description": "Start a long-running shell command inside the workspace and return a job ID immediately. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open.",
+                "description": format!(
+                    "Start a long-running shell command inside the workspace and return a job ID immediately. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open. Polling keeps a job alive: a running job with no poll_command for {} minutes is ended as state \"abandoned\", so poll while you still need it.",
+                    DEFAULT_ABANDON_AFTER_MS / 60_000
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -926,7 +929,10 @@ async fn handle_tools_list_with_show_detail_mode(
             tools.push(json!({
                 "name": "poll_command",
                 "title": "Poll command",
-                "description": "Read incremental output and current status from a command previously started with start_command. Pass the returned nextCursor as after on the next poll so output is not repeated. If hasMoreOutput is true, poll again even if the job is already terminal so the remaining buffered output can be drained. A job that was running when CatDesk exited reports state \"interrupted\" with no further output; finished job state and exit code survive a restart.",
+                "description": format!(
+                    "Read incremental output and current status from a command previously started with start_command. Pass the returned nextCursor as after on the next poll so output is not repeated. If hasMoreOutput is true, poll again even if the job is already terminal so the remaining buffered output can be drained. A job that was running when CatDesk exited reports state \"interrupted\" with no further output; finished job state and exit code survive a restart. Each poll also refreshes the job's keep-alive: a running job nobody polls for {} minutes is ended as state \"abandoned\".",
+                    DEFAULT_ABANDON_AFTER_MS / 60_000
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1473,6 +1479,10 @@ fn command_job_output_text(snapshot: &CommandJobSnapshot) -> String {
                 "(command interrupted: CatDesk exited before the command finished; output was not retained)"
                     .to_string()
             }
+            CommandJobState::Abandoned => {
+                "(job abandoned: no poll arrived within the keep-alive window; start the command again if its work is still needed)"
+                    .to_string()
+            }
             _ => "(no new output)".to_string(),
         };
     }
@@ -1503,6 +1513,7 @@ fn command_job_structured(tool_name: &str, snapshot: &CommandJobSnapshot) -> Val
         CommandJobState::Failed
         | CommandJobState::Cancelled
         | CommandJobState::TimedOut
+        | CommandJobState::Abandoned
         | CommandJobState::Interrupted => Some(false),
         CommandJobState::Running => None,
     };
@@ -2480,6 +2491,10 @@ Always specify the branch explicitly when using `git push`."#
             "Command results survive a CatDesk restart: finished jobs keep their state and exit code, and a job that was running when CatDesk exited reports \"interrupted\" — start it again if its work is still needed."
                 .to_string(),
         );
+        lines.push(format!(
+            "Keep polling a background command you still need: a running job with no poll for {} minutes is ended as \"abandoned\" and its process tree is terminated.",
+            DEFAULT_ABANDON_AFTER_MS / 60_000
+        ));
         lines.push(
             "Use cancel_command when a background command is no longer needed. Do not repeatedly start the same build or server while an existing command job is still running."
                 .to_string(),
@@ -3275,6 +3290,7 @@ fn build_command_job_widget_payload(
         "failed" => ("Command Failed", "failed"),
         "timed_out" => ("Command Timed Out", "failed"),
         "interrupted" => ("Command Interrupted", "failed"),
+        "abandoned" => ("Command Abandoned", "failed"),
         _ => ("Command Job", "waiting"),
     };
     let mut output = structured
@@ -4946,6 +4962,26 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_snapshot_text_explains_missing_polls() {
+        let snapshot = CommandJobSnapshot {
+            job_id: "j".into(),
+            command: "sleep 1".into(),
+            cwd: "/w".into(),
+            state: CommandJobState::Abandoned,
+            elapsed_ms: 5,
+            exit_code: Some(131),
+            events: Vec::new(),
+            next_cursor: 0,
+            has_more_output: false,
+            output_truncated: false,
+            timeout_ms: 1_000,
+        };
+        let text = command_job_output_text(&snapshot);
+        assert!(text.contains("abandoned"), "{text}");
+        assert!(text.contains("no poll"), "{text}");
+    }
+
+    #[test]
     fn command_job_widget_state_matrix_preserves_command_ui_contract() {
         let cases = [
             ("start_command", "running", "Command Started", "waiting"),
@@ -4955,6 +4991,7 @@ mod tests {
             ("cancel_command", "cancelled", "Command Cancelled", "done"),
             ("poll_command", "timed_out", "Command Timed Out", "failed"),
             ("poll_command", "interrupted", "Command Interrupted", "failed"),
+            ("poll_command", "abandoned", "Command Abandoned", "failed"),
         ];
 
         for (tool_name, state, expected_title, expected_widget_state) in cases {
@@ -5301,6 +5338,7 @@ mod tests {
             let text = tool.to_string();
             assert!(text.contains("restart"), "{name} must document restart durability: {text}");
             assert!(text.contains("interrupted"), "{name} must document interrupted state: {text}");
+            assert!(text.contains("abandoned"), "{name} must document abandoned state: {text}");
         }
     }
 
@@ -6376,6 +6414,7 @@ mod tests {
                 .expect("build instruction");
         assert!(instruction.contains("survive a CatDesk restart"));
         assert!(instruction.contains("interrupted"));
+        assert!(instruction.contains("abandoned"));
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
