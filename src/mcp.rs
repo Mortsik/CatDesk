@@ -45,7 +45,9 @@ const INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER: &str =
     "__catdeskInitialTokenStatsLayoutPlaceholder__";
 const INITIAL_TOOL_NAME_PLACEHOLDER: &str = "__catdeskInitialToolNamePlaceholder__";
 const INITIAL_MASCOT_OUTLINE_PLACEHOLDER: &str = "__catdeskInitialMascotOutlinePlaceholder__";
-const MAX_COMMAND_OUTPUT_CHARS: usize = 24_000;
+const MAX_WIDGET_COMMAND_OUTPUT_CHARS: usize = 4_000;
+const MAX_WIDGET_DIFF_CHARS_PER_FILE: usize = 1_500;
+const MAX_WIDGET_LIST_ENTRIES: usize = 100;
 const CATDESK_INSTRUCTION_REQUIRED_MESSAGE: &str =
     "Call catdesk_instruction successfully before using any other CatDesk tool.";
 const CATDESK_INSTRUCTION_REQUIRED_WIDGET_MESSAGE: &str = "ChatGPT didn’t call catdesk_instruction. CatDesk is asking it to call it now. You can ignore this message. It will retry automatically.";
@@ -2910,7 +2912,7 @@ fn file_entry_json(file: &FileChange) -> Value {
         "status": file.status,
         "added": file.added,
         "removed": file.removed,
-        "diff": file.diff,
+        "diff": truncate_for_widget(&file.diff, MAX_WIDGET_DIFF_CHARS_PER_FILE),
     })
 }
 
@@ -3025,17 +3027,31 @@ fn build_list_files_widget_payload_from_structured(
         "listOtherCount".to_string(),
         structured.get("listOtherCount")?.clone(),
     );
+    let list_entries = structured.get("listEntries")?.as_array()?;
+    let widget_preview_truncated = list_entries.len() > MAX_WIDGET_LIST_ENTRIES;
+    let source_truncated = structured.get("listTruncated")?.as_bool()?;
     payload.insert(
         "listTruncated".to_string(),
-        structured.get("listTruncated")?.clone(),
+        json!(source_truncated || widget_preview_truncated),
     );
+    let source_limit = structured.get("listLimit")?.as_u64()?;
     payload.insert(
         "listLimit".to_string(),
-        structured.get("listLimit")?.clone(),
+        json!(if widget_preview_truncated {
+            MAX_WIDGET_LIST_ENTRIES as u64
+        } else {
+            source_limit
+        }),
     );
     payload.insert(
         "listEntries".to_string(),
-        structured.get("listEntries")?.clone(),
+        Value::Array(
+            list_entries
+                .iter()
+                .take(MAX_WIDGET_LIST_ENTRIES)
+                .cloned()
+                .collect(),
+        ),
     );
     payload.insert("changedFiles".to_string(), json!([]));
     payload.insert("hasChanges".to_string(), json!(false));
@@ -3206,7 +3222,7 @@ fn build_run_command_widget_payload(
         "output".to_string(),
         json!(truncate_for_widget(
             &extract_tool_result_text(result),
-            MAX_COMMAND_OUTPUT_CHARS,
+            MAX_WIDGET_COMMAND_OUTPUT_CHARS,
         )),
     );
     if let Some(elapsed) = structured.get("elapsedMs") {
@@ -3277,7 +3293,10 @@ fn build_command_job_widget_payload(
     payload.insert("command".to_string(), command);
     payload.insert(
         "output".to_string(),
-        json!(truncate_for_widget(&output, MAX_COMMAND_OUTPUT_CHARS)),
+        json!(truncate_for_widget(
+            &output,
+            MAX_WIDGET_COMMAND_OUTPUT_CHARS
+        )),
     );
     if let Some(elapsed) = structured.get("elapsedMs") {
         payload.insert("elapsedMs".to_string(), elapsed.clone());
@@ -7939,6 +7958,161 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn run_command_keeps_full_model_output_but_bounds_widget_preview() {
+        let req = tool_call_request("run_command", json!({ "command": "verbose-test" }));
+        let full_output = "x".repeat(20_000);
+        let expected_output = full_output.clone();
+        let raw = json!({
+            "content": [],
+            "structuredContent": {
+                "toolName": "run_command",
+                "command": "verbose-test",
+                "cwd": "/tmp",
+                "stdout": full_output,
+                "stderr": "",
+                "success": true,
+                "exitCode": 0,
+                "elapsedMs": 1,
+                "timedOut": false,
+                "stdoutTruncated": false,
+                "stderrTruncated": false
+            }
+        });
+
+        let result = enrich_tool_result(&req, raw, None);
+        let structured = result
+            .get("structuredContent")
+            .expect("missing structured content");
+        let widget_payload = result
+            .get("_meta")
+            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+            .expect("missing widget payload");
+
+        assert_eq!(
+            structured.get("stdout").and_then(Value::as_str),
+            Some(expected_output.as_str()),
+            "model-visible command output must remain complete"
+        );
+        let preview = widget_payload
+            .get("output")
+            .and_then(Value::as_str)
+            .expect("missing widget output preview");
+        assert!(
+            preview.chars().count() <= 4_000,
+            "widget command preview was {} chars",
+            preview.chars().count()
+        );
+    }
+
+    #[test]
+    fn changed_file_widget_keeps_metadata_but_bounds_diff_preview() {
+        let req = tool_call_request("write", json!({ "path": "src/example.rs" }));
+        let raw = json!({
+            "content": [],
+            "structuredContent": {
+                "toolName": "write",
+                "path": "src/example.rs",
+                "bytesWritten": 12,
+                "success": true
+            }
+        });
+        let widget_context = AutoWidgetContext {
+            is_error: false,
+            turn_files: vec![FileChange {
+                path: "src/example.rs".into(),
+                status: "modified".into(),
+                added: 1,
+                removed: 1,
+                diff: "d".repeat(10_000),
+            }],
+        };
+
+        let result = enrich_tool_result(&req, raw, Some(&widget_context));
+        let widget_payload = result
+            .get("_meta")
+            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+            .expect("missing widget payload");
+        let file = widget_payload
+            .get("changedFiles")
+            .and_then(Value::as_array)
+            .and_then(|files| files.first())
+            .expect("missing changed file");
+
+        assert_eq!(
+            file.get("path").and_then(Value::as_str),
+            Some("src/example.rs")
+        );
+        assert_eq!(file.get("status").and_then(Value::as_str), Some("modified"));
+        assert_eq!(file.get("added").and_then(Value::as_u64), Some(1));
+        assert_eq!(file.get("removed").and_then(Value::as_u64), Some(1));
+        let diff = file
+            .get("diff")
+            .and_then(Value::as_str)
+            .expect("missing diff preview");
+        assert!(
+            diff.chars().count() <= 1_500,
+            "widget diff preview was {} chars",
+            diff.chars().count()
+        );
+    }
+
+    #[test]
+    fn list_files_widget_keeps_full_counts_but_bounds_rendered_entries() {
+        let entries = (0..250)
+            .map(|index| {
+                json!({
+                    "path": format!("file-{index}.txt"),
+                    "name": format!("file-{index}.txt"),
+                    "kind": "file",
+                    "depth": 0
+                })
+            })
+            .collect::<Vec<_>>();
+        let structured_value = json!({
+            "toolName": "run_command",
+            "interceptedToolName": "list_files",
+            "interceptedCommandName": "find",
+            "listPath": ".",
+            "listItemCount": 250,
+            "listDirectoryCount": 0,
+            "listFileCount": 250,
+            "listOtherCount": 0,
+            "listTruncated": false,
+            "listLimit": 500,
+            "listEntries": entries
+        });
+        let structured = structured_value
+            .as_object()
+            .expect("structured listing must be an object");
+
+        let payload =
+            build_list_files_widget_payload_from_structured(structured, "List Files", "done")
+                .expect("list widget payload");
+
+        assert_eq!(
+            structured
+                .get("listEntries")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(250),
+            "model-visible listing must remain complete"
+        );
+        assert_eq!(
+            payload.get("listItemCount").and_then(Value::as_u64),
+            Some(250)
+        );
+        let rendered = payload
+            .get("listEntries")
+            .and_then(Value::as_array)
+            .expect("missing widget list entries");
+        assert!(
+            rendered.len() <= 100,
+            "widget rendered {} listing rows",
+            rendered.len()
+        );
     }
 
     #[test]
