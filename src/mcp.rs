@@ -909,7 +909,7 @@ async fn handle_tools_list_with_show_detail_mode(
                             "minimum": 1,
                             "maximum": MAX_JOB_TIMEOUT_MS,
                             "description": format!(
-                                "Maximum command runtime in milliseconds. Defaults to {} ms; maximum is {} ms.",
+                                "Maximum command runtime in milliseconds. Defaults to {} ms; maximum is {} ms. The job's state and exit code survive a CatDesk restart; a job the restart took down reports state \"interrupted\".",
                                 DEFAULT_JOB_TIMEOUT_MS,
                                 MAX_JOB_TIMEOUT_MS
                             )
@@ -922,7 +922,7 @@ async fn handle_tools_list_with_show_detail_mode(
             tools.push(json!({
                 "name": "poll_command",
                 "title": "Poll command",
-                "description": "Read incremental output and current status from a command previously started with start_command. Pass the returned nextCursor as after on the next poll so output is not repeated. If hasMoreOutput is true, poll again even if the job is already terminal so the remaining buffered output can be drained.",
+                "description": "Read incremental output and current status from a command previously started with start_command. Pass the returned nextCursor as after on the next poll so output is not repeated. If hasMoreOutput is true, poll again even if the job is already terminal so the remaining buffered output can be drained. A job that was running when CatDesk exited reports state \"interrupted\" with no further output; finished job state and exit code survive a restart.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2470,6 +2470,10 @@ Always specify the branch explicitly when using `git push`."#
         );
         lines.push(
             "Use poll_command to read incremental output from a background command. Pass the returned nextCursor as after on the next poll so output is not repeated. If hasMoreOutput is true, keep polling even after the command reaches a terminal state so all buffered output can be drained."
+                .to_string(),
+        );
+        lines.push(
+            "Command results survive a CatDesk restart: finished jobs keep their state and exit code, and a job that was running when CatDesk exited reports \"interrupted\" — start it again if its work is still needed."
                 .to_string(),
         );
         lines.push(
@@ -5244,6 +5248,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_job_tools_document_restart_durability() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("req-tools-list-durable-jobs")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("missing tools");
+        for name in ["start_command", "poll_command"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let text = tool.to_string();
+            assert!(text.contains("restart"), "{name} must document restart durability: {text}");
+            assert!(text.contains("interrupted"), "{name} must document interrupted state: {text}");
+        }
+    }
+
+    #[tokio::test]
     async fn multi_tools_list_exposes_run_command_mv_without_move_path_tool() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -6299,6 +6329,22 @@ mod tests {
             Some("project-branch")
         );
 
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn catdesk_instruction_mentions_durable_command_results() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "catdesk-mcp-instruction-durable-jobs-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let instruction =
+            catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
+                .expect("build instruction");
+        assert!(instruction.contains("survive a CatDesk restart"));
+        assert!(instruction.contains("interrupted"));
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 

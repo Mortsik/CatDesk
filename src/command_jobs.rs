@@ -17,7 +17,7 @@ use crate::process_exit::{
 };
 use crate::process_runner;
 
-pub const DEFAULT_JOB_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
+pub const DEFAULT_JOB_TIMEOUT_MS: u64 = 2 * 60 * 60 * 1_000;
 pub const MAX_JOB_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const MAX_POLL_WAIT_MS: u64 = 30_000;
 pub const DEFAULT_POLL_WAIT_MS: u64 = 10_000;
@@ -1690,6 +1690,7 @@ mod tests {
 
     #[test]
     fn background_timeout_validation_covers_boundaries() {
+        assert_eq!(DEFAULT_JOB_TIMEOUT_MS, 2 * 60 * 60 * 1_000);
         assert_eq!(
             CommandJobManager::normalize_timeout(None).expect("default timeout"),
             DEFAULT_JOB_TIMEOUT_MS

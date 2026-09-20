@@ -75,7 +75,7 @@ const APP_CONFIG_FILE_NAME: &str = "config.toml";
 pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 /// Bump only when an existing ChatGPT connector must be removed and added again.
-pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 6;
+pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 7;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -995,7 +995,9 @@ impl AppState {
             request_count: 0,
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
-            command_jobs: CommandJobManager::new(),
+            command_jobs: crate::job_store::JobStore::default_dir()
+                .map(CommandJobManager::with_store)
+                .unwrap_or_else(CommandJobManager::new),
             config_path,
             server_handle: None,
             ngrok_task: None,
