@@ -115,9 +115,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' > release-notes.md
           gh release create "${GITHUB_REF_NAME}" release/* \
             --title "${GITHUB_REF_NAME}" \
-            --notes-from-tag \
+            --notes-file release-notes.md \
             --verify-tag
 
   publish-npm:

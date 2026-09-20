@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
+use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -165,6 +166,55 @@ impl TokenStatsLayout {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum WidgetCornerStyle {
+    #[default]
+    Rounded,
+    Square,
+}
+
+impl WidgetCornerStyle {
+    pub fn all() -> &'static [WidgetCornerStyle] {
+        const STYLES: [WidgetCornerStyle; 2] =
+            [WidgetCornerStyle::Rounded, WidgetCornerStyle::Square];
+        &STYLES
+    }
+
+    pub fn label_for(self, language: UiLanguage) -> &'static str {
+        match (self, language) {
+            (Self::Rounded, UiLanguage::English) => "Rounded",
+            (Self::Square, UiLanguage::English) => "Square",
+            (Self::Rounded, UiLanguage::TraditionalChinese) => "圓角",
+            (Self::Square, UiLanguage::TraditionalChinese) => "方角",
+        }
+    }
+
+    pub fn description_for(self, language: UiLanguage) -> &'static str {
+        if language == UiLanguage::English {
+            return self.description();
+        }
+        match self {
+            Self::Rounded => "Widget 邊角使用圓角樣式。",
+            Self::Square => "Widget 邊角使用直角樣式。",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Rounded => "Use rounded corners for the web widget.",
+            Self::Square => "Use square corners for the web widget.",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rounded => "rounded",
+            Self::Square => "square",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ShowDetailMode {
     Disable,
     #[default]
@@ -264,6 +314,19 @@ impl UiLanguage {
         }
     }
 }
+pub fn app_config_path() -> std::io::Result<PathBuf> {
+    Ok(user_home_dir()?
+        .join(APP_CONFIG_DIR_NAME)
+        .join(APP_CONFIG_FILE_NAME))
+}
+
+pub fn save_widget_corner_style(style: WidgetCornerStyle) -> std::io::Result<PathBuf> {
+    let path = app_config_path()?;
+    let mut config = AppConfig::load_from_path(&path)?;
+    config.widget_corner_style = style;
+    config.save_to_path(&path)?;
+    Ok(path)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -281,6 +344,8 @@ pub struct AppConfig {
     pub token_stats_layout: TokenStatsLayout,
     #[serde(default)]
     pub show_detail_mode: ShowDetailMode,
+    #[serde(default)]
+    pub widget_corner_style: WidgetCornerStyle,
     #[serde(default)]
     pub macos_terminal_profile: Option<bool>,
     #[serde(default)]
@@ -308,6 +373,7 @@ impl Default for AppConfig {
             agents_path_mode: AgentsPathMode::Default,
             token_stats_layout: TokenStatsLayout::Right,
             show_detail_mode: ShowDetailMode::Expanded,
+            widget_corner_style: WidgetCornerStyle::Rounded,
             macos_terminal_profile: None,
             ui_language: UiLanguage::English,
             partner_binagotchy_seed: None,
@@ -680,12 +746,6 @@ pub fn user_home_dir() -> std::io::Result<PathBuf> {
     ))
 }
 
-pub fn app_config_path() -> std::io::Result<PathBuf> {
-    Ok(user_home_dir()?
-        .join(APP_CONFIG_DIR_NAME)
-        .join(APP_CONFIG_FILE_NAME))
-}
-
 pub fn load_app_config() -> std::io::Result<AppConfig> {
     AppConfig::load_from_path(&app_config_path()?)
 }
@@ -760,13 +820,18 @@ pub(crate) fn parse_seed_hex(seed: &str) -> std::io::Result<u64> {
     })
 }
 
+pub(crate) fn local_now() -> OffsetDateTime {
+    let now = OffsetDateTime::now_utc();
+    let offset = UtcOffset::local_offset_at(now).unwrap_or(UtcOffset::UTC);
+    now.to_offset(offset)
+}
+
+fn format_hms(now: OffsetDateTime) -> String {
+    format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second())
+}
+
 fn now_hms() -> String {
-    let now =
-        time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    let h = now.hour();
-    let m = now.minute();
-    let s = now.second();
-    format!("{h:02}:{m:02}:{s:02}")
+    format_hms(local_now())
 }
 
 fn now_unix_millis() -> u128 {
@@ -1394,6 +1459,14 @@ mod tests {
         )
         .expect("create app state");
         (app, workspace, config_path)
+    }
+
+    #[test]
+    fn log_time_uses_the_datetime_offset() {
+        let local = OffsetDateTime::from_unix_timestamp(0)
+            .expect("unix epoch")
+            .to_offset(UtcOffset::from_hms(9, 0, 0).expect("UTC+09"));
+        assert_eq!(format_hms(local), "09:00:00");
     }
 
     #[test]

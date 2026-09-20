@@ -42,9 +42,10 @@ use ratatui::{
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
     GPT_5_6_AND_EARLIER_USAGE_BUCKET, LogEntry, Mode, ServerUiEvent, SharedState, ShowDetailMode,
-    ToolMode, UiLanguage, UsageTotals, app_config_path, flow_anim_lit_count,
-    load_macos_terminal_profile, load_ngrok_authtoken, load_ngrok_domain,
-    save_macos_terminal_profile, save_ngrok_authtoken, save_ngrok_domain, user_home_dir,
+    ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle, app_config_path, flow_anim_lit_count,
+    load_app_config, load_macos_terminal_profile, load_ngrok_authtoken, load_ngrok_domain,
+    local_now, save_macos_terminal_profile, save_ngrok_authtoken, save_ngrok_domain,
+    save_widget_corner_style, user_home_dir,
 };
 use std::collections::HashMap;
 use std::io::{Write, stdout};
@@ -630,6 +631,28 @@ fn wrap_log_message(message: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
+fn format_log_export_filename(now: time::OffsetDateTime) -> std::io::Result<String> {
+    let stamp = now
+        .format(time::macros::format_description!(
+            "[year][month][day]-[hour][minute][second]"
+        ))
+        .map_err(std::io::Error::other)?;
+    let offset_seconds = now.offset().whole_seconds();
+    let offset_suffix = if offset_seconds == 0 {
+        "Z".to_string()
+    } else {
+        let sign = if offset_seconds < 0 { '-' } else { '+' };
+        let absolute = offset_seconds.unsigned_abs();
+        let hours = absolute / 3600;
+        let minutes = (absolute % 3600) / 60;
+        format!("{sign}{hours:02}{minutes:02}")
+    };
+    Ok(format!(
+        "catdesk-{stamp}-{:03}{offset_suffix}.log",
+        now.millisecond()
+    ))
+}
+
 fn export_logs_to_dir(
     logs: &[LogEntry],
     directory: &std::path::Path,
@@ -641,13 +664,8 @@ fn export_logs_to_dir(
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
     }
 
-    let now = time::OffsetDateTime::now_utc();
-    let stamp = now
-        .format(time::macros::format_description!(
-            "[year][month][day]-[hour][minute][second]"
-        ))
-        .map_err(std::io::Error::other)?;
-    let path = directory.join(format!("catdesk-{stamp}-{:03}Z.log", now.millisecond()));
+    let now = local_now();
+    let path = directory.join(format_log_export_filename(now)?);
     let mut file = std::fs::File::create(&path)?;
     for entry in logs {
         let message = mask_secret_log_message(&entry.message, false);
@@ -2935,6 +2953,7 @@ mod tests {
                     &theme,
                     ToolMode::MultiTools,
                     super::ShowDetailMode::Expanded,
+                    super::WidgetCornerStyle::Rounded,
                     UiLanguage::TraditionalChinese,
                     false,
                     "test-slug",
@@ -3203,6 +3222,21 @@ mod tests {
         assert_eq!(
             localize_log_message("Mode: Both", UiLanguage::English),
             "Mode: Both"
+        );
+    }
+
+    #[test]
+    fn exported_log_filename_includes_utc_offset() {
+        let utc = time::OffsetDateTime::from_unix_timestamp(0).expect("unix epoch");
+        assert_eq!(
+            super::format_log_export_filename(utc).expect("format UTC filename"),
+            "catdesk-19700101-000000-000Z.log"
+        );
+
+        let seoul = utc.to_offset(time::UtcOffset::from_hms(9, 0, 0).expect("UTC+09"));
+        assert_eq!(
+            super::format_log_export_filename(seoul).expect("format local filename"),
+            "catdesk-19700101-090000-000+0900.log"
         );
     }
 
@@ -3499,12 +3533,17 @@ async fn run_settings(
     let themes = theme::all();
     let tool_modes = ToolMode::all();
     let show_detail_modes = ShowDetailMode::all();
+    let widget_corner_styles = WidgetCornerStyle::all();
+    let mut current_widget_corner_style = load_app_config()
+        .map(|config| config.widget_corner_style)
+        .unwrap_or_default();
     let mut confirm_reset_token_billing = false;
     let mut selected_row = {
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + show_detail_modes.len() + 1 + 3;
+    let total_rows =
+        themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 4;
 
     loop {
         let (
@@ -3535,6 +3574,7 @@ async fn run_settings(
                 current_theme,
                 current_tool_mode,
                 current_show_detail_mode,
+                current_widget_corner_style,
                 current_ui_language,
                 set_catdesk_as_co_author,
                 &mcp_slug,
@@ -3595,47 +3635,76 @@ async fn run_settings(
                                     );
                                     app.persist_state_with_log();
                                 }
-                            } else if selected_row == detail_mode_end {
-                                app.set_catdesk_as_co_author = !app.set_catdesk_as_co_author;
-                                let enabled = app.set_catdesk_as_co_author;
-                                app.log(
-                                    "INFO",
-                                    format!(
-                                        "Set CatDesk as co-author: {}",
-                                        if enabled { "enabled" } else { "disabled" }
-                                    ),
-                                );
-                                app.persist_state_with_log();
-                            } else if selected_row == detail_mode_end + 1 {
-                                // Keep existing slug, do nothing
-                            } else if selected_row == detail_mode_end + 2 {
-                                app.regenerate_mcp_slug();
-                                app.log("INFO", "Generated new random MCP slug".into());
-                                app.persist_state_with_log();
-                            } else if selected_row == detail_mode_end + 3 {
-                                let current_domain = app.ngrok_domain.clone().unwrap_or_default();
-                                drop(app);
-                                if let Some(new_domain) = run_prompt(
-                                    terminal,
-                                    current_ui_language.text(
-                                        "Enter ngrok static domain (with/without https://, empty to clear):",
-                                        "輸入 ngrok 固定網域（可含或不含 https://，留空可清除）：",
-                                    ),
-                                    &current_domain,
-                                )
-                                .await?
-                                {
-                                    let mut cleaned = new_domain.trim();
-                                    if let Some(stripped) = cleaned.strip_prefix("https://") {
-                                        cleaned = stripped;
-                                    } else if let Some(stripped) = cleaned.strip_prefix("http://") {
-                                        cleaned = stripped;
+                            } else {
+                                let corner_start = detail_mode_end;
+                                let corner_end = corner_start + widget_corner_styles.len();
+                                if selected_row < corner_end {
+                                    let picked = widget_corner_styles[selected_row - corner_start];
+                                    if current_widget_corner_style != picked {
+                                        match save_widget_corner_style(picked) {
+                                            Ok(_) => {
+                                                current_widget_corner_style = picked;
+                                                app.log(
+                                                    "INFO",
+                                                    format!(
+                                                        "Widget corner style: {}",
+                                                        picked.label_for(current_ui_language)
+                                                    ),
+                                                );
+                                            }
+                                            Err(error) => {
+                                                app.log(
+                                                    "ERROR",
+                                                    format!(
+                                                        "Failed to save widget corner style: {error}"
+                                                    ),
+                                                );
+                                            }
+                                        }
                                     }
-                                    cleaned = cleaned.trim_end_matches('/');
-                                    let mut app = state.lock().await;
-                                    app.ngrok_domain = if cleaned.is_empty() { None } else { Some(cleaned.to_string()) };
-                                    app.log("INFO", "Updated ngrok static domain".into());
+                                } else if selected_row == corner_end {
+                                    app.set_catdesk_as_co_author = !app.set_catdesk_as_co_author;
+                                    let enabled = app.set_catdesk_as_co_author;
+                                    app.log(
+                                        "INFO",
+                                        format!(
+                                            "Set CatDesk as co-author: {}",
+                                            if enabled { "enabled" } else { "disabled" }
+                                        ),
+                                    );
                                     app.persist_state_with_log();
+                                } else if selected_row == corner_end + 1 {
+                                    // Keep existing slug, do nothing
+                                } else if selected_row == corner_end + 2 {
+                                    app.regenerate_mcp_slug();
+                                    app.log("INFO", "Generated new random MCP slug".into());
+                                    app.persist_state_with_log();
+                                } else if selected_row == corner_end + 3 {
+                                    let current_domain =
+                                        app.ngrok_domain.clone().unwrap_or_default();
+                                    drop(app);
+                                    if let Some(new_domain) = run_prompt(
+                                        terminal,
+                                        current_ui_language.text(
+                                            "Enter ngrok static domain (with/without https://, empty to clear):",
+                                            "輸入 ngrok 固定網域（可含或不含 https://，留空可清除）：",
+                                        ),
+                                        &current_domain,
+                                    )
+                                    .await?
+                                    {
+                                        let mut cleaned = new_domain.trim();
+                                        if let Some(stripped) = cleaned.strip_prefix("https://") {
+                                            cleaned = stripped;
+                                        } else if let Some(stripped) = cleaned.strip_prefix("http://") {
+                                            cleaned = stripped;
+                                        }
+                                        cleaned = cleaned.trim_end_matches('/');
+                                        let mut app = state.lock().await;
+                                        app.ngrok_domain = if cleaned.is_empty() { None } else { Some(cleaned.to_string()) };
+                                        app.log("INFO", "Updated ngrok static domain".into());
+                                        app.persist_state_with_log();
+                                    }
                                 }
                             }
                         }
@@ -3665,6 +3734,7 @@ fn draw_settings(
     current_theme: &theme::ThemeDef,
     current_tool_mode: ToolMode,
     current_show_detail_mode: ShowDetailMode,
+    current_widget_corner_style: WidgetCornerStyle,
     ui_language: UiLanguage,
     set_catdesk_as_co_author: bool,
     mcp_slug: &str,
@@ -3676,6 +3746,7 @@ fn draw_settings(
     let themes = theme::all();
     let tool_modes = ToolMode::all();
     let show_detail_modes = ShowDetailMode::all();
+    let widget_corner_styles = WidgetCornerStyle::all();
     let palette = current_theme.palette;
     let area = f.area();
     let chunks = Layout::default()
@@ -3831,7 +3902,54 @@ fn draw_settings(
         )]));
     }
 
-    let co_author_row = themes.len() + tool_modes.len() + show_detail_modes.len();
+    let widget_corner_start = themes.len() + tool_modes.len() + show_detail_modes.len();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        ui_language.text("  Choose a widget corner style", "  選擇 Widget 邊角樣式"),
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    for (idx, corner_style) in widget_corner_styles.iter().enumerate() {
+        let row_idx = widget_corner_start + idx;
+        let selected = row_idx == selected_row;
+        let marker = if selected { ">" } else { " " };
+        let name_style = if selected {
+            Style::default()
+                .fg(palette.key_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.primary_fg)
+        };
+        lines.push(Line::from(""));
+        if selected {
+            selected_line_idx = lines.len();
+        }
+        let mut spans = vec![Span::styled(
+            format!(
+                " {} [{}] {}",
+                marker,
+                row_idx + 1,
+                corner_style.label_for(ui_language)
+            ),
+            name_style,
+        )];
+        if *corner_style == current_widget_corner_style {
+            spans.push(Span::styled(
+                ui_language.text("  [current]", "  [目前]"),
+                Style::default()
+                    .fg(palette.secondary_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(vec![Span::styled(
+            format!("     {}", corner_style.description_for(ui_language)),
+            Style::default().fg(palette.muted_fg),
+        )]));
+    }
+
+    let co_author_row = widget_corner_start + widget_corner_styles.len();
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
