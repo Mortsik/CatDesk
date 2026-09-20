@@ -153,6 +153,7 @@ pub async fn handle_request(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn handle_request_with_show_detail_mode(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -1175,6 +1176,7 @@ async fn handle_tools_call(
     .await
 }
 
+#[cfg(test)]
 async fn handle_tools_call_with_show_detail_mode(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -2378,6 +2380,7 @@ fn instruction_agents_layers(
     Ok(layers)
 }
 
+#[cfg(test)]
 fn catdesk_instruction_text(
     workspace_root: &str,
     mode: Mode,
@@ -2478,6 +2481,7 @@ Always specify the branch explicitly when using `git push`."#
     Ok(lines.join("\n"))
 }
 
+#[cfg(test)]
 fn catdesk_instruction_structured(
     workspace_root: &str,
     mode: Mode,
