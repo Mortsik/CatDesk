@@ -44,7 +44,9 @@ stays.
   `~/.catdesk/logs`, via `user_home_dir()`). One JSON file per job,
   named `<job_id>.json`.
 - Records are written with `std::fs` (small payloads, two writes per job):
-  atomically — temp file in the same directory, then rename.
+  atomically — temp file in the same directory, then rename. On Unix the
+  store directory is forced to `0700` and record files to `0600`, because a
+  command line can contain sensitive arguments.
 - Record schema:
 
   ```json
@@ -66,7 +68,9 @@ stays.
   Timestamps are Unix milliseconds, matching the connections log. `state`
   uses the same snake_case spelling as the MCP snapshots. For terminal
   records `exit_code`, `finished_at_ms` and `elapsed_ms` are filled
-  (`exit_code` may still be JSON `null` — killed processes have none).
+  (`exit_code` is numeric for live terminal outcomes, including conventional
+  `128 + signal` values such as `137` for `SIGKILL`; recovered `interrupted`
+  jobs have no process exit status and therefore keep it `null`).
 - Writes happen at exactly two points: when a job starts (`"running"`) and
   when `finish()` records its terminal state. Nothing is written on output
   events or polls.
@@ -83,7 +87,7 @@ stays.
 | State | Meaning | Set by |
 |---|---|---|
 | `running` | process tree alive | spawn |
-| `succeeded` / `failed` | exited, exit code recorded (or `null` on signal) | runner |
+| `succeeded` / `failed` | exited, numeric exit code recorded; Unix signals use `128 + signal` | runner |
 | `cancelled` | a cancel request reached the runner in time (user cancel, or `cancel_all` during graceful shutdown) | runner |
 | `timed_out` | timeout hit, tree terminated | runner |
 | `interrupted` | the CatDesk process died before the job reached a terminal state | recovery at next startup |
