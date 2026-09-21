@@ -1,4 +1,4 @@
-# CatDesk adaptive fair scheduler design
+# CatDesk unbounded concurrency design
 
 Date: 2026-09-21
 Issue: `catdesk-vmi.2`
@@ -6,251 +6,196 @@ Status: proposed / user-approved direction, pending written-spec review
 
 ## Intent
 
-CatDesk should support roughly 10–25 concurrent agent/chat sessions without making agents reason about internal worker limits. From the caller's perspective, work should normally be accepted rather than rejected with `Busy` just because another session currently occupies a worker slot.
+CatDesk should not impose artificial concurrency limits on agent/chat work.
 
-At the same time, CatDesk must not turn “no artificial limits” into unbounded physical execution. The host still needs protection against CPU saturation, memory pressure, process storms, browser storms, and an unbounded in-memory queue.
+The user explicitly does not want CPU, RAM, RSS, load average, queue depth, browser occupancy, or any other host-pressure signal to reduce CatDesk concurrency. CatDesk should not throttle, queue, reject, or delay work because it believes the machine is busy.
 
-The target behavior is therefore:
+The target behavior is:
 
-- no per-user, per-session, or per-project hard quota as a normal admission rule;
-- no ordinary fail-fast `Busy` solely because a worker semaphore is currently full;
-- fair queuing across sessions, with project awareness so one repo cannot monopolize the host;
-- a protected control plane (`poll`, `cancel`, health/session lifecycle) that remains responsive under heavy work;
-- dynamic physical concurrency based on host pressure;
-- bounded memory even if logical demand is much larger than current execution capacity;
-- durable lifecycle for queued background command jobs so a CatDesk restart does not silently lose work that never started.
+- no per-user, per-session, per-project, per-tool-class, per-process, or per-background-job concurrency quota;
+- no CPU/RAM/load-based governor;
+- no adaptive physical concurrency;
+- no fail-fast `Busy` caused by CatDesk worker/process semaphores;
+- `start_command` accepts and starts new jobs without an active-job cap;
+- `run_command` starts without a shared process permit;
+- request work is allowed to start immediately rather than waiting in a CatDesk fairness queue;
+- the OS/runtime is the only practical resource-pressure boundary;
+- existing command cancellation, command timeout, process-tree termination, persistence, dedupe/idempotency, output bounds, path safety, and session/project isolation remain intact.
 
 Windows native computer-use/UIA remains out of scope.
 
+## Explicit non-goal: resource-aware throttling
+
+This task must not introduce or consult:
+
+- CPU utilization;
+- logical CPU count for concurrency decisions;
+- system available memory;
+- CatDesk RSS;
+- load average;
+- process-count thresholds;
+- browser occupancy thresholds;
+- queue depth thresholds used to reduce execution concurrency;
+- dynamic `set_limit()` behavior;
+- host-pressure sampling or a `ResourceGovernor`.
+
+CatDesk may continue to expose unrelated diagnostics if they already exist, but those values must not influence admission or concurrency in this design.
+
 ## Current state
 
-There are two independent saturation mechanisms today.
+There are two independent artificial saturation mechanisms today.
 
 ### Request workers
 
-`src/request_workers.rs` has fixed pools:
+`src/request_workers.rs` uses fixed Tokio semaphores for request classes. A request calls `try_acquire_owned()` and returns `RequestFailure::Busy` when the class pool is full.
 
-- control: 8
-- filesystem: 16
-- process: 12
-- browser: 4
-- general: 8
+Current class limits are effectively:
 
-`RequestWorkers::run()` uses `Semaphore::try_acquire_owned()`. If the pool is full, the request fails immediately with `RequestFailure::Busy`.
+- control: 8;
+- filesystem: 16;
+- process: 12;
+- browser: 4;
+- general: 8.
 
-This protects the host, but it makes contention visible to agents as an error and provides no fairness between sessions.
+These limits are to be removed as execution gates.
 
 ### Command jobs
 
-`src/command_jobs.rs` has:
+`src/command_jobs.rs` currently has:
 
-- `MAX_ACTIVE_JOBS = 8`
-- `MAX_ACTIVE_PROCESSES = 12`
+- `MAX_ACTIVE_JOBS = 8`;
+- `MAX_ACTIVE_PROCESSES = 12`;
+- `process_budget: Semaphore`;
+- `try_acquire_process()`.
 
-`start_command` rejects a ninth active job and process acquisition is also fail-fast through `try_acquire_owned()`.
+`start_command` rejects additional work when either the active-job cap or process semaphore is exhausted. Foreground `run_command` shares the same process budget.
 
-This is a logical admission cap rather than just a physical execution cap. It prevents CatDesk from accepting additional durable work even when it could safely queue it.
+These concurrency limits are to be removed.
 
 ## Design principles
 
-### 1. Separate admission from execution
+### 1. Start work immediately
 
-CatDesk may accept substantially more work than it can execute simultaneously.
+If a request passes normal validation/authorization/path checks, CatDesk should start it without waiting for a CatDesk concurrency slot.
 
-“Accepted” means CatDesk owns the lifecycle of the request/job. “Running” means it currently consumes a scarce host resource. These must no longer be treated as the same thing.
+There is no fair queue because fairness is unnecessary when CatDesk is not serializing or throttling competing sessions.
 
-### 2. No ordinary user-visible `Busy` for temporary saturation
+### 2. No concurrency-related `Busy`
 
-Temporary saturation should result in waiting/queuing, not an immediate error.
+Normal request handling must not return `Busy` because another CatDesk request or command is active.
 
-`Busy` remains valid only for exceptional protection cases such as:
+If `RequestFailure::Busy` becomes unused after removing worker semaphores, remove it and its HTTP/diagnostic mappings rather than keeping dead concurrency semantics.
 
-- scheduler shutdown;
-- queue memory/safety circuit breaker activation;
-- host in critical memory pressure where admitting more non-durable request work would itself be unsafe;
-- unrecoverable scheduler failure.
+Errors unrelated to concurrency remain valid, including malformed input, path violations, command-policy rejection, tool-specific failures, and request deadlines.
 
-It should not mean “all 12 slots happen to be occupied right now”.
+### 3. Preserve request deadlines without reclaiming running work incorrectly
 
-### 3. Fairness is session-first, project-aware
+The current important timeout invariant remains:
 
-The scheduler should use session identity as the primary fairness key because chats/agents are the actual independent producers of work.
+- the response may time out;
+- already-started synchronous/blocking work must continue to own its real execution until it exits;
+- CatDesk must not pretend timed-out work stopped if it is still running.
 
-Within that model, project identity is an additional scheduling dimension. A project with many sessions should receive substantial throughput, but should not permanently starve sessions working in another project.
+Removing semaphores must not regress this lifecycle behavior.
 
-No hard quota is assigned to either session or project. Fairness affects ordering, not admission limits.
+### 4. Remove command-process admission gates
 
-### 4. Protect the control plane
+For background jobs:
 
-Control requests must not sit behind filesystem/process/browser work.
+1. validate/dedupe exactly as today;
+2. create/persist the job using the existing durable lifecycle;
+3. spawn the process immediately;
+4. return the job id;
+5. retain existing poll/cancel/timeout/output handling.
 
-Control operations use a dedicated reserved execution path and bypass the heavy-work queue where safe. This includes at minimum health/ping, poll/cancel, session disconnect/cleanup, and scheduler introspection needed to recover from overload.
+There is no `Queued` state in this design because CatDesk is not deliberately queueing command execution.
 
-### 5. Physical execution remains bounded by a host governor
+For foreground `run_command`, remove the process-permit acquisition and execute directly after normal validation.
 
-Removing logical limits does not mean unlimited process creation.
+### 5. Keep durability conservative across restart
 
-A resource governor chooses the current execution capacity for heavy classes. It uses conservative defaults and host-pressure signals to increase or reduce concurrency.
+The existing recovery invariant remains:
 
-Initial pressure inputs:
+- a job recorded as `Running` when CatDesk restarts becomes `Interrupted`;
+- CatDesk does not auto-replay uncertain work;
+- terminal records restore as today.
 
-- total/logical CPU count;
-- CatDesk process RSS;
-- system available memory where the platform exposes it cheaply;
-- recent queue depth and worker utilization;
-- active child process count / active command process permits;
-- browser-class occupancy.
+This task does not introduce durable queued jobs because there is no scheduler queue to persist.
 
-The governor should favor stability over perfect utilization. It may reduce new starts under pressure but should not kill already-running work solely because the target concurrency fell.
+### 6. Keep cancellation semantics
 
-No new heavyweight monitoring dependency is required if the existing platform APIs/procfs can supply enough data. If cross-platform host memory/CPU collection becomes disproportionately complex, implementation may isolate the governor behind a trait and initially use a conservative adaptive policy with Linux metrics plus safe fallback defaults on other platforms.
+Background command cancellation still terminates the full child process tree.
 
-## Scheduler architecture
+Session disconnect cancellation behavior remains unchanged except that there is no process permit to release.
 
-### Request scheduler
+### 7. Keep non-concurrency safety bounds
 
-Replace the current “one semaphore per class + try acquire” model with a scheduler that owns queued request descriptors.
+Removing concurrency limits does **not** mean deleting unrelated correctness/safety bounds such as:
 
-Each queued descriptor includes at least:
+- request body size limits;
+- command timeout requested by the caller;
+- output-buffer size limits;
+- retained terminal-job count/TTL;
+- path containment and symlink hardening;
+- poll response caps;
+- command-policy/security checks.
 
-- request class;
-- session key;
-- optional project key;
-- enqueue sequence/time;
-- response deadline / cancellation state;
-- one-shot mechanism used to grant execution.
+These do not throttle the number of concurrently running agents or processes and therefore remain in scope to preserve.
 
-The queue should be logically fair rather than a single global FIFO. A practical policy is deficit/round-robin style rotation:
+## Request path architecture
 
-1. rotate among sessions with pending work;
-2. within a session, rotate among projects/classes that have pending work;
-3. respect class-specific physical capacity and control-plane reservations;
-4. skip entries that cannot currently run and continue searching for runnable work.
+Simplify `src/request_workers.rs` so it no longer owns per-class semaphores.
 
-Exact algorithm choice can remain implementation-local as long as tests prove starvation resistance and deterministic ordering properties.
+Two acceptable implementation shapes are:
 
-### Queue memory protection
+1. keep `RequestScheduler`/`RequestWorkers` as thin deadline/execution wrappers for minimal call-site churn; or
+2. remove the redundant worker wrapper and move the existing timeout/spawn-blocking lifecycle into the server call path.
 
-The scheduler cannot accept infinite non-durable HTTP work into RAM.
+Prefer the smaller diff that preserves current timeout/disconnect semantics.
 
-Use a high global safety ceiling based primarily on memory footprint, not a small per-session quota. Reaching it is an exceptional circuit-breaker condition and may return `Busy`/overload.
+`RequestClass` may remain for diagnostics/deadline selection even though it no longer controls concurrency.
 
-This ceiling should be far above normal 10–25-session demand and should be observable in telemetry. It exists to prevent OOM, not to shape normal throughput.
+`ping`/health fast paths should remain as currently structured. They should not be routed through a new throttling mechanism.
 
-Timed-out/disconnected queued requests must be removed or marked cancelled without consuming a future execution slot.
+## Command-job architecture
 
-### Command job lifecycle
+Simplify `CommandJobManager` by removing concurrency-only state:
 
-Background commands need an explicit queued state.
+- `MAX_ACTIVE_JOBS`;
+- `MAX_ACTIVE_PROCESSES`;
+- `process_budget`;
+- `process_limit` where it exists only for admission;
+- `try_acquire_process()`;
+- test-only constructors whose only purpose is setting a process concurrency limit.
 
-Extend `CommandJobState` with `Queued`.
+`active_job_count()` remains useful as telemetry/status, but no longer controls admission.
 
-`start_command` flow becomes:
+`MAX_RETAINED_JOBS` and terminal TTL remain because they bound completed-history retention, not active concurrency.
 
-1. validate/dedupe;
-2. create and persist a queued job record immediately;
-3. return its job id promptly;
-4. scheduler waits for process execution capacity;
-5. atomically transition `Queued -> Running` before spawn;
-6. execute using the existing durable output/timeout/cancel machinery;
-7. terminal state remains unchanged from the existing model.
+Background job start should no longer perform:
 
-There is no `MAX_ACTIVE_JOBS = 8` admission rule.
+```text
+if active_count >= MAX_ACTIVE_JOBS -> reject
+try_acquire_process() -> reject
+```
 
-The current process semaphore concept may remain internally as one implementation mechanism, but acquisition becomes awaited/scheduled rather than fail-fast and its permit count is controlled by the host governor.
+Instead it proceeds to normal job creation/spawn immediately.
 
-### Restart behavior for queued jobs
+Foreground `run_command` similarly removes `try_acquire_process()`.
 
-A queued job has never executed side effects. Therefore it can safely remain queued across a CatDesk restart.
+## Observability
 
-Recovery rules:
+This task does not add CPU/RAM/load monitoring.
 
-- persisted `Queued` -> restore as `Queued` and make eligible for scheduling;
-- persisted `Running` -> keep the current conservative behavior and recover as `Interrupted`, because CatDesk cannot prove whether an external side effect completed before the restart;
-- terminal states -> restore as today.
+Useful existing counters may remain:
 
-This distinction is important: CatDesk may automatically resume work that provably never started, but must not blindly replay work whose execution outcome is uncertain.
+- active request count;
+- active background-job count;
+- connected chats/sessions;
+- tool latency/errors;
+- command lifecycle state.
 
-### Cancellation
-
-Cancellation must work in both states.
-
-For `Queued`:
-
-- remove/disable the queue entry;
-- transition directly to `Cancelled`;
-- never spawn a process.
-
-For `Running`:
-
-- retain the existing process-tree termination behavior.
-
-Session disconnect cancellation should similarly handle queued and running jobs owned by that session.
-
-## Deadlines and waiting semantics
-
-Request deadline and queue waiting are distinct from underlying work lifetime.
-
-For ordinary synchronous MCP requests:
-
-- queue wait counts toward the response deadline;
-- if the caller deadline expires before execution starts, the queued work must not later execute as a surprise side effect;
-- if execution has already started and the response deadline expires, preserve the current rule: the execution slot remains owned until the real work ends.
-
-For durable `start_command` jobs:
-
-- the MCP call only needs enough time to durably accept the job;
-- queued waiting occurs after the call returns and does not consume the request-response deadline;
-- the command's own runtime timeout should begin when the process actually starts, not while the job is merely queued;
-- elapsed metadata should expose queue wait separately from execution duration where practical.
-
-## Adaptive host governor
-
-The first implementation should be intentionally conservative.
-
-Suggested policy shape:
-
-- define a safe minimum concurrency for each heavy class;
-- define a generous maximum based on CPU count / platform defaults;
-- periodically sample pressure, not on every tool call;
-- increase capacity slowly after a sustained healthy period;
-- decrease admission of new executions quickly under memory pressure or severe CPU saturation;
-- never shrink by revoking permits from work already running;
-- browser concurrency remains lower than filesystem/process concurrency because browser instances are disproportionately expensive;
-- control plane is excluded from heavy-resource throttling except under catastrophic process shutdown.
-
-The exact thresholds are configuration details, not public API. They should be observable and tunable later from performance telemetry (`catdesk-vmi.4`).
-
-## Observability required by this change
-
-Even before the full performance dashboard task, the scheduler must expose enough counters to debug itself:
-
-- queued requests total and by class;
-- active requests by class;
-- queue wait time for completed admissions;
-- queued/running command job counts;
-- current governor concurrency targets;
-- overload/circuit-breaker rejection count;
-- cancellation-before-start count.
-
-These counters may initially live in diagnostics/runtime state and do not need the final dashboard UI yet.
-
-## Files / components expected to change
-
-Primary:
-
-- `src/request_workers.rs` — fair queued request scheduler and capacity control;
-- `src/command_jobs.rs` — `Queued` lifecycle, durable admission, scheduled process start;
-- `src/server.rs` — pass session/project scheduling identity and classify control-plane work;
-- job persistence/serialization tests as needed for `Queued` state;
-- lightweight governor module, preferably isolated from request scheduling logic.
-
-Possible new modules:
-
-- `src/resource_governor.rs`
-- `src/fair_queue.rs` or equivalent if `request_workers.rs` becomes too large.
-
-This task should not perform the broad `mcp.rs`/`main.rs` structural refactor from `catdesk-vmi.6`.
+No concurrency target, queue depth, host-pressure state, or adaptive governor telemetry is required because those mechanisms do not exist in this design.
 
 ## Testing strategy
 
@@ -258,57 +203,74 @@ Implementation is test-driven.
 
 Required behavioral tests:
 
-1. saturated request pool queues work instead of returning `Busy`;
-2. queued work starts when capacity is released;
-3. one noisy session cannot starve another session;
-4. one noisy project cannot permanently starve a different project;
-5. control-plane work remains responsive while heavy queues are saturated;
-6. a queued request whose deadline expires never executes later;
-7. caller disconnect before start prevents later execution;
-8. once execution starts, timeout/disconnect does not prematurely release capacity;
-9. more than eight background jobs can be accepted;
-10. excess background jobs remain `Queued` rather than spawning extra process trees;
-11. queued job cancellation guarantees no side effect occurs;
-12. queued jobs survive restart and later execute;
-13. running jobs still recover as `Interrupted`, never auto-replayed;
-14. idempotency/dedupe works across queued jobs;
-15. governor target can increase/decrease without killing active work;
-16. queue/counter telemetry stays internally consistent under concurrent load.
+1. more requests than every former request-worker limit can be accepted concurrently without `Busy`;
+2. request timeout semantics still hold when many requests are active;
+3. a timed-out caller does not cause already-started blocking work to be treated as finished early;
+4. more than eight background jobs can be accepted without rejection;
+5. more than twelve background/foreground command processes can be started without CatDesk process-budget rejection;
+6. foreground `run_command` no longer depends on a shared process semaphore;
+7. background cancellation still terminates the process tree;
+8. session disconnect still cancels owned background jobs as today;
+9. idempotency/dedupe still returns the same job for duplicate request keys;
+10. restart recovery still maps uncertain `Running` jobs to `Interrupted` without replay;
+11. terminal-job retention/output bounds remain unchanged;
+12. synthetic 1/5/10/20/25-session verification completes without CatDesk-generated concurrency `Busy` errors.
 
-A synthetic load test should exercise at least 1, 5, 10, 20 and 25 sessions and record throughput, queue wait, active concurrency, CPU/RSS and overload events. The purpose is to validate stability, not to hard-code a benchmark threshold that will be flaky across machines.
+The synthetic verification must not assert CPU, RAM, RSS, load, active-process ceilings, or adaptive targets. It should only verify functional progress, absence of CatDesk concurrency rejections, control-call availability, and correct lifecycle behavior.
+
+## Expected files/components
+
+Primary:
+
+- `src/request_workers.rs` — remove semaphore admission / `Busy` behavior while preserving deadlines;
+- `src/server.rs` — remove `Busy` HTTP/diagnostic mappings if no longer used;
+- `src/command_jobs.rs` — remove active-job/process concurrency caps and process semaphore;
+- `src/mcp.rs` — remove foreground `run_command` process-permit acquisition and update tests;
+- existing server/command-job tests — replace saturation expectations with unbounded-concurrency expectations.
+
+No new scheduler, fair-queue, queue persistence, or resource-governor module should be created.
 
 ## Safety invariants
 
-The implementation must preserve these invariants:
+The implementation must preserve:
 
-- never execute a cancelled queued side-effecting request later;
-- never replay a previously running command after uncertain restart outcome;
-- never let client disconnect free a slot while underlying synchronous work is still running;
-- never let heavy work starve poll/cancel/health indefinitely;
-- never allow queue metadata itself to grow without a global safety bound;
-- never hold global application state locks while waiting for scheduler capacity;
-- preserve existing command process-tree termination guarantees;
-- preserve command idempotency behavior across concurrent/retried requests.
+- no replay of uncertain running commands after restart;
+- process-tree termination on cancellation/timeout where currently guaranteed;
+- command idempotency/dedupe across retried requests;
+- path containment/symlink protections;
+- request/body/output bounds unrelated to concurrency;
+- tool-specific authorization/policy checks;
+- multi-project/session isolation;
+- persistence behavior already implemented for telemetry and command jobs.
+
+The implementation must **not** introduce:
+
+- CatDesk concurrency semaphores replacing the removed ones under a different name;
+- CPU/RAM/load-based throttling;
+- adaptive concurrency;
+- per-session/project fairness queues;
+- a global live-job safety ceiling used as a concurrency admission limit;
+- a durable `Queued` command state solely to defer execution.
 
 ## Out of scope
 
 - Windows native computer-use/UIA and stale-action hardening;
-- final performance dashboard UI (`catdesk-vmi.4`);
+- performance dashboard UI (`catdesk-vmi.4`);
 - model-aware cost telemetry (`catdesk-vmi.5`);
-- broad source-file refactor (`catdesk-vmi.6`);
-- AgentForge policy changes outside CatDesk itself.
+- broad `mcp.rs`/`main.rs` structural refactor (`catdesk-vmi.6`);
+- AgentForge policy changes outside CatDesk.
 
 ## Acceptance criteria
 
 The task is complete when:
 
-- normal temporary saturation no longer produces fail-fast `Busy` for ordinary supported workload;
-- CatDesk accepts substantially more than eight background jobs and queues excess execution safely;
-- 10–25 concurrent sessions make forward progress without starvation;
-- control-plane calls remain responsive under saturation;
-- physical process/browser concurrency stays governed and host-safe;
-- queued durable jobs survive restart while uncertain running jobs are not replayed;
-- scheduler state is observable enough to diagnose queueing/governor behavior;
-- full existing test suite plus new scheduler tests pass;
-- release build succeeds;
-- synthetic 1/5/10/20/25-session load verification shows stable bounded execution rather than fail-fast saturation or runaway resource creation.
+- fixed request-worker semaphore limits no longer gate execution;
+- normal request load no longer returns `RequestFailure::Busy` because worker slots are occupied;
+- `MAX_ACTIVE_JOBS = 8` no longer limits `start_command`;
+- `MAX_ACTIVE_PROCESSES = 12` and shared process-permit admission no longer limit foreground/background command execution;
+- CatDesk does not sample or consult CPU/RAM/RSS/load to decide concurrency;
+- no fair/adaptive scheduler or host governor exists for this task;
+- 1/5/10/20/25 concurrent-session verification shows forward progress without CatDesk-generated concurrency rejection;
+- cancellation, timeout, dedupe, restart recovery, path safety, output bounds, and existing persistence behavior remain correct;
+- full test suite passes;
+- release build succeeds.
