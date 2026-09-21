@@ -296,6 +296,20 @@ fn trim_line(text: &str, max_cells: usize) -> String {
     format!("{kept}...")
 }
 
+fn format_session_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    if total_seconds < 60 {
+        return format!("{total_seconds}s");
+    }
+
+    let minutes = total_seconds / 60;
+    if minutes < 60 {
+        return format!("{}m {}s", minutes, total_seconds % 60);
+    }
+
+    format!("{}h {}m", minutes / 60, minutes % 60)
+}
+
 fn format_token_compact(value: u64) -> String {
     if value < 1_000 {
         return value.to_string();
@@ -724,6 +738,7 @@ fn usage_line(
     usage: &UsageTotals,
     cost_usd: f64,
     status_label: Span<'static>,
+    leading_value: Option<String>,
     palette: &theme::Palette,
     value_widths: &[usize; 5],
     ui_language: UiLanguage,
@@ -737,8 +752,12 @@ fn usage_line(
         .add_modifier(Modifier::BOLD);
     let values = formatted_usage_values(usage, cost_usd);
 
-    Line::from(vec![
-        status_label,
+    let mut spans = vec![status_label];
+    if let Some(value) = leading_value {
+        spans.push(Span::styled(value, value_style));
+        spans.push(Span::raw("  "));
+    }
+    spans.extend([
         Span::styled("↓", label_style),
         Span::styled(
             format!("{:<width$}", values[0], width = value_widths[0]),
@@ -772,7 +791,8 @@ fn usage_line(
             format!("{:<width$}", values[4], width = value_widths[4]),
             price_style,
         ),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 fn live_usage_rate_line(
@@ -1520,6 +1540,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
+    let session_started_at = Instant::now();
+
     // rustls 0.23 refuses to pick a process-level CryptoProvider when more than
     // one provider feature is enabled, and panics on first use. Both end up
     // enabled here through feature unification: ngrok requires aws-lc-rs, while
@@ -1612,7 +1634,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     startup::run_startup_intro(&mut terminal, startup_theme, &startup_mascot).await?;
 
-    let result = run_app(&mut terminal, state.clone()).await;
+    let result = run_app(&mut terminal, state.clone(), session_started_at).await;
 
     diagnostics::event("process_stopping");
     diagnostics::event("server_stopping");
@@ -1657,6 +1679,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
+    session_started_at: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Draw mode selection screen
     loop {
@@ -1726,7 +1749,14 @@ async fn run_app(
     run_chatgpt_connector_refresh_notice(terminal, state.clone(), &mut ui_event_rx).await?;
 
     // Phase 2: main TUI loop
-    run_tui(terminal, state, devtools_bridge, ui_event_rx).await
+    run_tui(
+        terminal,
+        state,
+        devtools_bridge,
+        ui_event_rx,
+        session_started_at,
+    )
+    .await
 }
 
 async fn run_chatgpt_connector_refresh_notice(
@@ -2928,15 +2958,15 @@ mod tests {
     use super::state::{AppState, ToolMode, UiLanguage};
     use super::{
         LogView, draw_chatgpt_connector_refresh_notice, draw_mode_select, draw_settings,
-        draw_tui_header, draw_ui, export_logs_to_dir, key_is_clipboard_paste, localize_log_message,
-        mask_mcp_path_in_log, normalize_ngrok_authtoken_input, pad_right_to_cell_width,
-        parse_terminal_profile_choice, terminal_cell_width, text_input_key_is_cancel, trim_line,
-        wrap_log_message,
+        draw_tui_header, draw_ui, export_logs_to_dir, format_session_duration,
+        key_is_clipboard_paste, localize_log_message, mask_mcp_path_in_log,
+        normalize_ngrok_authtoken_input, pad_right_to_cell_width, parse_terminal_profile_choice,
+        terminal_cell_width, text_input_key_is_cancel, trim_line, wrap_log_message,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use std::collections::HashMap;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn terminal_buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
@@ -2949,6 +2979,19 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn session_duration_format_is_compact() {
+        assert_eq!(format_session_duration(Duration::from_secs(12)), "12s");
+        assert_eq!(
+            format_session_duration(Duration::from_secs(8 * 60 + 14)),
+            "8m 14s"
+        );
+        assert_eq!(
+            format_session_duration(Duration::from_secs(60 * 60 + 23 * 60 + 45)),
+            "1h 23m"
+        );
     }
 
     #[test]
@@ -3067,6 +3110,7 @@ mod tests {
                     frame,
                     &app,
                     0,
+                    Duration::ZERO,
                     0,
                     true,
                     &mut log_view,
@@ -3148,6 +3192,7 @@ mod tests {
                     frame,
                     &app,
                     3,
+                    Duration::from_secs(60 * 60 + 23 * 60 + 45),
                     0,
                     true,
                     &mut log_view,
@@ -3159,7 +3204,7 @@ mod tests {
             .expect("draw main dashboard");
 
         let text = terminal_buffer_text(&terminal);
-        for expected in ["Chats 2", "Jobs 3", "60s rate", "/min", "/h"] {
+        for expected in ["Chats 2", "Jobs 3", "60s rate", "1h 23m", "/min", "/h"] {
             assert!(
                 text.contains(expected),
                 "missing live telemetry text: {expected}"
@@ -5072,6 +5117,7 @@ async fn run_tui(
     state: SharedState,
     _devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     mut ui_events: Receiver<ServerUiEvent>,
+    session_started_at: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
     let mut log_follow_tail = true;
@@ -5129,6 +5175,7 @@ async fn run_tui(
                     f,
                     &app,
                     active_job_count,
+                    session_started_at.elapsed(),
                     log_scroll,
                     log_follow_tail,
                     &mut latest_log_view,
@@ -5449,6 +5496,7 @@ fn draw_ui(
     f: &mut Frame,
     app: &AppState,
     active_job_count: usize,
+    session_elapsed: Duration,
     log_scroll: usize,
     log_follow_tail: bool,
     log_view: &mut Option<LogView>,
@@ -5774,6 +5822,7 @@ fn draw_ui(
             &app.session_usage_totals,
             session_usage_cost_usd,
             status_label(ui_language.text("Session", "本次工作階段")),
+            Some(format_session_duration(session_elapsed)),
             &palette,
             &usage_widths,
             ui_language,
@@ -5782,6 +5831,7 @@ fn draw_ui(
             &all_time_usage_totals,
             all_time_usage_cost_usd,
             status_label(ui_language.text("All-time", "累計")),
+            None,
             &palette,
             &usage_widths,
             ui_language,
