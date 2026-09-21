@@ -842,7 +842,9 @@ pub fn load_macos_terminal_profile() -> std::io::Result<Option<bool>> {
 
 pub fn save_macos_terminal_profile(enabled: bool) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
-    update_app_config_at_path(&path, |config| config.macos_terminal_profile = Some(enabled))?;
+    update_app_config_at_path(&path, |config| {
+        config.macos_terminal_profile = Some(enabled)
+    })?;
     Ok(path)
 }
 
@@ -1443,11 +1445,7 @@ impl AppState {
         tool_input_tokens: u64,
         tool_output_tokens: u64,
     ) {
-        let Some(flow) = self
-            .flows
-            .iter_mut()
-            .find(|flow| flow.flow_id == flow_id)
-        else {
+        let Some(flow) = self.flows.iter_mut().find(|flow| flow.flow_id == flow_id) else {
             // UI events are best-effort. A saturated bounded channel may drop
             // the flow event while a later usage event still arrives.
             return;
@@ -1582,7 +1580,10 @@ mod tests {
 
         let entry = app.logs.last().expect("log entry");
         let mut parts = entry.time.split(':');
-        let h = parts.next().and_then(|p| p.parse::<u64>().ok()).expect("hour");
+        let h = parts
+            .next()
+            .and_then(|p| p.parse::<u64>().ok())
+            .expect("hour");
         let m = parts
             .next()
             .and_then(|p| p.parse::<u64>().ok())
@@ -1597,11 +1598,10 @@ mod tests {
             entry.time
         );
 
-        let now = time::OffsetDateTime::now_local()
-            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-        let local_secs = u64::from(now.hour()) * 3600
-            + u64::from(now.minute()) * 60
-            + u64::from(now.second());
+        let now =
+            time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let local_secs =
+            u64::from(now.hour()) * 3600 + u64::from(now.minute()) * 60 + u64::from(now.second());
         let entry_secs = h * 3600 + m * 60 + s;
         let delta = (local_secs + 86400 - entry_secs) % 86400;
         assert!(
@@ -1848,8 +1848,14 @@ toolCallCount = 1
             })
         });
         barrier.wait();
-        first.join().expect("join first update").expect("first update");
-        second.join().expect("join second update").expect("second update");
+        first
+            .join()
+            .expect("join first update")
+            .expect("first update");
+        second
+            .join()
+            .expect("join second update")
+            .expect("second update");
 
         let saved = AppConfig::load_from_path(&config_path).expect("load config");
         assert!(matches!(saved.agents_path_mode, AgentsPathMode::Codex));
@@ -1859,7 +1865,10 @@ toolCallCount = 1
             .filter_map(Result::ok)
             .filter(|entry| entry.path() != config_path)
             .collect::<Vec<_>>();
-        assert!(leftovers.is_empty(), "temporary config files leaked: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temporary config files leaked: {leftovers:?}"
+        );
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
@@ -2247,13 +2256,27 @@ toolCallCount = 0
         })
         .expect("persist independent config update");
 
-        std::thread::sleep(std::time::Duration::from_millis(80));
-        let saved = AppConfig::load_from_path(&config_path).expect("load coalesced config");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let saved = loop {
+            let saved = AppConfig::load_from_path(&config_path).expect("load coalesced config");
+            if saved
+                .usage_by_model
+                .get(CURRENT_USAGE_BUCKET)
+                .is_some_and(|usage| usage.tool_call_count == 8)
+            {
+                break saved;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deferred usage was not persisted before the test deadline",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(matches!(saved.agents_path_mode, AgentsPathMode::Codex));
         let usage = saved
             .usage_by_model
             .get(CURRENT_USAGE_BUCKET)
-            .expect("missing deferred usage bucket");
+            .expect("missing deferred usage bucket after persistence deadline");
         assert_eq!(usage.tool_input_tokens, 80);
         assert_eq!(usage.tool_output_tokens, 16);
         assert_eq!(usage.tool_call_count, 8);
@@ -2273,7 +2296,8 @@ toolCallCount = 0
         app.persist_state().expect("persist reset usage state");
         std::thread::sleep(std::time::Duration::from_millis(80));
 
-        let saved = AppConfig::load_from_path(&config_path).expect("reload config after deferred writer");
+        let saved =
+            AppConfig::load_from_path(&config_path).expect("reload config after deferred writer");
         assert!(
             saved.usage_by_model.is_empty(),
             "an older deferred usage snapshot must not overwrite a newer full config persist"
@@ -2291,7 +2315,10 @@ toolCallCount = 0
         app.schedule_usage_persistence();
         std::fs::write(&config_path, "this is not valid = [toml").expect("write invalid config");
 
-        assert!(app.persist_state().is_err(), "invalid config should make full persistence fail");
+        assert!(
+            app.persist_state().is_err(),
+            "invalid config should make full persistence fail"
+        );
         AppConfig::default()
             .save_to_path(&config_path)
             .expect("repair config before shutdown");
