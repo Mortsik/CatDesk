@@ -28,13 +28,18 @@ pub struct Rect {
 pub struct UiTreeSnapshot {
     pub window_name: String,
     pub elements: Vec<UiElement>,
+    pub truncated: bool,
 }
+
+#[cfg(windows)]
+const MAX_UIA_ELEMENTS: usize = 512;
 
 #[cfg(windows)]
 mod windows_impl {
     use super::{Rect, UiElement, UiTreeSnapshot};
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
     };
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
@@ -42,10 +47,18 @@ mod windows_impl {
     };
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
-    pub fn capture_foreground(max_depth: i32) -> Result<UiTreeSnapshot, String> {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    struct ComGuard(bool);
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
         }
+    }
+
+    pub fn capture_foreground(max_depth: i32) -> Result<UiTreeSnapshot, String> {
+        let _com_guard = ComGuard(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() });
 
         let foreground_hwnd = unsafe { GetForegroundWindow() };
         if foreground_hwnd.is_invalid() {
@@ -71,11 +84,13 @@ mod windows_impl {
 
         let mut elements = Vec::new();
         let mut index = 0;
+        let mut truncated = false;
         walk_element(
             &walker,
             &root,
             &mut elements,
             &mut index,
+            &mut truncated,
             0,
             max_depth.clamp(1, 12),
         )?;
@@ -83,6 +98,7 @@ mod windows_impl {
         Ok(UiTreeSnapshot {
             window_name,
             elements,
+            truncated,
         })
     }
 
@@ -91,10 +107,15 @@ mod windows_impl {
         element: &IUIAutomationElement,
         elements: &mut Vec<UiElement>,
         index: &mut i32,
+        truncated: &mut bool,
         depth: i32,
         max_depth: i32,
     ) -> Result<(), String> {
         if depth > max_depth {
+            return Ok(());
+        }
+        if elements.len() >= MAX_UIA_ELEMENTS {
+            *truncated = true;
             return Ok(());
         }
 
@@ -158,7 +179,18 @@ mod windows_impl {
         if let Ok(child) = unsafe { walker.GetFirstChildElement(element) } {
             let mut current = child;
             loop {
-                walk_element(walker, &current, elements, index, depth + 1, max_depth)?;
+                walk_element(
+                    walker,
+                    &current,
+                    elements,
+                    index,
+                    truncated,
+                    depth + 1,
+                    max_depth,
+                )?;
+                if *truncated {
+                    break;
+                }
                 match unsafe { walker.GetNextSiblingElement(&current) } {
                     Ok(next) => current = next,
                     Err(_) => break,
@@ -227,12 +259,20 @@ pub fn capture_foreground(_max_depth: i32) -> Result<UiTreeSnapshot, String> {
     Err("UI Automation is supported on Windows only".into())
 }
 
+fn compact_field(value: &str) -> String {
+    value
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(80)
+        .collect()
+}
+
 pub fn compact_tree(snapshot: &UiTreeSnapshot) -> String {
     snapshot
         .elements
         .iter()
         .map(|element| {
-            let name: String = element.name.chars().take(80).collect();
+            let name = compact_field(&element.name);
             let mut flags = String::new();
             if !element.is_enabled {
                 flags.push('!');
@@ -247,9 +287,9 @@ pub fn compact_tree(snapshot: &UiTreeSnapshot) -> String {
                 "{}|{}|{}|{}|{}|{},{},{},{}|{}",
                 element.element_index,
                 element.control_type,
-                name.replace(['\r', '\n'], " "),
-                element.automation_id.replace(['\r', '\n'], " "),
-                element.class_name.replace(['\r', '\n'], " "),
+                name,
+                compact_field(&element.automation_id),
+                compact_field(&element.class_name),
                 element.bounding_rect.x,
                 element.bounding_rect.y,
                 element.bounding_rect.width,
@@ -318,6 +358,7 @@ mod tests {
         let mut snapshot = UiTreeSnapshot {
             window_name: "test".into(),
             elements: vec![element(false, false)],
+            truncated: false,
         };
         assert!(resolve_element_center(&snapshot, 7).is_err());
         snapshot.elements[0] = element(true, true);

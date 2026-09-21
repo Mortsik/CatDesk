@@ -205,6 +205,7 @@ where
         .find(|candidate| candidate.is_file())
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn windows_application_binary_relative_path(binary: &str) -> Option<&'static str> {
     match binary {
         "google-chrome-stable" | "google-chrome" => {

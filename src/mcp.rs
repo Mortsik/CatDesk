@@ -674,6 +674,8 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
         "ui_tree" => {
             properties.insert("windowName".to_string(), json!({ "type": "string" }));
             properties.insert("tree".to_string(), json!({ "type": "string" }));
+            properties.insert("treeFingerprint".to_string(), json!({ "type": "string" }));
+            properties.insert("treeTruncated".to_string(), json!({ "type": "boolean" }));
             properties.insert(
                 "elementCount".to_string(),
                 json!({ "type": "integer", "minimum": 0 }),
@@ -905,9 +907,10 @@ fn desktop_tool_descriptors(tool_mode: ToolMode) -> Vec<Value> {
                         "element_index": { "type": "integer", "minimum": 0 },
                         "max_depth": { "type": "integer", "minimum": 1, "maximum": 12, "default": 5 },
                         "button": { "type": "string", "enum": ["left", "right", "middle"] },
-                        "clicks": { "type": "integer", "minimum": 1, "maximum": 3 }
+                        "clicks": { "type": "integer", "minimum": 1, "maximum": 3 },
+                        "tree_fingerprint": { "type": "string", "minLength": 1, "description": "Fingerprint returned by ui_tree; ui_click rejects the action if the foreground UI tree changed." }
                     },
-                    "required": ["element_index"]
+                    "required": ["element_index", "tree_fingerprint"]
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }),
@@ -922,7 +925,7 @@ fn desktop_tool_descriptors(tool_mode: ToolMode) -> Vec<Value> {
                         "y": { "type": "integer", "minimum": 0 },
                         "capture_id": { "type": "integer", "minimum": 1, "description": "Expected capture ID from screenshot; rejects stale coordinates when provided." }
                     },
-                    "required": ["x", "y"]
+                    "required": ["x", "y", "capture_id"]
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
             }),
@@ -939,7 +942,7 @@ fn desktop_tool_descriptors(tool_mode: ToolMode) -> Vec<Value> {
                         "clicks": { "type": "integer", "minimum": 1, "maximum": 3 },
                         "capture_id": { "type": "integer", "minimum": 1, "description": "Expected capture ID from screenshot; rejects stale coordinates when provided." }
                     },
-                    "required": ["x", "y"]
+                    "required": ["x", "y", "capture_id"]
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }),
@@ -2225,6 +2228,14 @@ fn build_run_command_listing_structured(
     })
 }
 
+fn ui_tree_fingerprint(snapshot: &crate::uia::UiTreeSnapshot) -> String {
+    let mut hasher = DefaultHasher::new();
+    snapshot.window_name.hash(&mut hasher);
+    snapshot.truncated.hash(&mut hasher);
+    crate::uia::compact_tree(snapshot).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 fn screenshot_success_response(req: &JsonRpcRequest, shot: &desktop::Screenshot) -> JsonRpcResponse {
     JsonRpcResponse::success(
         req.id.clone(),
@@ -2279,6 +2290,7 @@ fn handle_desktop_tool(req: &JsonRpcRequest, tool_name: &str) -> JsonRpcResponse
             match crate::uia::capture_foreground(max_depth) {
                 Ok(snapshot) => {
                     let tree = crate::uia::compact_tree(&snapshot);
+                    let tree_fingerprint = ui_tree_fingerprint(&snapshot);
                     tool_success_response_with_structured(
                         req,
                         String::new(),
@@ -2292,7 +2304,9 @@ fn handle_desktop_tool(req: &JsonRpcRequest, tool_name: &str) -> JsonRpcResponse
                             "success": true,
                             "windowName": snapshot.window_name,
                             "elementCount": snapshot.elements.len(),
-                            "tree": tree
+                            "tree": tree,
+                            "treeFingerprint": tree_fingerprint,
+                            "treeTruncated": snapshot.truncated
                         }),
                     )
                 }
@@ -2311,6 +2325,15 @@ fn handle_desktop_tool(req: &JsonRpcRequest, tool_name: &str) -> JsonRpcResponse
                 .and_then(Value::as_i64)
                 .unwrap_or(5)
                 .clamp(1, 12) as i32;
+            let Some(expected_tree_fingerprint) = arguments
+                .get("tree_fingerprint")
+                .and_then(Value::as_str)
+            else {
+                return tool_error_response(
+                    req,
+                    "Missing required parameter: tree_fingerprint".into(),
+                );
+            };
             let button = arguments
                 .get("button")
                 .and_then(Value::as_str)
@@ -2320,6 +2343,13 @@ fn handle_desktop_tool(req: &JsonRpcRequest, tool_name: &str) -> JsonRpcResponse
                 .and_then(Value::as_u64)
                 .unwrap_or(1) as u32;
             match crate::uia::capture_foreground(max_depth).and_then(|snapshot| {
+                let current_tree_fingerprint = ui_tree_fingerprint(&snapshot);
+                if current_tree_fingerprint != expected_tree_fingerprint {
+                    return Err(
+                        "Stale UI tree: the foreground window changed. Call ui_tree again before clicking."
+                            .to_string(),
+                    );
+                }
                 let (screen_x, screen_y, name) =
                     crate::uia::resolve_element_center(&snapshot, element_index as i32)?;
                 desktop::mouse_click_screen(screen_x, screen_y, button, clicks)
@@ -2346,9 +2376,11 @@ fn handle_desktop_tool(req: &JsonRpcRequest, tool_name: &str) -> JsonRpcResponse
             if x < 0 || y < 0 {
                 return tool_error_response(req, "x and y must be non-negative integers".into());
             }
-            let capture_id = arguments.get("capture_id").and_then(Value::as_u64);
+            let Some(capture_id) = arguments.get("capture_id").and_then(Value::as_u64) else {
+                return tool_error_response(req, "Missing required parameter: capture_id".into());
+            };
             let result = if tool_name == "mouse_move" {
-                desktop::mouse_move_checked(x, y, capture_id)
+                desktop::mouse_move_checked(x, y, Some(capture_id))
             } else {
                 let button = arguments
                     .get("button")
@@ -2358,7 +2390,7 @@ fn handle_desktop_tool(req: &JsonRpcRequest, tool_name: &str) -> JsonRpcResponse
                     .get("clicks")
                     .and_then(Value::as_u64)
                     .unwrap_or(1) as u32;
-                desktop::mouse_click_checked(x, y, button, clicks, capture_id)
+                desktop::mouse_click_checked(x, y, button, clicks, Some(capture_id))
             };
             match result {
                 Ok((screen_x, screen_y)) => tool_success_response_with_structured(
@@ -4850,6 +4882,60 @@ mod tests {
         ] {
             assert!(full_names.contains(&expected), "missing {expected}");
         }
+
+        for name in ["mouse_move", "mouse_click"] {
+            let required = full
+                .iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|tool| tool.get("inputSchema"))
+                .and_then(|schema| schema.get("required"))
+                .and_then(Value::as_array)
+                .expect("required fields");
+            assert!(
+                required.iter().any(|field| field == "capture_id"),
+                "{name} must require capture_id"
+            );
+        }
+        let ui_click_required = full
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("ui_click"))
+            .and_then(|tool| tool.get("inputSchema"))
+            .and_then(|schema| schema.get("required"))
+            .and_then(Value::as_array)
+            .expect("ui_click required fields");
+        assert!(
+            ui_click_required
+                .iter()
+                .any(|field| field == "tree_fingerprint"),
+            "ui_click must reject stale UI trees"
+        );
+    }
+
+    #[test]
+    fn ui_tree_fingerprint_changes_when_semantic_tree_changes() {
+        let first = crate::uia::UiTreeSnapshot {
+            window_name: "Window".into(),
+            elements: vec![crate::uia::UiElement {
+                element_index: 0,
+                control_type: "Button".into(),
+                name: "Save".into(),
+                automation_id: "save".into(),
+                class_name: "Button".into(),
+                is_enabled: true,
+                bounding_rect: crate::uia::Rect {
+                    x: 1,
+                    y: 2,
+                    width: 10,
+                    height: 10,
+                },
+                has_keyboard_focus: false,
+                is_offscreen: false,
+            }],
+            truncated: false,
+        };
+        let mut second = first.clone();
+        second.elements[0].name = "Delete".into();
+        assert_ne!(ui_tree_fingerprint(&first), ui_tree_fingerprint(&second));
     }
 
     #[test]
