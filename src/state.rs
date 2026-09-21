@@ -517,12 +517,6 @@ pub enum FlowDirection {
 
 pub enum ServerUiEvent {
     IncrementRequestCount,
-    SetRemoteConnected(bool),
-    RecordFlow {
-        flow_id: String,
-        events: Vec<String>,
-        direction: FlowDirection,
-    },
     RecordBootstrapDiscoverResponse {
         flow_id: String,
         success: bool,
@@ -541,9 +535,6 @@ pub enum ServerUiEvent {
         flow_id: String,
         tool_input_tokens: u64,
         tool_output_tokens: u64,
-    },
-    BeginFlowClose {
-        flow_id: String,
     },
     Log {
         level: &'static str,
@@ -1245,22 +1236,6 @@ impl AppState {
             ServerUiEvent::IncrementRequestCount => {
                 self.request_count = self.request_count.saturating_add(1);
             }
-            ServerUiEvent::SetRemoteConnected(connected) => {
-                self.remote_connected = connected;
-                if connected {
-                    self.last_remote_activity_ms = Some(now_unix_millis());
-                } else {
-                    self.last_remote_activity_ms = None;
-                    self.connected_chat_ids.clear();
-                }
-            }
-            ServerUiEvent::RecordFlow {
-                flow_id,
-                events,
-                direction,
-            } => {
-                self.record_flow(&flow_id, &events, direction);
-            }
             ServerUiEvent::RecordBootstrapDiscoverResponse { flow_id, success } => {
                 self.record_bootstrap_discover_response(&flow_id, success);
             }
@@ -1285,9 +1260,6 @@ impl AppState {
             } => {
                 self.record_flow_turn_usage(&flow_id, tool_input_tokens, tool_output_tokens);
             }
-            ServerUiEvent::BeginFlowClose { flow_id } => {
-                self.begin_flow_close(&flow_id);
-            }
             ServerUiEvent::Log { level, message } => {
                 self.log(level, message);
             }
@@ -1296,6 +1268,16 @@ impl AppState {
 }
 
 impl AppState {
+    pub fn set_remote_connected(&mut self, connected: bool) {
+        self.remote_connected = connected;
+        if connected {
+            self.last_remote_activity_ms = Some(now_unix_millis());
+        } else {
+            self.last_remote_activity_ms = None;
+            self.connected_chat_ids.clear();
+        }
+    }
+
     pub fn record_flow(&mut self, flow_id: &str, events: &[String], direction: FlowDirection) {
         if events.is_empty() {
             return;
@@ -2426,7 +2408,7 @@ toolCallCount = 0
         app.begin_flow_close("session:a");
         assert_eq!(app.connected_chat_count(), 1);
 
-        app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected(false));
+        app.set_remote_connected(false);
         assert_eq!(app.connected_chat_count(), 0);
 
         let _ = std::fs::remove_file(config_path);

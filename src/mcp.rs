@@ -1272,6 +1272,7 @@ async fn handle_tools_call_with_session(
                                 workspace_root,
                                 set_catdesk_as_co_author,
                                 command_jobs,
+                                session_namespace,
                                 active_project,
                             )
                             .await
@@ -1480,6 +1481,7 @@ where
 fn command_job_output_text(snapshot: &CommandJobSnapshot) -> String {
     if snapshot.events.is_empty() {
         return match snapshot.state {
+            CommandJobState::Queued => "(no new output; command is queued for process capacity)".to_string(),
             CommandJobState::Running => "(no new output; command is still running)".to_string(),
             CommandJobState::Interrupted => {
                 "(command interrupted: CatDesk exited before the command finished; output was not retained)"
@@ -1521,7 +1523,7 @@ fn command_job_structured(tool_name: &str, snapshot: &CommandJobSnapshot) -> Val
         | CommandJobState::TimedOut
         | CommandJobState::Abandoned
         | CommandJobState::Interrupted => Some(false),
-        CommandJobState::Running => None,
+        CommandJobState::Queued | CommandJobState::Running => None,
     };
     json!({
         "toolName": tool_name,
@@ -1740,6 +1742,7 @@ async fn handle_run_command(
     workspace_root: &str,
     set_catdesk_as_co_author: bool,
     command_jobs: &CommandJobManager,
+    session_namespace: Option<&str>,
     active_project: Option<&Path>,
 ) -> JsonRpcResponse {
     let params = &req.params;
@@ -1836,7 +1839,7 @@ async fn handle_run_command(
         );
     }
 
-    let _process_permit = match command_jobs.try_acquire_process() {
+    let _process_permit = match command_jobs.acquire_process(session_namespace, &cwd).await {
         Ok(permit) => permit,
         Err(error) => return tool_error_response(req, error),
     };
@@ -3353,6 +3356,7 @@ fn build_command_job_widget_payload(
     let command = structured.get("command")?.clone();
     let state = structured.get("state")?.as_str()?;
     let (title, widget_state) = match state {
+        "queued" => ("Command Queued", "waiting"),
         "running" => (
             if tool_name == "start_command" {
                 "Command Started"
@@ -4706,7 +4710,7 @@ mod tests {
             .to_string();
         assert_eq!(
             start_structured.get("state").and_then(Value::as_str),
-            Some("running")
+            Some("queued")
         );
         assert_eq!(
             start_response
@@ -5100,6 +5104,7 @@ mod tests {
     #[test]
     fn command_job_widget_state_matrix_preserves_command_ui_contract() {
         let cases = [
+            ("start_command", "queued", "Command Queued", "waiting"),
             ("start_command", "running", "Command Started", "waiting"),
             ("poll_command", "running", "Command Running", "waiting"),
             ("poll_command", "succeeded", "Command Complete", "done"),
@@ -5359,30 +5364,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_shares_process_budget_with_background_jobs() {
+    async fn run_command_waits_for_shared_process_capacity_instead_of_failing_busy() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-run-budget-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
         let command_jobs = CommandJobManager::new_with_process_limit(1);
-        let _occupied = command_jobs
-            .try_acquire_process()
+        let occupied = command_jobs
+            .acquire_process(Some("holder"), &workspace_root)
+            .await
             .expect("occupy shared process budget");
         let req = tool_call_request("run_command", json!({ "command": "printf budget-test" }));
+        let jobs = command_jobs.clone();
+        let root = workspace_root_str.clone();
+        let task = tokio::spawn(async move {
+            handle_tools_call(
+                &req,
+                &root,
+                1,
+                Mode::Both,
+                ToolMode::MultiTools,
+                false,
+                &jobs,
+                &None,
+            )
+            .await
+        });
 
-        let response = handle_tools_call(
-            &req,
-            &workspace_root_str,
-            1,
-            Mode::Both,
-            ToolMode::MultiTools,
-            false,
-            &command_jobs,
-            &None,
-        )
-        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "run_command should queue while process capacity is occupied");
+        drop(occupied);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("queued run_command did not resume")
+            .expect("run_command task panicked");
 
-        assert_eq!(
+        assert_ne!(
             response
                 .result
                 .as_ref()
@@ -5390,10 +5407,14 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
-        assert!(
-            result_text(&response).contains("too many active command processes"),
-            "unexpected result text: {}",
-            result_text(&response)
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("stdout"))
+                .and_then(Value::as_str),
+            Some("budget-test")
         );
         let _ = std::fs::remove_dir_all(workspace_root);
     }
@@ -7943,12 +7964,15 @@ mod tests {
         };
 
         let immediate = poll(json!({ "job_id": job_id, "wait_ms": 0 })).await;
-        assert_eq!(immediate["state"], json!("running"), "0 must not block");
+        assert!(
+            matches!(immediate["state"].as_str(), Some("queued" | "running")),
+            "0 must return immediately with the current nonterminal state"
+        );
 
         let waited = poll(json!({ "job_id": job_id })).await;
         assert_ne!(
             waited["state"],
-            json!("running"),
+            immediate["state"],
             "omitting wait_ms must block until there is progress"
         );
 

@@ -66,11 +66,44 @@ mod tests {
     }
 
     #[test]
+    fn write_failure_reopens_writer_and_does_not_disable_later_records() {
+        let root = std::env::temp_dir().join(format!(
+            "catdesk-diagnostics-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut writer = Some(LogWriter::open(&root, 128).unwrap());
+        let failures = AtomicU64::new(0);
+        let oversized = json!({"event": "too-large", "payload": "x".repeat(512)});
+        assert!(!write_record_resilient(
+            &mut writer,
+            &root,
+            128,
+            &oversized,
+            &failures,
+        ));
+        assert!(failures.load(Ordering::Relaxed) >= 1);
+
+        assert!(write_record_resilient(
+            &mut writer,
+            &root,
+            128,
+            &json!({"event": "after-failure"}),
+            &failures,
+        ));
+        drop(writer);
+        let current = std::fs::read_to_string(root.join("connections.jsonl")).unwrap();
+        assert!(current.contains("after-failure"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn busy_writer_drops_records_without_blocking_and_reports_loss() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let log = Diagnostics {
             sender,
             dropped: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
+            write_dropped: Arc::new(AtomicU64::new(0)),
             active: Arc::new(AtomicU64::new(0)),
         };
         log.record(json!({"event": "first"}));
@@ -295,10 +328,12 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const LOG_LIMIT: u64 = 5 * 1024 * 1024;
+const WRITE_RETRY_ATTEMPTS: usize = 4;
+const WRITE_RETRY_BASE_MS: u64 = 25;
 static GLOBAL: OnceLock<Diagnostics> = OnceLock::new();
 tokio::task_local! { static REQUEST: RequestLog; }
 
@@ -306,6 +341,8 @@ tokio::task_local! { static REQUEST: RequestLog; }
 pub(crate) struct Diagnostics {
     sender: mpsc::SyncSender<Option<Value>>,
     dropped: Arc<AtomicU64>,
+    write_failures: Arc<AtomicU64>,
+    write_dropped: Arc<AtomicU64>,
     active: Arc<AtomicU64>,
 }
 
@@ -331,23 +368,33 @@ impl Diagnostics {
         // An overlapping restart must not silently lose all diagnostics while
         // the old process still holds the primary log. Two fixed slots retain
         // rotation bounds; they do not accumulate per-PID files indefinitely.
-        let mut writer = LogWriter::open(root, LOG_LIMIT)
+        let writer = LogWriter::open(root, LOG_LIMIT)
             .or_else(|_| LogWriter::open(&root.join("concurrent"), LOG_LIMIT))?;
         let (sender, receiver) = mpsc::sync_channel(1024);
+        let write_failures = Arc::new(AtomicU64::new(0));
+        let write_dropped = Arc::new(AtomicU64::new(0));
         let log = Self {
             sender,
             dropped: Arc::new(AtomicU64::new(0)),
+            write_failures: write_failures.clone(),
+            write_dropped: write_dropped.clone(),
             active: Arc::new(AtomicU64::new(0)),
         };
+        let writer_root = writer.root.clone();
+        let writer_limit = writer.limit;
         let worker = std::thread::Builder::new()
             .name("catdesk-diagnostics".into())
             .spawn(move || {
+                let mut writer = Some(writer);
                 while let Ok(Some(record)) = receiver.recv() {
-                    if writer.write(&record).is_err() {
-                        eprintln!(
-                            "CatDesk: connection diagnostics disabled after a log write failure"
-                        );
-                        break;
+                    if !write_record_resilient(
+                        &mut writer,
+                        &writer_root,
+                        writer_limit,
+                        &record,
+                        &write_failures,
+                    ) {
+                        write_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             })?;
@@ -369,9 +416,16 @@ impl Diagnostics {
         );
         value["pid"] = json!(std::process::id());
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        let write_failures = self.write_failures.swap(0, Ordering::Relaxed);
+        let write_dropped = self.write_dropped.swap(0, Ordering::Relaxed);
         value["dropped_records"] = json!(dropped);
+        value["diagnostic_write_failures"] = json!(write_failures);
+        value["diagnostic_write_dropped"] = json!(write_dropped);
         if self.sender.try_send(Some(value)).is_err() {
             self.dropped.fetch_add(dropped + 1, Ordering::Relaxed);
+            self.write_failures
+                .fetch_add(write_failures, Ordering::Relaxed);
+            self.write_dropped.fetch_add(write_dropped, Ordering::Relaxed);
         }
     }
 }
@@ -539,6 +593,45 @@ fn private_file(path: &Path) -> io::Result<File> {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(file)
+}
+
+fn write_record_resilient(
+    writer: &mut Option<LogWriter>,
+    root: &Path,
+    limit: u64,
+    record: &Value,
+    write_failures: &AtomicU64,
+) -> bool {
+    for attempt in 0..WRITE_RETRY_ATTEMPTS {
+        if writer.is_none() {
+            match LogWriter::open(root, limit) {
+                Ok(opened) => *writer = Some(opened),
+                Err(_) => {
+                    write_failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        if let Some(current) = writer.as_mut() {
+            match current.write(record) {
+                Ok(()) => return true,
+                Err(_) => {
+                    write_failures.fetch_add(1, Ordering::Relaxed);
+                    writer.take();
+                }
+            }
+        }
+
+        if attempt + 1 < WRITE_RETRY_ATTEMPTS {
+            let shift = (attempt as u32).min(3);
+            std::thread::sleep(Duration::from_millis(
+                WRITE_RETRY_BASE_MS.saturating_mul(1u64 << shift),
+            ));
+        }
+    }
+
+    eprintln!("CatDesk: connection diagnostics degraded; one record dropped after retry budget");
+    false
 }
 
 impl LogWriter {

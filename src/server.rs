@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration as StdDuration;
 use tokio::sync::{Mutex, mpsc::Sender};
 
@@ -20,7 +23,7 @@ use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::project_scope;
-use crate::request_workers::{RequestClass, RequestScheduler};
+use crate::request_workers::{RequestClass, global_request_scheduler};
 use crate::session_context::{ProjectStateChange, SessionContextStore};
 use crate::state::{
     AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
@@ -63,13 +66,53 @@ impl ClientSession {
 #[derive(Clone)]
 struct InstructionGate {
     contexts: SessionContextStore,
+    remote_connected_desired: Arc<AtomicBool>,
+    remote_connected_update_pending: Arc<AtomicBool>,
 }
 
 impl InstructionGate {
     fn with_anonymous(called: bool) -> Self {
         Self {
             contexts: SessionContextStore::with_anonymous(called),
+            remote_connected_desired: Arc::new(AtomicBool::new(false)),
+            remote_connected_update_pending: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn note_remote_connected(&self, connected: bool) {
+        self.remote_connected_desired
+            .store(connected, Ordering::Release);
+    }
+
+    fn set_remote_connected_nonblocking(&self, app: SharedState, connected: bool) {
+        self.note_remote_connected(connected);
+        if let Ok(mut state) = app.try_lock() {
+            state.set_remote_connected(connected);
+            return;
+        }
+        if self
+            .remote_connected_update_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let desired = self.remote_connected_desired.clone();
+        let pending = self.remote_connected_update_pending.clone();
+        tokio::spawn(async move {
+            loop {
+                let connected = desired.load(Ordering::Acquire);
+                app.lock().await.set_remote_connected(connected);
+                pending.store(false, Ordering::Release);
+                if desired.load(Ordering::Acquire) == connected
+                    || pending
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
     }
 
     fn is_called(&self, session: &ClientSession) -> bool {
@@ -494,6 +537,19 @@ fn request_deadline(class: RequestClass) -> StdDuration {
         }
         RequestClass::General => StdDuration::from_secs(60),
     }
+}
+
+fn request_scheduling_key(
+    session: &ClientSession,
+    gate: &InstructionGate,
+) -> crate::fair_queue::SchedulingKey {
+    let project = gate
+        .active_project(session)
+        .map(|path| path.to_string_lossy().into_owned());
+    crate::fair_queue::SchedulingKey::new(
+        session.namespace().unwrap_or(session.flow_id.as_str()),
+        project.as_deref(),
+    )
 }
 
 fn request_failure_event(
@@ -1533,6 +1589,18 @@ mod tests {
     }
 
     #[test]
+    fn scheduling_key_uses_named_session_and_active_project() {
+        let body = tool_call_body("read", json!({ "paths": ["x"] }));
+        let session = ClientSession::from_headers(&modern_mcp_headers_for_session(&body, "session-a"));
+        let gate = InstructionGate::with_anonymous(false);
+        gate.set_active_project(&session, std::path::PathBuf::from("/workspace/project-a"));
+
+        let key = request_scheduling_key(&session, &gate);
+        assert_eq!(key.session, "session-a");
+        assert_eq!(key.project.as_deref(), Some("/workspace/project-a"));
+    }
+
+    #[test]
     fn tool_flow_label_keeps_plain_name_for_unlisted_arguments() {
         let instruction = json!({
             "method": "tools/call",
@@ -2091,8 +2159,19 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), post_mcp_http(
             State(server), modern_mcp_headers("ping", None), mcp_request_body("ping", json!({})),
         )).await;
-        std::fs::remove_dir_all(root).unwrap();
         assert_eq!(result.expect("ping must not wait for UI/persistence").status(), StatusCode::OK);
+        drop(_locked);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.lock().await.remote_connected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("coalesced authoritative connection update must eventually apply");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2853,7 +2932,7 @@ mod tests {
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, mut ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let server_state = ServerState {
-            app: app_state,
+            app: app_state.clone(),
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
@@ -2903,12 +2982,14 @@ mod tests {
             "one MCP client's instruction call must not unlock another client"
         );
 
-        let mut session_flow_ids = Vec::new();
-        while let Ok(event) = ui_rx.try_recv() {
-            if let ServerUiEvent::RecordFlow { flow_id, .. } = event {
-                session_flow_ids.push(flow_id);
-            }
-        }
+        while ui_rx.try_recv().is_ok() {}
+        let session_flow_ids = app_state
+            .lock()
+            .await
+            .flows
+            .iter()
+            .map(|flow| flow.flow_id.clone())
+            .collect::<Vec<_>>();
         assert!(session_flow_ids.iter().any(|flow_id| flow_id != STATELESS_FLOW_ID));
         assert!(session_flow_ids.iter().all(|flow_id| !flow_id.contains("client-a-secret-session")));
         assert!(session_flow_ids.iter().all(|flow_id| !flow_id.contains("client-b-secret-session")));
@@ -2932,7 +3013,7 @@ mod tests {
         )
         .expect("create app state");
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, mut ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
         let gate = InstructionGate::with_anonymous(false);
         let session_a = ClientSession::from_headers(&modern_mcp_headers_for_session(
             &tool_call_body("catdesk_instruction", json!({})),
@@ -2976,8 +3057,9 @@ mod tests {
             .await
             .expect("start session-b job");
 
+        app_state.lock().await.set_remote_connected(true);
         let server_state = ServerState {
-            app: app_state,
+            app: app_state.clone(),
             devtools: None,
             command_jobs: command_jobs.clone(),
             ui_events: ui_tx,
@@ -3009,13 +3091,10 @@ mod tests {
             .expect("poll surviving session-b job");
         assert_eq!(b_snapshot.state, crate::command_jobs::CommandJobState::Running);
 
-        let mut saw_disconnect = false;
-        while let Ok(event) = ui_rx.try_recv() {
-            if matches!(event, ServerUiEvent::SetRemoteConnected(false)) {
-                saw_disconnect = true;
-            }
-        }
-        assert!(!saw_disconnect, "deleting session-a must not disconnect session-b");
+        assert!(
+            app_state.lock().await.remote_connected,
+            "deleting session-a must not disconnect session-b"
+        );
 
         let delete_b = delete_mcp(
             State(server_state),
@@ -3023,15 +3102,68 @@ mod tests {
         )
         .await;
         assert_eq!(delete_b.status(), StatusCode::OK);
-        let mut saw_final_disconnect = false;
-        while let Ok(event) = ui_rx.try_recv() {
-            if matches!(event, ServerUiEvent::SetRemoteConnected(false)) {
-                saw_final_disconnect = true;
-            }
-        }
-        assert!(saw_final_disconnect, "deleting the final named session must disconnect remote UI state");
+        assert!(
+            !app_state.lock().await.remote_connected,
+            "deleting the final named session must disconnect authoritative remote state"
+        );
 
         command_jobs.cancel_all().await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
+    async fn authoritative_session_state_survives_a_full_ui_event_queue() {
+        let workspace_root = unique_temp_path("catdesk-authoritative-session-workspace");
+        let config_root = unique_temp_path("catdesk-authoritative-session-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        for _ in 0..crate::state::UI_EVENT_CAPACITY {
+            ui_tx
+                .try_send(ServerUiEvent::IncrementRequestCount)
+                .expect("fill UI event queue");
+        }
+        let server_state = ServerState {
+            app: app_state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: InstructionGate::with_anonymous(false),
+        };
+        let request = tool_call_body("catdesk_instruction", json!({}));
+        let headers = modern_mcp_headers_for_session(&request, "queue-saturated-session");
+        let response = post_mcp_http(
+            State(server_state.clone()),
+            headers.clone(),
+            request,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let app = app_state.lock().await;
+            assert!(app.remote_connected);
+            assert_eq!(app.connected_chat_count(), 1);
+        }
+
+        let deleted = delete_mcp(State(server_state), headers).await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        {
+            let app = app_state.lock().await;
+            assert!(!app.remote_connected);
+            assert_eq!(app.connected_chat_count(), 0);
+        }
+
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
         let _ = std::fs::remove_dir_all(config_root);
@@ -3880,7 +4012,8 @@ async fn post_mcp_http(
         }
         if let Err(response) = validate_modern_request(body, &headers) { return response; }
         let _ = s.ui_events.try_send(ServerUiEvent::IncrementRequestCount);
-        let _ = s.ui_events.try_send(ServerUiEvent::SetRemoteConnected(true));
+        s.catdesk_instruction_called
+            .set_remote_connected_nonblocking(s.app.clone(), true);
         let Some(id) = body.get("id").filter(|v| !v.is_null()) else {
             return Response::builder().status(StatusCode::ACCEPTED).body(Body::empty()).unwrap();
         };
@@ -3897,12 +4030,13 @@ async fn post_mcp_http(
         .as_ref()
         .map(request_class)
         .unwrap_or(RequestClass::General);
+    let client_session = ClientSession::from_headers(&headers);
+    let scheduling_key = request_scheduling_key(&client_session, &s.catdesk_instruction_called);
     let id = metadata.and_then(|v| v.get("id").cloned());
-    static SCHEDULER: std::sync::LazyLock<RequestScheduler> =
-        std::sync::LazyLock::new(RequestScheduler::new);
-    match SCHEDULER
-        .run(
+    match global_request_scheduler()
+        .run_keyed(
             class,
+            scheduling_key,
             async move { post_mcp_inner(State(s), body_bytes, &headers, None).await },
             request_deadline(class),
         )
@@ -4031,7 +4165,6 @@ async fn post_mcp_inner(
 
     crate::diagnostics::rpc_request(&body);
     let _ = s.ui_events.try_send(ServerUiEvent::IncrementRequestCount);
-    let _ = s.ui_events.try_send(ServerUiEvent::SetRemoteConnected(true));
     let client_session = ClientSession::from_headers(headers);
     let flow_id = client_session.flow_id.clone();
 
@@ -4064,11 +4197,12 @@ async fn post_mcp_inner(
     let request_summary = summarize_request(&body);
     let request_flow_event = request_flow_label(&body);
 
-    let _ = s.ui_events.try_send(ServerUiEvent::RecordFlow {
-        flow_id: flow_id.clone(),
-        events: vec![request_flow_event.clone()],
-        direction: FlowDirection::Forward,
-    });
+    s.catdesk_instruction_called.note_remote_connected(true);
+    s.app.lock().await.record_flow(
+        &flow_id,
+        std::slice::from_ref(&request_flow_event),
+        FlowDirection::Forward,
+    );
 
     let req: JsonRpcRequest = match serde_json::from_value(body.clone()) {
         Ok(r) => r,
@@ -4249,11 +4383,11 @@ async fn post_mcp_inner(
             _ => {}
         }
 
-        let _ = s.ui_events.try_send(ServerUiEvent::RecordFlow {
-            flow_id: flow_id.clone(),
-            events: vec![request_flow_event.clone()],
-            direction: FlowDirection::Backward,
-        });
+        s.app.lock().await.record_flow(
+            &flow_id,
+            std::slice::from_ref(&request_flow_event),
+            FlowDirection::Backward,
+        );
     }
     if let Some(ref resp_json) = response_json {
         let response_summary = summarize_response(&body, resp_json);
@@ -4338,12 +4472,18 @@ async fn delete_mcp(State(s): State<ServerState>, headers: HeaderMap) -> Respons
         0
     };
     s.catdesk_instruction_called.forget(&client_session);
-    if client_session.namespace().is_none() || !s.catdesk_instruction_called.has_named_sessions() {
-        let _ = s.ui_events.try_send(ServerUiEvent::SetRemoteConnected(false));
+    let should_disconnect =
+        client_session.namespace().is_none() || !s.catdesk_instruction_called.has_named_sessions();
+    if should_disconnect {
+        s.catdesk_instruction_called.note_remote_connected(false);
     }
-    let _ = s.ui_events.try_send(ServerUiEvent::BeginFlowClose {
-        flow_id: client_session.flow_id,
-    });
+    {
+        let mut app = s.app.lock().await;
+        if should_disconnect {
+            app.set_remote_connected(false);
+        }
+        app.begin_flow_close(&client_session.flow_id);
+    }
     let _ = s.ui_events.try_send(ServerUiEvent::Log {
         level: "INFO",
         message: format!(

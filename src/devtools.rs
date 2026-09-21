@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -10,6 +11,63 @@ const DEVTOOLS_PROTOCOL_VERSION: &str = "2025-03-26";
 const DEVTOOLS_CLIENT_NAME: &str = "catdesk-bridge";
 const DEVTOOLS_CLIENT_VERSION: &str = "4.0.0";
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const RESTART_BACKOFF_BASE_MS: u64 = 250;
+const RESTART_BACKOFF_MAX_MS: u64 = 15_000;
+const RESTART_JITTER_MAX_MS: u64 = 250;
+
+#[derive(Clone)]
+struct LaunchSpec {
+    program: String,
+    args: Vec<String>,
+}
+
+impl LaunchSpec {
+    fn devtools(selected_browser: Option<&DetectedBrowser>) -> Self {
+        let mut args = vec!["-y".to_string(), "chrome-devtools-mcp@latest".to_string()];
+        if let Some(browser) = selected_browser {
+            if browser.remote_debug_active {
+                if let Some(target) = browser.remote_debug_target.as_deref() {
+                    if target == "pipe" {
+                        args.extend(["--executablePath".to_string(), browser.path.clone()]);
+                    } else {
+                        args.extend(["--browserUrl".to_string(), format!("http://{target}")]);
+                    }
+                } else {
+                    args.extend(["--executablePath".to_string(), browser.path.clone()]);
+                }
+            } else {
+                args.extend(["--executablePath".to_string(), browser.path.clone()]);
+            }
+        }
+        Self {
+            program: "npx".to_string(),
+            args,
+        }
+    }
+
+    fn spawn(&self) -> Result<Child, String> {
+        Command::new(&self.program)
+            .args(&self.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("Failed to spawn DevTools bridge: {e}"))
+    }
+}
+
+fn restart_backoff(failures: u32) -> StdDuration {
+    let factor = 1u64 << failures.saturating_sub(1).min(6);
+    let base = RESTART_BACKOFF_BASE_MS
+        .saturating_mul(factor)
+        .min(RESTART_BACKOFF_MAX_MS);
+    let jitter = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_nanos()) % (RESTART_JITTER_MAX_MS + 1))
+        .unwrap_or(0);
+    StdDuration::from_millis(base.saturating_add(jitter).min(RESTART_BACKOFF_MAX_MS))
+}
 
 fn stderr_event(bytes: &[u8]) -> Option<&'static str> {
     let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
@@ -67,15 +125,19 @@ pub struct DevtoolsBridge {
     pending: Arc<StdMutex<Pending>>,
     reader: tokio::task::JoinHandle<()>,
     stderr_reader: Option<tokio::task::JoinHandle<()>>,
+    launch: Option<LaunchSpec>,
+    restart_failures: u32,
+    next_restart_at: Option<Instant>,
 }
 
 impl DevtoolsBridge {
-    /// The browser protocol is serialized, but callers must not build an
-    /// unbounded queue behind one slow browser operation.
+    /// The browser protocol itself is serialized. Temporary saturation waits in
+    /// Tokio's mutex queue instead of surfacing a misleading two-second Busy error.
     pub async fn call(bridge: &Arc<Mutex<Self>>, req: &Value) -> Result<Value, String> {
-        let mut guard = tokio::time::timeout(std::time::Duration::from_secs(2), bridge.lock())
-            .await
-            .map_err(|_| "DevTools is busy; wait for the active browser operation.".to_string())?;
+        let mut guard = bridge.lock().await;
+        if !guard.is_connected() {
+            guard.restart().await?;
+        }
         guard.request(req).await
     }
 
@@ -83,63 +145,21 @@ impl DevtoolsBridge {
     pub async fn start(
         selected_browser: Option<&DetectedBrowser>,
     ) -> Result<Arc<Mutex<Self>>, String> {
-        let mut command = Command::new("npx");
-        command.args(["-y", "chrome-devtools-mcp@latest"]);
-
-        if let Some(browser) = selected_browser {
-            if browser.remote_debug_active {
-                if let Some(target) = browser.remote_debug_target.as_deref() {
-                    if target == "pipe" {
-                        command.args(["--executablePath", &browser.path]);
-                    } else {
-                        command.args(["--browserUrl", &format!("http://{target}")]);
-                    }
-                } else {
-                    command.args(["--executablePath", &browser.path]);
-                }
-            } else {
-                command.args(["--executablePath", &browser.path]);
-            }
-        }
-
-        let child = command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("Failed to spawn chrome-devtools-mcp: {e}"))?;
-
-        let bridge = Self::from_child(child)?;
-
+        let launch = LaunchSpec::devtools(selected_browser);
+        let child = launch.spawn()?;
+        let bridge = Arc::new(Mutex::new(Self::from_child_inner(child, Some(launch))?));
         {
-            let init_req = json!({
-                "jsonrpc": "2.0",
-                "id": "dt-init",
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": DEVTOOLS_PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": DEVTOOLS_CLIENT_NAME,
-                        "version": DEVTOOLS_CLIENT_VERSION
-                    }
-                }
-            });
             let mut bridge_guard = bridge.lock().await;
-            bridge_guard.request(&init_req).await?;
-            bridge_guard
-                .notify(&json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized"
-                }))
-                .await?;
+            bridge_guard.initialize_protocol().await?;
         }
-
         Ok(bridge)
     }
 
-    fn from_child(mut child: Child) -> Result<Arc<Mutex<Self>>, String> {
+    fn from_child(child: Child) -> Result<Arc<Mutex<Self>>, String> {
+        Ok(Arc::new(Mutex::new(Self::from_child_inner(child, None)?)))
+    }
+
+    fn from_child_inner(mut child: Child, launch: Option<LaunchSpec>) -> Result<Self, String> {
         let child_stdin = child.stdin.take().ok_or("No stdin")?;
         let child_stdout = child.stdout.take().ok_or("No stdout")?;
         let stderr_reader = child.stderr.take().map(|stderr| {
@@ -202,13 +222,86 @@ impl DevtoolsBridge {
             crate::diagnostics::event("devtools_stdout_closed");
         });
 
-        Ok(Arc::new(Mutex::new(Self {
+        Ok(Self {
             child,
             stdin,
             pending,
             reader,
             stderr_reader,
-        })))
+            launch,
+            restart_failures: 0,
+            next_restart_at: None,
+        })
+    }
+
+    async fn initialize_protocol(&mut self) -> Result<(), String> {
+        let init_req = json!({
+            "jsonrpc": "2.0",
+            "id": "dt-init",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": DEVTOOLS_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": DEVTOOLS_CLIENT_NAME,
+                    "version": DEVTOOLS_CLIENT_VERSION
+                }
+            }
+        });
+        self.request(&init_req).await?;
+        self.notify(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .await
+    }
+
+    pub fn is_connected(&self) -> bool {
+        !self.pending.lock().unwrap().closed
+    }
+
+    fn record_restart_failure(&mut self) {
+        self.restart_failures = self.restart_failures.saturating_add(1);
+        self.next_restart_at = Some(Instant::now() + restart_backoff(self.restart_failures));
+        crate::diagnostics::event("devtools_restart_failed");
+    }
+
+    async fn restart(&mut self) -> Result<(), String> {
+        let Some(launch) = self.launch.clone() else {
+            return Err("DevTools process disconnected; this bridge cannot be restarted automatically.".into());
+        };
+        if let Some(next) = self.next_restart_at {
+            if let Some(remaining) = next.checked_duration_since(Instant::now()) {
+                return Err(format!(
+                    "DevTools is reconnecting; retry after {} ms",
+                    remaining.as_millis()
+                ));
+            }
+        }
+
+        let child = match launch.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.record_restart_failure();
+                return Err(error);
+            }
+        };
+        let mut replacement = match Self::from_child_inner(child, Some(launch)) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                self.record_restart_failure();
+                return Err(error);
+            }
+        };
+        if let Err(error) = replacement.initialize_protocol().await {
+            self.record_restart_failure();
+            return Err(format!("Failed to reinitialize DevTools bridge: {error}"));
+        }
+
+        let old = std::mem::replace(self, replacement);
+        drop(old);
+        crate::diagnostics::event("devtools_restarted");
+        Ok(())
     }
 
     /// Send a JSON-RPC request and wait for the response.
@@ -342,6 +435,17 @@ mod tests {
         DevtoolsBridge::from_child(child).unwrap()
     }
 
+    fn restartable_peer(script: &str) -> Arc<Mutex<DevtoolsBridge>> {
+        let launch = LaunchSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+        };
+        let child = launch.spawn().unwrap();
+        Arc::new(Mutex::new(
+            DevtoolsBridge::from_child_inner(child, Some(launch)).unwrap(),
+        ))
+    }
+
     #[tokio::test]
     async fn peer_exit_fails_pending_request_promptly() {
         let bridge = peer("read line; exit 0");
@@ -397,15 +501,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_lock_has_a_bounded_wait() {
-        let bridge = peer("while read line; do :; done");
-        let _busy = bridge.lock().await;
-        let request = json!({"id": 1, "method": "ping"});
-        let result = tokio::time::timeout(
+    async fn next_call_restarts_a_disconnected_bridge_without_replaying_failed_work() {
+        let marker = std::env::temp_dir().join(format!("catdesk-devtools-restart-{}", uuid::Uuid::new_v4()));
+        let script = format!(
+            "if [ ! -f '{marker}' ]; then touch '{marker}'; read line; exit 0; else while IFS= read -r line; do printf '%s\\n' \"$line\"; done; fi",
+            marker = marker.display()
+        );
+        let bridge = restartable_peer(&script);
+
+        let first = json!({"id": "first", "method": "side-effectful"});
+        assert!(DevtoolsBridge::call(&bridge, &first).await.is_err());
+        assert!(!bridge.lock().await.is_connected());
+
+        let second = json!({"id": "second", "method": "ping"});
+        let response = tokio::time::timeout(
             Duration::from_secs(3),
-            DevtoolsBridge::call(&bridge, &request),
+            DevtoolsBridge::call(&bridge, &second),
         )
-        .await;
-        assert!(matches!(result, Ok(Err(_))));
+        .await
+        .expect("automatic restart timed out")
+        .expect("automatic restart failed");
+        assert_eq!(response["id"], "second");
+        assert!(bridge.lock().await.is_connected());
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn restart_backoff_is_bounded() {
+        assert!(restart_backoff(1) >= Duration::from_millis(RESTART_BACKOFF_BASE_MS));
+        assert!(restart_backoff(100) <= Duration::from_millis(RESTART_BACKOFF_MAX_MS));
+    }
+
+    #[tokio::test]
+    async fn browser_calls_queue_behind_the_serial_bridge_instead_of_failing_busy() {
+        let bridge = peer("while IFS= read -r line; do printf '%s\\n' \"$line\"; done");
+        let busy = bridge.lock().await;
+        let request = json!({"id": 1, "method": "ping"});
+        let queued_bridge = bridge.clone();
+        let queued = tokio::spawn(async move { DevtoolsBridge::call(&queued_bridge, &request).await });
+
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        assert!(
+            !queued.is_finished(),
+            "temporary DevTools serialization must queue instead of returning Busy"
+        );
+        drop(busy);
+
+        let response = tokio::time::timeout(Duration::from_secs(2), queued)
+            .await
+            .expect("queued DevTools call did not resume")
+            .expect("queued task panicked")
+            .expect("queued DevTools call failed");
+        assert_eq!(response["id"], 1);
     }
 }
