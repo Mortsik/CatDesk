@@ -68,6 +68,85 @@ pub fn clamp_timeout(t: Option<u64>) -> u64 {
     }
 }
 
+const MAX_SYMLINK_RESOLUTION_DEPTH: usize = 40;
+
+fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, String> {
+    canonicalize_allow_missing_inner(path, 0).map(normalize_windows_verbatim_path)
+}
+
+fn canonicalize_allow_missing_inner(path: &Path, symlink_depth: usize) -> Result<PathBuf, String> {
+    if symlink_depth > MAX_SYMLINK_RESOLUTION_DEPTH {
+        return Err(format!(
+            "Too many symbolic links while resolving path: {}",
+            path.display()
+        ));
+    }
+
+    let mut current = path.to_path_buf();
+    let mut unresolved = Vec::new();
+    loop {
+        match current.canonicalize() {
+            Ok(mut resolved) => {
+                for component in unresolved.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(&current)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    let link_target = std::fs::read_link(&current).map_err(|read_error| {
+                        format!(
+                            "Failed to read symbolic link {}: {read_error}",
+                            current.display()
+                        )
+                    })?;
+                    let link_target = if link_target.is_absolute() {
+                        link_target
+                    } else {
+                        current
+                            .parent()
+                            .ok_or_else(|| {
+                                format!(
+                                    "Failed to resolve symbolic link parent: {}",
+                                    current.display()
+                                )
+                            })?
+                            .join(link_target)
+                    };
+                    let mut resolved =
+                        canonicalize_allow_missing_inner(&link_target, symlink_depth + 1)?;
+                    for component in unresolved.iter().rev() {
+                        resolved.push(component);
+                    }
+                    return Ok(resolved);
+                }
+
+                let file_name = current.file_name().ok_or_else(|| {
+                    format!(
+                        "Failed to resolve missing path component: {} ({error})",
+                        current.display()
+                    )
+                })?;
+                unresolved.push(file_name.to_os_string());
+                current = current
+                    .parent()
+                    .ok_or_else(|| {
+                        format!(
+                            "Failed to resolve parent of missing path: {}",
+                            current.display()
+                        )
+                    })?
+                    .to_path_buf();
+            }
+            Err(error) => {
+                return Err(format!("Failed to resolve {}: {error}", current.display()));
+            }
+        }
+    }
+}
+
 /// Resolve `input` relative to `workspace_root`, rejecting path traversal.
 pub fn resolve_workspace_path(
     workspace_root: &str,
@@ -85,7 +164,7 @@ pub fn resolve_workspace_path(
         root.join(input)
     };
 
-    let candidate = normalize_windows_verbatim_path(candidate.canonicalize().unwrap_or(candidate));
+    let candidate = canonicalize_allow_missing(&candidate)?;
     if !candidate.starts_with(&root) {
         return Err(format!(
             "Path escapes workspace root: {}",
@@ -113,7 +192,7 @@ pub fn resolve_command_path(
         cwd.join(input)
     };
 
-    let candidate = normalize_windows_verbatim_path(candidate.canonicalize().unwrap_or(candidate));
+    let candidate = canonicalize_allow_missing(&candidate)?;
     if !candidate.starts_with(&root) {
         return Err(format!(
             "Path escapes workspace root: {}",
@@ -982,6 +1061,50 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_path_rejects_missing_child_beneath_external_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace_root = test_workspace("resolve-symlink-escape");
+        let external_root = test_workspace("resolve-symlink-external");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&external_root).expect("create external root");
+        symlink(&external_root, workspace_root.join("outside")).expect("create external symlink");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let error = resolve_workspace_path(&workspace_root_str, Some("outside/new-file.txt"))
+            .expect_err("missing child below external symlink must be rejected");
+
+        assert!(error.contains("Path escapes workspace root"), "{error}");
+        let _ = std::fs::remove_file(workspace_root.join("outside"));
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(external_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_path_rejects_dangling_external_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let workspace_root = test_workspace("resolve-dangling-escape");
+        let external_root = test_workspace("resolve-dangling-external");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&external_root).expect("create external root");
+        let external_target = external_root.join("not-created-yet.txt");
+        symlink(&external_target, workspace_root.join("outside-file"))
+            .expect("create dangling external symlink");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let error = resolve_workspace_path(&workspace_root_str, Some("outside-file"))
+            .expect_err("dangling external symlink target must be rejected");
+
+        assert!(error.contains("Path escapes workspace root"), "{error}");
+        let _ = std::fs::remove_file(workspace_root.join("outside-file"));
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(external_root);
     }
 
     #[tokio::test]
