@@ -3680,6 +3680,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_mcp_usage_does_not_persist_config_on_hot_path() {
+        let workspace_root = unique_temp_path("catdesk-post-mcp-usage-hot-path-workspace");
+        let config_root = unique_temp_path("catdesk-post-mcp-usage-hot-path-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+        std::fs::write(workspace_root.join("hello.txt"), "hello world\n").expect("write file");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let server_state = ServerState {
+            app: app_state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
+        };
+
+        let response = post_mcp(
+            State(server_state.clone()),
+            tool_call_body("read", json!({ "paths": ["hello.txt"] })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let app = app_state.lock().await;
+        assert_eq!(app.all_time_usage_totals().tool_call_count, 1);
+        drop(app);
+        assert!(
+            !config_path.exists(),
+            "usage accounting must not durably rewrite config.toml on the request hot path"
+        );
+
+        drop(server_state);
+        drop(app_state);
+        let _ = std::fs::remove_file(workspace_root.join("hello.txt"));
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
+    async fn post_mcp_usage_is_persisted_after_the_hot_path_returns() {
+        let workspace_root = unique_temp_path("catdesk-post-mcp-usage-deferred-workspace");
+        let config_root = unique_temp_path("catdesk-post-mcp-usage-deferred-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+        std::fs::write(workspace_root.join("hello.txt"), "hello world\n").expect("write file");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let server_state = ServerState {
+            app: app_state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: InstructionGate::with_anonymous(true),
+        };
+
+        let response = post_mcp(
+            State(server_state.clone()),
+            tool_call_body("read", json!({ "paths": ["hello.txt"] })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!config_path.exists(), "deferred persistence wrote synchronously");
+
+        for _ in 0..100 {
+            if config_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(config_path.exists(), "deferred usage persistence never wrote config.toml");
+
+        let reloaded = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload persisted app state");
+        assert_eq!(reloaded.all_time_usage_totals().tool_call_count, 1);
+        assert!(reloaded.all_time_usage_totals().total_tokens > 0);
+        drop(reloaded);
+
+        drop(server_state);
+        drop(app_state);
+        let _ = std::fs::remove_file(workspace_root.join("hello.txt"));
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
     async fn post_mcp_accumulates_usage_from_widget_payload_meta() {
         let workspace_root = unique_temp_path("catdesk-post-mcp-workspace");
         let config_root = unique_temp_path("catdesk-post-mcp-config");
@@ -4074,12 +4181,12 @@ async fn post_mcp_inner(
                 let mut app = s.app.lock().await;
                 if let Some((tool_input_tokens, tool_output_tokens)) = turn_token_usage {
                     app.record_turn_usage(tool_input_tokens, tool_output_tokens);
+                    app.schedule_usage_persistence();
                     let _ = s.ui_events.try_send(ServerUiEvent::RecordTurnUsage {
                         flow_id: flow_id.clone(),
                         tool_input_tokens,
                         tool_output_tokens,
                     });
-                    app.persist_state_with_log();
                 }
                 app.all_time_usage_totals()
             };

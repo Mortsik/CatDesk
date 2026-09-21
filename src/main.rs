@@ -24,6 +24,7 @@ mod session_context;
 mod startup;
 mod state;
 mod theme;
+mod usage_persistence;
 mod vision;
 mod workspace_tools;
 
