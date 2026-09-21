@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -143,6 +143,7 @@ struct CommandJob {
     timeout_ms: u64,
     abandon_after_ms: u64,
     change_session: Option<ChangeSession>,
+    final_changes: OnceLock<Vec<FileChange>>,
     store: JobStore,
     runtime: Mutex<JobRuntime>,
     // Heartbeat for idle reaping: the most recent poll_command instant. A
@@ -190,6 +191,7 @@ impl CommandJob {
                 timeout_ms,
                 abandon_after_ms,
                 change_session,
+                final_changes: OnceLock::new(),
                 store,
                 runtime: Mutex::new(JobRuntime::default()),
                 last_poll: std::sync::Mutex::new(Instant::now()),
@@ -258,6 +260,7 @@ impl CommandJob {
             timeout_ms: record.timeout_ms,
             abandon_after_ms: DEFAULT_ABANDON_AFTER_MS,
             change_session: None,
+            final_changes: OnceLock::new(),
             store,
             runtime: Mutex::new(JobRuntime {
                 state,
@@ -639,11 +642,13 @@ impl CommandJobManager {
     ) -> Result<Vec<FileChange>, String> {
         self.cleanup().await;
         let job = self.get_job_for_session(job_id, owner_session).await?;
-        Ok(job
-            .change_session
-            .as_ref()
-            .map(ChangeSession::changes)
-            .unwrap_or_default())
+        if !job.snapshot(0).await.state.is_terminal() {
+            return Ok(Vec::new());
+        }
+        let Some(session) = job.change_session.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(job.final_changes.get_or_init(|| session.changes()).clone())
     }
 
     #[cfg(test)]
@@ -1095,6 +1100,7 @@ async fn run_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change_tracking::{ChangeScope, ChangeTarget};
 
     fn workspace(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("catdesk-jobs-{name}-{}", Uuid::new_v4()));
@@ -1380,6 +1386,67 @@ mod tests {
         assert_eq!(records[0].state, CommandJobState::Cancelled);
         assert_eq!(records[0].exit_code, Some(EXIT_CODE_CANCELLED));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn background_change_report_is_deferred_and_cached_until_terminal() {
+        let root = workspace("deferred-changes");
+        let session = ChangeSession::begin(
+            &root,
+            ChangeScope::single(ChangeTarget::explicit(root.clone(), true)),
+        );
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 500"
+        } else {
+            "sleep 0.5"
+        };
+        let manager = CommandJobManager::new();
+        let started = manager
+            .start_with_change_session(
+                command.into(),
+                root.clone(),
+                root.clone(),
+                5_000,
+                None,
+                Some(session),
+                None,
+            )
+            .await
+            .expect("start job");
+
+        std::fs::write(root.join("created.txt"), "created\n").expect("create file");
+        let running = manager
+            .current_changes(&started.snapshot.job_id)
+            .await
+            .expect("running changes");
+        assert!(
+            running.is_empty(),
+            "running jobs must defer recursive change scans until terminal"
+        );
+
+        let terminal = wait_terminal(&manager, &started.snapshot.job_id).await;
+        assert!(terminal.state.is_terminal());
+        let first = manager
+            .current_changes(&started.snapshot.job_id)
+            .await
+            .expect("terminal changes");
+        assert!(first.iter().any(|file| file.path == "created.txt"));
+        let second = manager
+            .current_changes(&started.snapshot.job_id)
+            .await
+            .expect("cached changes");
+        assert_eq!(
+            first
+                .iter()
+                .map(|file| (&file.path, &file.status, file.added, file.removed, &file.diff))
+                .collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|file| (&file.path, &file.status, file.added, file.removed, &file.diff))
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -1,10 +1,11 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::SystemTime;
 use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::Mutex;
 
@@ -19,7 +20,7 @@ use crate::handoff;
 use crate::mascot;
 use crate::project_scope;
 use crate::state::{
-    AgentsPathMode, Mode, ShowDetailMode, TokenStatsLayout, ToolMode, WidgetCornerStyle,
+    AgentsPathMode, AppConfig, Mode, ShowDetailMode, TokenStatsLayout, ToolMode, WidgetCornerStyle,
     app_config_path, load_app_config, user_home_dir,
 };
 use crate::vision;
@@ -37,6 +38,9 @@ const CATDESK_WIDGET_HTML: &str = include_str!("widget/catdesk_dashboard.html");
 const REENABLE_WIDGET_PNG: &[u8] = include_bytes!("widget/assets/reenable_widget.png");
 const REFRESH_CATDESK_PNG: &[u8] = include_bytes!("widget/assets/refresh_catdesk.png");
 const REMOVE_CATDESK_PNG: &[u8] = include_bytes!("widget/assets/remove_catdesk.png");
+static REENABLE_WIDGET_IMAGE: OnceLock<String> = OnceLock::new();
+static REFRESH_CATDESK_IMAGE: OnceLock<String> = OnceLock::new();
+static REMOVE_CATDESK_IMAGE: OnceLock<String> = OnceLock::new();
 const WIDGET_RESOURCE_URI_PLACEHOLDER: &str = "__catdeskWidgetResourceUriPlaceholder__";
 const REENABLE_WIDGET_IMAGE_PLACEHOLDER: &str = "__catdeskReenableWidgetImageDataUriPlaceholder__";
 const REFRESH_CATDESK_IMAGE_PLACEHOLDER: &str = "__catdeskRefreshCatdeskImageDataUriPlaceholder__";
@@ -412,27 +416,29 @@ fn initial_tool_name_from_resource_uri(resource_uri: &str) -> &str {
     query_param_value(resource_uri, "toolName").unwrap_or_default()
 }
 
+fn cached_data_uri<'a>(cache: &'a OnceLock<String>, bytes: &[u8]) -> &'a str {
+    cache
+        .get_or_init(|| {
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        })
+        .as_str()
+}
+
 fn render_widget_html(resource_uri: &str, mascot_seed: u64) -> String {
     let initial_mascot_outline =
         serde_json::to_string(&mascot::build_widget_mascot_outline(mascot_seed))
             .unwrap_or_else(|_| "{}".to_string());
-    let reenable_widget_image = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(REENABLE_WIDGET_PNG)
-    );
-    let refresh_catdesk_image = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(REFRESH_CATDESK_PNG)
-    );
-    let remove_catdesk_image = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(REMOVE_CATDESK_PNG)
-    );
+    let reenable_widget_image = cached_data_uri(&REENABLE_WIDGET_IMAGE, REENABLE_WIDGET_PNG);
+    let refresh_catdesk_image = cached_data_uri(&REFRESH_CATDESK_IMAGE, REFRESH_CATDESK_PNG);
+    let remove_catdesk_image = cached_data_uri(&REMOVE_CATDESK_IMAGE, REMOVE_CATDESK_PNG);
     CATDESK_WIDGET_HTML
         .replace(WIDGET_RESOURCE_URI_PLACEHOLDER, resource_uri)
-        .replace(REENABLE_WIDGET_IMAGE_PLACEHOLDER, &reenable_widget_image)
-        .replace(REFRESH_CATDESK_IMAGE_PLACEHOLDER, &refresh_catdesk_image)
-        .replace(REMOVE_CATDESK_IMAGE_PLACEHOLDER, &remove_catdesk_image)
+        .replace(REENABLE_WIDGET_IMAGE_PLACEHOLDER, reenable_widget_image)
+        .replace(REFRESH_CATDESK_IMAGE_PLACEHOLDER, refresh_catdesk_image)
+        .replace(REMOVE_CATDESK_IMAGE_PLACEHOLDER, remove_catdesk_image)
         .replace(
             INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER,
             current_token_stats_layout().as_str(),
@@ -2214,6 +2220,77 @@ fn codex_agents_path() -> PathBuf {
         .join("AGENTS.md")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FileStamp {
+    Missing,
+    Present { len: u64, modified: SystemTime },
+}
+
+fn file_stamp(path: &Path) -> std::io::Result<FileStamp> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(FileStamp::Present {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileStamp::Missing),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone)]
+struct CachedFileValue<T> {
+    stamp: FileStamp,
+    value: T,
+}
+
+const MAX_METADATA_CACHE_ENTRIES: usize = 128;
+
+fn cached_file_value<T: Clone>(
+    cache: &StdMutex<HashMap<PathBuf, CachedFileValue<T>>>,
+    path: &Path,
+    load: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let stamp = match file_stamp(path) {
+        Ok(stamp) => stamp,
+        Err(_) => return load(),
+    };
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = guard.get(path).filter(|entry| entry.stamp == stamp) {
+            return Ok(entry.value.clone());
+        }
+    }
+
+    let value = load()?;
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.len() >= MAX_METADATA_CACHE_ENTRIES && !guard.contains_key(path) {
+        guard.clear();
+    }
+    guard.insert(
+        path.to_path_buf(),
+        CachedFileValue {
+            stamp,
+            value: value.clone(),
+        },
+    );
+    Ok(value)
+}
+
+static APP_CONFIG_CACHE: OnceLock<StdMutex<HashMap<PathBuf, CachedFileValue<AppConfig>>>> =
+    OnceLock::new();
+static AGENTS_TEXT_CACHE: OnceLock<StdMutex<HashMap<PathBuf, CachedFileValue<Option<String>>>>> =
+    OnceLock::new();
+
+fn cached_app_config() -> std::io::Result<AppConfig> {
+    let path = app_config_path()?;
+    let cache = APP_CONFIG_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+    cached_file_value(cache, &path, load_app_config)
+}
+
 #[derive(Clone)]
 struct AgentsOptionState {
     path: PathBuf,
@@ -2244,7 +2321,7 @@ fn agents_option_state(path: PathBuf) -> AgentsOptionState {
 }
 
 fn agents_widget_state(workspace_root: &str) -> std::io::Result<AgentsWidgetState> {
-    let mode = load_app_config()?.agents_path_mode;
+    let mode = cached_app_config()?.agents_path_mode;
     let workspace = agents_option_state(workspace_agents_path(workspace_root));
     let catdesk = agents_option_state(catdesk_agents_path()?);
     let codex = agents_option_state(codex_agents_path());
@@ -2314,14 +2391,21 @@ pub(crate) fn agents_widget_state_payload(workspace_root: &str) -> std::io::Resu
     }))
 }
 
-fn read_agents_text(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+fn read_agents_text_result(path: &Path) -> std::io::Result<Option<String>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let trimmed = content.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+}
+
+fn cached_agents_text(path: &Path) -> Option<String> {
+    let cache = AGENTS_TEXT_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+    cached_file_value(cache, path, || read_agents_text_result(path))
+        .ok()
+        .flatten()
 }
 
 fn display_path_with_tilde(path: &Path) -> String {
@@ -2393,7 +2477,7 @@ fn instruction_agents_layers(
             continue;
         }
         seen.push(identity);
-        if let Some(text) = read_agents_text(&path) {
+        if let Some(text) = cached_agents_text(&path) {
             layers.push((label, text));
         }
     }
@@ -2518,6 +2602,7 @@ fn catdesk_instruction_structured(
     catdesk_instruction_structured_for_project(workspace_root, mode, tool_mode, None)
 }
 
+#[cfg(test)]
 fn catdesk_instruction_structured_for_project(
     workspace_root: &str,
     mode: Mode,
@@ -2526,10 +2611,14 @@ fn catdesk_instruction_structured_for_project(
 ) -> std::io::Result<Value> {
     let instruction_text =
         catdesk_instruction_text_for_project(workspace_root, mode, tool_mode, active_project)?;
-    Ok(json!({
+    Ok(catdesk_instruction_structured_from_text(&instruction_text))
+}
+
+fn catdesk_instruction_structured_from_text(instruction_text: &str) -> Value {
+    json!({
         "toolName": "catdesk_instruction",
         "instructionText": instruction_text,
-    }))
+    })
 }
 
 fn catdesk_instruction_widget_payload_with_cards(
@@ -2625,20 +2714,7 @@ fn handle_catdesk_instruction_with_show_detail_mode(
             );
         }
     };
-    let structured = match catdesk_instruction_structured_for_project(
-        workspace_root,
-        mode,
-        tool_mode,
-        active_project,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return tool_error_response(
-                req,
-                format!("Failed to resolve AGENTS.md configuration: {error}"),
-            );
-        }
-    };
+    let structured = catdesk_instruction_structured_from_text(&instruction_text);
     let mut response = tool_success_response_with_structured(req, instruction_text, structured);
     if show_detail_mode == ShowDetailMode::Disable {
         return response;
@@ -3011,13 +3087,13 @@ fn base_widget_payload_with_show_detail_mode(
 }
 
 fn current_token_stats_layout() -> TokenStatsLayout {
-    load_app_config()
+    cached_app_config()
         .map(|config| config.token_stats_layout)
         .unwrap_or_default()
 }
 
 fn current_widget_corner_style() -> WidgetCornerStyle {
-    load_app_config()
+    cached_app_config()
         .map(|config| config.widget_corner_style)
         .unwrap_or_default()
 }
@@ -4306,6 +4382,46 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_widget_image_encoding_is_reused() {
+        let cache = OnceLock::new();
+        let first = cached_data_uri(&cache, b"static-png");
+        let second = cached_data_uri(&cache, b"static-png");
+
+        assert_eq!(first, second);
+        assert!(std::ptr::eq(first, second), "cached URI must reuse one allocation");
+    }
+
+    #[test]
+    fn metadata_cache_reuses_unchanged_value_and_reloads_after_file_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "catdesk-mcp-metadata-cache-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create cache test root");
+        let path = root.join("value.txt");
+        std::fs::write(&path, "one").expect("write first value");
+        let cache = std::sync::Mutex::new(HashMap::new());
+        let loads = std::cell::Cell::new(0usize);
+        let load = || {
+            loads.set(loads.get() + 1);
+            std::fs::read_to_string(&path)
+        };
+
+        assert_eq!(cached_file_value(&cache, &path, load).unwrap(), "one");
+        assert_eq!(cached_file_value(&cache, &path, load).unwrap(), "one");
+        assert_eq!(loads.get(), 1, "unchanged file should reuse cached value");
+
+        std::fs::write(&path, "three-three").expect("rewrite cached value");
+        assert_eq!(
+            cached_file_value(&cache, &path, load).unwrap(),
+            "three-three"
+        );
+        assert_eq!(loads.get(), 2, "metadata change must invalidate cache");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn workspace_root_command_scope_skips_recursive_change_tracking() {

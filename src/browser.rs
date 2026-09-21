@@ -171,12 +171,52 @@ fn resolve_binary(binary: &str) -> Option<PathBuf> {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    if let Some(candidate) = resolve_windows_application_binary(binary) {
+        return Some(candidate);
+    }
+
     #[cfg(target_os = "macos")]
     if let Some(candidate) = resolve_macos_application_binary(binary) {
         return Some(candidate);
     }
 
     None
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_application_binary(binary: &str) -> Option<PathBuf> {
+    let roots = ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"]
+        .into_iter()
+        .filter_map(|name| std::env::var_os(name).map(PathBuf::from));
+
+    find_existing_windows_application_binary(binary, roots)
+}
+
+#[cfg(target_os = "windows")]
+fn find_existing_windows_application_binary<I>(binary: &str, roots: I) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let relative = windows_application_binary_relative_path(binary)?;
+    roots
+        .into_iter()
+        .map(|root| root.join(relative))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_application_binary_relative_path(binary: &str) -> Option<&'static str> {
+    match binary {
+        "google-chrome-stable" | "google-chrome" => {
+            Some(r"Google\Chrome\Application\chrome.exe")
+        }
+        "microsoft-edge-stable" | "microsoft-edge" => {
+            Some(r"Microsoft\Edge\Application\msedge.exe")
+        }
+        "brave-browser" => Some(r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -455,6 +495,31 @@ pub fn format_active_remote_debug_names(browsers: &[DetectedBrowser]) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_application_paths_cover_supported_chromium_browsers() {
+        assert_eq!(
+            windows_application_binary_relative_path("google-chrome"),
+            Some(r"Google\Chrome\Application\chrome.exe")
+        );
+        assert_eq!(
+            windows_application_binary_relative_path("google-chrome-stable"),
+            Some(r"Google\Chrome\Application\chrome.exe")
+        );
+        assert_eq!(
+            windows_application_binary_relative_path("microsoft-edge"),
+            Some(r"Microsoft\Edge\Application\msedge.exe")
+        );
+        assert_eq!(
+            windows_application_binary_relative_path("microsoft-edge-stable"),
+            Some(r"Microsoft\Edge\Application\msedge.exe")
+        );
+        assert_eq!(
+            windows_application_binary_relative_path("brave-browser"),
+            Some(r"BraveSoftware\Brave-Browser\Application\brave.exe")
+        );
+        assert_eq!(windows_application_binary_relative_path("firefox"), None);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
