@@ -20,7 +20,7 @@ use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::project_scope;
-use crate::request_workers::{RequestClass, RequestScheduler};
+use crate::request_workers::{RequestClass, global_request_scheduler};
 use crate::session_context::{ProjectStateChange, SessionContextStore};
 use crate::state::{
     AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
@@ -494,6 +494,19 @@ fn request_deadline(class: RequestClass) -> StdDuration {
         }
         RequestClass::General => StdDuration::from_secs(60),
     }
+}
+
+fn request_scheduling_key(
+    session: &ClientSession,
+    gate: &InstructionGate,
+) -> crate::fair_queue::SchedulingKey {
+    let project = gate
+        .active_project(session)
+        .map(|path| path.to_string_lossy().into_owned());
+    crate::fair_queue::SchedulingKey::new(
+        session.namespace().unwrap_or(session.flow_id.as_str()),
+        project.as_deref(),
+    )
 }
 
 fn request_failure_event(
@@ -1530,6 +1543,18 @@ mod tests {
             let body: Value = serde_json::from_slice(&body).expect("parse test request");
             assert_eq!(request_class(&body), expected, "unexpected class for {body}");
         }
+    }
+
+    #[test]
+    fn scheduling_key_uses_named_session_and_active_project() {
+        let body = tool_call_body("read", json!({ "paths": ["x"] }));
+        let session = ClientSession::from_headers(&modern_mcp_headers_for_session(&body, "session-a"));
+        let gate = InstructionGate::with_anonymous(false);
+        gate.set_active_project(&session, std::path::PathBuf::from("/workspace/project-a"));
+
+        let key = request_scheduling_key(&session, &gate);
+        assert_eq!(key.session, "session-a");
+        assert_eq!(key.project.as_deref(), Some("/workspace/project-a"));
     }
 
     #[test]
@@ -3897,12 +3922,13 @@ async fn post_mcp_http(
         .as_ref()
         .map(request_class)
         .unwrap_or(RequestClass::General);
+    let client_session = ClientSession::from_headers(&headers);
+    let scheduling_key = request_scheduling_key(&client_session, &s.catdesk_instruction_called);
     let id = metadata.and_then(|v| v.get("id").cloned());
-    static SCHEDULER: std::sync::LazyLock<RequestScheduler> =
-        std::sync::LazyLock::new(RequestScheduler::new);
-    match SCHEDULER
-        .run(
+    match global_request_scheduler()
+        .run_keyed(
             class,
+            scheduling_key,
             async move { post_mcp_inner(State(s), body_bytes, &headers, None).await },
             request_deadline(class),
         )
