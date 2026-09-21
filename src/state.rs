@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset};
@@ -11,6 +12,7 @@ use uuid::Uuid;
 
 use crate::browser::DetectedBrowser;
 use crate::command_jobs::CommandJobManager;
+use crate::usage_persistence::UsagePersistence;
 
 // UI telemetry is best-effort. A stalled terminal must not grow an unbounded
 // queue of request events in memory or block the server trying to publish them.
@@ -699,6 +701,7 @@ pub struct AppState {
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
     usage_rate_samples: VecDeque<UsageRateSample>,
+    usage_persistence: UsagePersistence,
     pub command_jobs: CommandJobManager,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -775,6 +778,24 @@ where
     let mut config = AppConfig::load_from_path(path)?;
     update(&mut config);
     config.save_to_path(path)
+}
+
+pub(crate) fn persist_usage_by_model_at_path_if_current(
+    path: &Path,
+    usage_by_model: BTreeMap<String, UsageTotals>,
+    expected_generation: u64,
+    current_generation: &AtomicU64,
+) -> std::io::Result<bool> {
+    let _guard = APP_CONFIG_IO_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if current_generation.load(AtomicOrdering::Acquire) != expected_generation {
+        return Ok(false);
+    }
+    let mut config = AppConfig::load_from_path(path)?;
+    config.usage_by_model = usage_by_model;
+    config.save_to_path(path)?;
+    Ok(true)
 }
 
 pub fn save_ngrok_authtoken(token: &str) -> std::io::Result<PathBuf> {
@@ -1073,6 +1094,7 @@ impl AppState {
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
             usage_rate_samples: VecDeque::new(),
+            usage_persistence: UsagePersistence::new(config_path.clone()),
             command_jobs: crate::job_store::JobStore::default_dir()
                 .map(CommandJobManager::with_store)
                 .unwrap_or_else(CommandJobManager::new),
@@ -1141,10 +1163,17 @@ impl AppState {
     }
 
     pub fn persist_state(&self) -> std::io::Result<()> {
-        let _guard = APP_CONFIG_IO_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.app_config()?.save_to_path(&self.config_path)
+        self.usage_persistence.supersede_pending();
+        let result = (|| -> std::io::Result<()> {
+            let _guard = APP_CONFIG_IO_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.app_config()?.save_to_path(&self.config_path)
+        })();
+        if result.is_err() {
+            self.usage_persistence.schedule(self.usage_by_model.clone());
+        }
+        result
     }
 
     pub fn persist_state_with_log(&mut self) {
@@ -1163,6 +1192,10 @@ impl AppState {
 
     pub fn record_turn_usage(&mut self, tool_input_tokens: u64, tool_output_tokens: u64) {
         self.record_turn_usage_at(tool_input_tokens, tool_output_tokens, now_unix_millis());
+    }
+
+    pub fn schedule_usage_persistence(&self) {
+        self.usage_persistence.schedule(self.usage_by_model.clone());
     }
 
     fn record_turn_usage_at(
@@ -2195,6 +2228,114 @@ toolCallCount = 0
                 .turn_usage
                 .is_none()
         );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn deferred_usage_coalesces_latest_totals_and_preserves_other_config_fields() {
+        let (mut app, workspace, config_path) = test_app("catdesk-usage-coalescing");
+        app.persist_state().expect("seed config");
+
+        for _ in 0..8 {
+            app.record_turn_usage(10, 2);
+            app.schedule_usage_persistence();
+        }
+        update_app_config_at_path(&config_path, |config| {
+            config.agents_path_mode = AgentsPathMode::Codex;
+        })
+        .expect("persist independent config update");
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let saved = AppConfig::load_from_path(&config_path).expect("load coalesced config");
+        assert!(matches!(saved.agents_path_mode, AgentsPathMode::Codex));
+        let usage = saved
+            .usage_by_model
+            .get(CURRENT_USAGE_BUCKET)
+            .expect("missing deferred usage bucket");
+        assert_eq!(usage.tool_input_tokens, 80);
+        assert_eq!(usage.tool_output_tokens, 16);
+        assert_eq!(usage.tool_call_count, 8);
+        drop(app);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn full_state_persist_supersedes_older_pending_usage_snapshot() {
+        let (mut app, workspace, config_path) = test_app("catdesk-usage-full-persist-ordering");
+        app.record_turn_usage(100, 25);
+        app.schedule_usage_persistence();
+
+        app.usage_by_model.clear();
+        app.persist_state().expect("persist reset usage state");
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        let saved = AppConfig::load_from_path(&config_path).expect("reload config after deferred writer");
+        assert!(
+            saved.usage_by_model.is_empty(),
+            "an older deferred usage snapshot must not overwrite a newer full config persist"
+        );
+        drop(app);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn failed_full_state_persist_requeues_latest_usage_for_shutdown_flush() {
+        let (mut app, workspace, config_path) = test_app("catdesk-usage-full-persist-retry");
+        app.record_turn_usage(77, 11);
+        app.schedule_usage_persistence();
+        std::fs::write(&config_path, "this is not valid = [toml").expect("write invalid config");
+
+        assert!(app.persist_state().is_err(), "invalid config should make full persistence fail");
+        AppConfig::default()
+            .save_to_path(&config_path)
+            .expect("repair config before shutdown");
+        drop(app);
+
+        let reloaded = AppState::from_config_path(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload repaired config");
+        let usage = reloaded.all_time_usage_totals();
+        assert_eq!(usage.tool_input_tokens, 77);
+        assert_eq!(usage.tool_output_tokens, 11);
+        assert_eq!(usage.tool_call_count, 1);
+        drop(reloaded);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn usage_persistence_flushes_pending_snapshot_on_app_state_drop() {
+        let (mut app, workspace, config_path) = test_app("catdesk-usage-drop-flush");
+        app.record_turn_usage(100, 25);
+        app.schedule_usage_persistence();
+
+        drop(app);
+
+        assert!(
+            config_path.exists(),
+            "dropping AppState must flush pending usage before the persistence worker exits"
+        );
+        let reloaded = AppState::from_config_path(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload app state after usage flush");
+        let usage = reloaded.all_time_usage_totals();
+        assert_eq!(usage.tool_input_tokens, 100);
+        assert_eq!(usage.tool_output_tokens, 25);
+        assert_eq!(usage.tool_call_count, 1);
+        drop(reloaded);
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
