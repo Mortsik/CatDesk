@@ -63,7 +63,13 @@ const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
 const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
 const REMOTE_CONNECT_UI_GRACE_MS: u128 = 8_000;
 const UI_POLL_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+const UI_TIMED_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const UI_IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(1);
 const MCP_URL_REVEAL_DURATION: Duration = Duration::from_secs(10);
+
+fn redraw_due(dirty: bool, elapsed: Duration, interval: Option<Duration>) -> bool {
+    dirty || interval.is_some_and(|interval| elapsed >= interval)
+}
 const MCP_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓▓▓/mcp";
 const MCP_PATH_MASK: &str = "/▓▓▓▓▓▓▓▓/mcp";
 const NGROK_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓";
@@ -1420,12 +1426,15 @@ fn normalize_ngrok_authtoken_input(text: &str) -> String {
     trimmed.to_string()
 }
 
-fn drain_server_ui_events(app: &mut AppState, ui_events: &mut Receiver<ServerUiEvent>) {
+fn drain_server_ui_events(app: &mut AppState, ui_events: &mut Receiver<ServerUiEvent>) -> bool {
     // An ongoing request stream must not postpone keyboard handling forever.
+    let mut changed = false;
     for _ in 0..256 {
         let Ok(event) = ui_events.try_recv() else { break };
         app.apply_server_ui_event(event);
+        changed = true;
     }
+    changed
 }
 
 // ── Main ────────────────────────────────────────────────────
@@ -1615,15 +1624,21 @@ async fn run_app(
     state: SharedState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Draw mode selection screen
+    let mut redraw = true;
     loop {
         let (current_theme, current_tool_mode, current_ui_language) = {
             let app = state.lock().await;
             (app.current_theme(), app.tool_mode, app.ui_language)
         };
-        terminal
-            .draw(|f| draw_mode_select(f, current_theme, current_tool_mode, current_ui_language))?;
+        if redraw {
+            terminal.draw(|f| {
+                draw_mode_select(f, current_theme, current_tool_mode, current_ui_language)
+            })?;
+            redraw = false;
+        }
 
         if event::poll(UI_POLL_INTERVAL)? {
+            redraw = true;
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -2886,8 +2901,8 @@ mod tests {
         LogView, draw_chatgpt_connector_refresh_notice, draw_mode_select, draw_settings,
         draw_tui_header, draw_ui, export_logs_to_dir, key_is_clipboard_paste, localize_log_message,
         mask_mcp_path_in_log, normalize_ngrok_authtoken_input, pad_right_to_cell_width,
-        parse_terminal_profile_choice, terminal_cell_width, text_input_key_is_cancel, trim_line,
-        wrap_log_message,
+        parse_terminal_profile_choice, redraw_due, terminal_cell_width, text_input_key_is_cancel,
+        trim_line, wrap_log_message,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
@@ -2905,6 +2920,23 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn redraw_gate_skips_idle_frames_but_honors_dirty_and_timed_ticks() {
+        let elapsed = std::time::Duration::from_millis(40);
+        assert!(redraw_due(true, elapsed, None));
+        assert!(!redraw_due(false, elapsed, None));
+        assert!(!redraw_due(
+            false,
+            elapsed,
+            Some(std::time::Duration::from_millis(50))
+        ));
+        assert!(redraw_due(
+            false,
+            std::time::Duration::from_millis(50),
+            Some(std::time::Duration::from_millis(50))
+        ));
     }
 
     #[test]
@@ -3484,23 +3516,28 @@ async fn run_prompt(
     initial_value: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mut input = initial_value.to_string();
+    let mut redraw = true;
     loop {
-        terminal.draw(|f| {
-            let area = centered_rect(60, 20, f.area());
-            let block = Block::default()
-                .title(prompt_title)
-                .borders(Borders::ALL)
-                .border_type(ratatui::widgets::BorderType::Rounded)
-                .style(Style::default().fg(Color::Yellow));
+        if redraw {
+            terminal.draw(|f| {
+                let area = centered_rect(60, 20, f.area());
+                let block = Block::default()
+                    .title(prompt_title)
+                    .borders(Borders::ALL)
+                    .border_type(ratatui::widgets::BorderType::Rounded)
+                    .style(Style::default().fg(Color::Yellow));
 
-            let text = Paragraph::new(format!("> {}_", input))
-                .block(block)
-                .wrap(ratatui::widgets::Wrap { trim: true });
-            f.render_widget(ratatui::widgets::Clear, area);
-            f.render_widget(text, area);
-        })?;
+                let text = Paragraph::new(format!("> {}_", input))
+                    .block(block)
+                    .wrap(ratatui::widgets::Wrap { trim: true });
+                f.render_widget(ratatui::widgets::Clear, area);
+                f.render_widget(text, area);
+            })?;
+            redraw = false;
+        }
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+            redraw = true;
             let event = crossterm::event::read()?;
             match event {
                 crossterm::event::Event::Paste(text) => {
@@ -3547,6 +3584,7 @@ async fn run_settings(
     let total_rows =
         themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 4;
 
+    let mut redraw = true;
     loop {
         let (
             current_theme,
@@ -3570,24 +3608,28 @@ async fn run_settings(
                 app.ngrok_domain.clone(),
             )
         };
-        terminal.draw(|f| {
-            draw_settings(
-                f,
-                current_theme,
-                current_tool_mode,
-                current_show_detail_mode,
-                current_widget_corner_style,
-                current_ui_language,
-                set_catdesk_as_co_author,
-                &mcp_slug,
-                ngrok_domain.as_deref(),
-                &usage_totals,
-                selected_row,
-                confirm_reset_token_billing,
-            )
-        })?;
+        if redraw {
+            terminal.draw(|f| {
+                draw_settings(
+                    f,
+                    current_theme,
+                    current_tool_mode,
+                    current_show_detail_mode,
+                    current_widget_corner_style,
+                    current_ui_language,
+                    set_catdesk_as_co_author,
+                    &mcp_slug,
+                    ngrok_domain.as_deref(),
+                    &usage_totals,
+                    selected_row,
+                    confirm_reset_token_billing,
+                )
+            })?;
+            redraw = false;
+        }
 
         if event::poll(UI_POLL_INTERVAL)? {
+            redraw = true;
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -4272,6 +4314,7 @@ async fn run_browser_select(
         }
         selected_supported_browser_idx(&browsers, app.selected_browser.as_ref())
     };
+    let mut redraw = true;
     loop {
         let supported_indices: Vec<usize> = browsers
             .iter()
@@ -4290,18 +4333,22 @@ async fn run_browser_select(
             let app = state.lock().await;
             (app.current_theme(), app.ui_language)
         };
-        terminal.draw(|f| {
-            draw_browser_select(
-                f,
-                &browsers,
-                &supported_indices,
-                selected_supported_idx,
-                current_theme,
-                current_ui_language,
-            )
-        })?;
+        if redraw {
+            terminal.draw(|f| {
+                draw_browser_select(
+                    f,
+                    &browsers,
+                    &supported_indices,
+                    selected_supported_idx,
+                    current_theme,
+                    current_ui_language,
+                )
+            })?;
+            redraw = false;
+        }
 
         if event::poll(UI_POLL_INTERVAL)? {
+            redraw = true;
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -4987,104 +5034,144 @@ async fn run_tui(
     let mut mcp_url_revealed_until: Option<Instant> = None;
     let mut log_secret_revealed_until: HashMap<u64, Instant> = HashMap::new();
     let mut current_ui_language = UiLanguage::English;
+    let mut redraw_dirty = true;
+    let mut last_draw = Instant::now()
+        .checked_sub(UI_IDLE_REDRAW_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut last_frame_width = 0u16;
 
     loop {
+        if let Some((_, _, t)) = &toast {
+            if t.elapsed().as_secs() >= 2 {
+                toast = None;
+                redraw_dirty = true;
+            }
+        }
+
         // Persistence or another service may temporarily own the state. Keep
         // polling the keyboard against the last frame, especially the quit key.
         if let Ok(mut app) = state.try_lock() {
             current_ui_language = app.ui_language;
-            drain_server_ui_events(&mut app, &mut ui_events);
+            if drain_server_ui_events(&mut app, &mut ui_events) {
+                redraw_dirty = true;
+            }
+            let flow_count_before = app.flows.len();
             app.prune_closed_flows();
+            if app.flows.len() != flow_count_before {
+                redraw_dirty = true;
+            }
             let reveal_remaining = mcp_url_revealed_until
                 .and_then(|deadline| deadline.checked_duration_since(Instant::now()));
             if mcp_url_revealed_until.is_some() && reveal_remaining.is_none() {
                 mcp_url_revealed_until = None;
+                redraw_dirty = true;
             }
             let now = Instant::now();
+            let revealed_log_count = log_secret_revealed_until.len();
             log_secret_revealed_until
                 .retain(|_, deadline| deadline.checked_duration_since(now).is_some());
+            if log_secret_revealed_until.len() != revealed_log_count {
+                redraw_dirty = true;
+            }
             last_mcp_url = app.public_mcp_url();
             let toast_ref = toast
                 .as_ref()
                 .filter(|(_, _, t)| t.elapsed().as_secs() < 2)
                 .map(|(m, pos, _)| (*m, *pos));
-            let mut new_lines: Vec<String> = Vec::new();
-            let mut latest_log_view: Option<LogView> = None;
-            terminal.draw(|f| {
-                draw_ui(
-                    f,
-                    &app,
-                    log_scroll,
-                    log_follow_tail,
-                    &mut latest_log_view,
-                    toast_ref,
-                    reveal_remaining,
-                    &log_secret_revealed_until,
-                );
+            let has_flow_animation = app
+                .flows
+                .iter()
+                .any(|flow| !flow.anim_queue.is_empty() || flow.closing_started_ms.is_some());
+            let timed_overlay_active = reveal_remaining.is_some()
+                || !log_secret_revealed_until.is_empty()
+                || toast_ref.is_some();
+            let redraw_interval = if has_flow_animation {
+                UI_POLL_INTERVAL
+            } else if last_frame_width >= 120 && app.mascot.tui_frames.len() > 1 {
+                Duration::from_millis(app.mascot.frame_ms.max(1))
+            } else if timed_overlay_active {
+                UI_TIMED_REDRAW_INTERVAL
+            } else {
+                UI_IDLE_REDRAW_INTERVAL
+            };
 
-                if let Some(((c0, r0), (c1, r1))) = selection.range() {
-                    let palette = app.current_theme().palette;
-                    let area = f.area();
-                    for row in r0..=r1 {
-                        if row >= area.height {
-                            break;
-                        }
-                        let cs = if row == r0 { c0 } else { 0 };
-                        let ce = if row == r1 {
-                            c1
-                        } else {
-                            area.width.saturating_sub(1)
-                        };
-                        for col in cs..=ce {
-                            if col >= area.width {
+            if redraw_due(redraw_dirty, last_draw.elapsed(), Some(redraw_interval)) {
+                let mut new_lines: Vec<String> = Vec::new();
+                let mut latest_log_view: Option<LogView> = None;
+                terminal.draw(|f| {
+                    draw_ui(
+                        f,
+                        &app,
+                        log_scroll,
+                        log_follow_tail,
+                        &mut latest_log_view,
+                        toast_ref,
+                        reveal_remaining,
+                        &log_secret_revealed_until,
+                    );
+
+                    if let Some(((c0, r0), (c1, r1))) = selection.range() {
+                        let palette = app.current_theme().palette;
+                        let area = f.area();
+                        for row in r0..=r1 {
+                            if row >= area.height {
                                 break;
                             }
-                            if let Some(cell) = f.buffer_mut().cell_mut((col, row)) {
-                                cell.set_style(
-                                    Style::default()
-                                        .bg(palette.selection_bg)
-                                        .fg(palette.selection_fg),
-                                );
+                            let cs = if row == r0 { c0 } else { 0 };
+                            let ce = if row == r1 {
+                                c1
+                            } else {
+                                area.width.saturating_sub(1)
+                            };
+                            for col in cs..=ce {
+                                if col >= area.width {
+                                    break;
+                                }
+                                if let Some(cell) = f.buffer_mut().cell_mut((col, row)) {
+                                    cell.set_style(
+                                        Style::default()
+                                            .bg(palette.selection_bg)
+                                            .fg(palette.selection_fg),
+                                    );
+                                }
                             }
                         }
                     }
-                }
 
-                let area = f.area();
-                let buf = f.buffer_mut();
-                for row in 0..area.height {
-                    let mut line = String::new();
-                    for col in 0..area.width {
-                        line.push_str(buf[(col, row)].symbol());
+                    let area = f.area();
+                    last_frame_width = area.width;
+                    let buf = f.buffer_mut();
+                    for row in 0..area.height {
+                        let mut line = String::new();
+                        for col in 0..area.width {
+                            line.push_str(buf[(col, row)].symbol());
+                        }
+                        new_lines.push(line);
                     }
-                    new_lines.push(line);
+                })?;
+                if let Some(log_view) = latest_log_view {
+                    last_log_max_scroll = log_view.max_scroll;
+                    last_log_effective_scroll = log_view.effective_scroll;
+                    last_log_view = Some(log_view);
+                    if !log_follow_tail && log_scroll > last_log_max_scroll {
+                        log_scroll = last_log_max_scroll;
+                    }
                 }
-            })?;
-            if let Some(log_view) = latest_log_view {
-                last_log_max_scroll = log_view.max_scroll;
-                last_log_effective_scroll = log_view.effective_scroll;
-                last_log_view = Some(log_view);
-                if !log_follow_tail && log_scroll > last_log_max_scroll {
-                    log_scroll = last_log_max_scroll;
+                screen_lines = new_lines;
+                let snapshots = build_animation_snapshot(&app);
+                if !snapshots.is_empty() {
+                    let snapshot_joined = snapshots.join("\n");
+                    if snapshot_joined != last_animation_snapshot {
+                        last_animation_snapshot = snapshot_joined;
+                    }
                 }
-            }
-            screen_lines = new_lines;
-            let snapshots = build_animation_snapshot(&app);
-            if !snapshots.is_empty() {
-                let snapshot_joined = snapshots.join("\n");
-                if snapshot_joined != last_animation_snapshot {
-                    last_animation_snapshot = snapshot_joined;
-                }
-            }
-        }
-
-        if let Some((_, _, t)) = &toast {
-            if t.elapsed().as_secs() >= 2 {
-                toast = None;
+                redraw_dirty = false;
+                last_draw = Instant::now();
             }
         }
 
         if event::poll(UI_POLL_INTERVAL)? {
+            redraw_dirty = true;
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
