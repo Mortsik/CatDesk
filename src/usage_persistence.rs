@@ -164,17 +164,27 @@ mod tests {
         seed.persist_state().expect("seed config");
         drop(seed);
 
-        let persistence = UsagePersistence::new(config_path.clone());
         let mut usage = UsageSnapshot::new();
         let mut totals = UsageTotals::default();
         totals.accumulate(55, 7, 1);
         usage.insert(CURRENT_USAGE_BUCKET.to_string(), totals);
+        let pending = Mutex::new(Some(PendingUsage {
+            generation: 1,
+            snapshot: usage,
+        }));
+        let generation = AtomicU64::new(1);
 
         fs::remove_file(&config_path).expect("remove config file");
         fs::remove_dir(&config_dir).expect("remove config dir");
         fs::write(&config_dir, "block directory recreation").expect("create blocking file");
-        persistence.schedule(usage);
-        std::thread::sleep(USAGE_PERSIST_DEBOUNCE + Duration::from_millis(40));
+        flush_pending(&config_path, &pending, &generation);
+        assert!(
+            pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some(),
+            "failed persistence must keep the snapshot pending",
+        );
 
         fs::remove_file(&config_dir).expect("remove blocking file");
         fs::create_dir_all(&config_dir).expect("restore config dir");
@@ -186,7 +196,15 @@ mod tests {
         .expect("repair config app state");
         repaired.persist_state().expect("repair config");
         drop(repaired);
-        drop(persistence);
+
+        flush_pending(&config_path, &pending, &generation);
+        assert!(
+            pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none(),
+            "successful retry must clear the pending snapshot",
+        );
 
         let saved = AppState::new_for_test(
             0,
