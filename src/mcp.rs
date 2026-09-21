@@ -7964,12 +7964,15 @@ mod tests {
         };
 
         let immediate = poll(json!({ "job_id": job_id, "wait_ms": 0 })).await;
-        assert_eq!(immediate["state"], json!("running"), "0 must not block");
+        assert!(
+            matches!(immediate["state"].as_str(), Some("queued" | "running")),
+            "0 must return immediately with the current nonterminal state"
+        );
 
         let waited = poll(json!({ "job_id": job_id })).await;
         assert_ne!(
             waited["state"],
-            json!("running"),
+            immediate["state"],
             "omitting wait_ms must block until there is progress"
         );
 

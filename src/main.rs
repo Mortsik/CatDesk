@@ -5160,7 +5160,7 @@ async fn start_services(
 async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
-    _devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     mut ui_events: Receiver<ServerUiEvent>,
     session_started_at: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -5213,6 +5213,15 @@ async fn run_tui(
         // Persistence or another service may temporarily own the state. Keep
         // polling the keyboard against the last frame, especially the quit key.
         if let Ok(mut app) = state.try_lock() {
+            if let Some(bridge) = devtools.as_ref() {
+                if let Ok(bridge) = bridge.try_lock() {
+                    let connected = bridge.is_connected();
+                    if app.devtools_running != connected {
+                        app.devtools_running = connected;
+                        redraw_dirty = true;
+                    }
+                }
+            }
             current_ui_language = app.ui_language;
             if drain_server_ui_events(&mut app, &mut ui_events) {
                 redraw_dirty = true;
