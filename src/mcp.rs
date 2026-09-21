@@ -2602,6 +2602,7 @@ fn catdesk_instruction_structured(
     catdesk_instruction_structured_for_project(workspace_root, mode, tool_mode, None)
 }
 
+#[cfg(test)]
 fn catdesk_instruction_structured_for_project(
     workspace_root: &str,
     mode: Mode,
