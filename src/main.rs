@@ -6,6 +6,7 @@ mod command_jobs;
 mod command_policy;
 mod search_gate;
 mod job_store;
+mod desktop;
 mod devtools;
 mod diagnostics;
 mod handoff;
@@ -24,6 +25,7 @@ mod session_context;
 mod startup;
 mod state;
 mod theme;
+mod uia;
 mod vision;
 mod workspace_tools;
 
@@ -1476,6 +1478,7 @@ fn macos_terminal_profile_enabled() -> std::io::Result<bool> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    desktop::init_dpi_awareness();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(async_main());
     // A filesystem mounted over 9p/NFS can remain blocked in the kernel. Do not

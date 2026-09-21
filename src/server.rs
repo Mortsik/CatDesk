@@ -474,6 +474,16 @@ fn request_class(req: &Value) -> RequestClass {
                 "read" | "read_image" | "search" | "write" | "edit" | "create_handoff"
                 | "delete",
             ) => RequestClass::Filesystem,
+            Some(
+                "screenshot"
+                    | "ui_tree"
+                    | "ui_click"
+                    | "mouse_move"
+                    | "mouse_click"
+                    | "mouse_scroll"
+                    | "type_text"
+                    | "key_press",
+            ) => RequestClass::General,
             // Any tool not owned by CatDesk itself is a dynamically discovered
             // DevTools operation when browser mode is enabled. Isolate it from
             // local filesystem/process capacity even if the browser is slow.
@@ -1522,6 +1532,8 @@ mod tests {
             (tool_call_body("edit", json!({ "path": "x", "edits": [] })), RequestClass::Filesystem),
             (tool_call_body("run_command", json!({ "command": "true" })), RequestClass::Process),
             (tool_call_body("start_command", json!({ "command": "true" })), RequestClass::Process),
+            (tool_call_body("screenshot", json!({})), RequestClass::General),
+            (tool_call_body("ui_click", json!({ "element_index": 1 })), RequestClass::General),
             (tool_call_body("take_screenshot", json!({})), RequestClass::Browser),
             (mcp_request_body("catdesk/unknown", json!({})), RequestClass::General),
         ];
