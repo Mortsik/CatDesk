@@ -8,6 +8,7 @@ mod search_gate;
 mod job_store;
 mod devtools;
 mod diagnostics;
+mod fair_queue;
 mod handoff;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
