@@ -2,7 +2,7 @@
 
 Date: 2026-09-21
 Issue: `catdesk-vmi.2`
-Status: proposed / user-approved direction, pending written-spec review
+Status: approved
 
 ## Intent
 
