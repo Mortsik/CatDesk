@@ -45,8 +45,7 @@ use ratatui::{
 };
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
-    GPT_5_6_AND_EARLIER_USAGE_BUCKET, HOURLY_USAGE_WINDOW_MS, LIVE_USAGE_WINDOW_MS, LogEntry,
-    Mode, ServerUiEvent,
+    GPT_5_6_AND_EARLIER_USAGE_BUCKET, LIVE_USAGE_WINDOW_MS, LogEntry, Mode, ServerUiEvent,
     SharedState, ShowDetailMode, ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle,
     app_config_path, flow_anim_lit_count, load_app_config, load_macos_terminal_profile,
     load_ngrok_authtoken, load_ngrok_domain, local_now, save_macos_terminal_profile,
@@ -746,6 +745,7 @@ fn usage_value_widths(
 fn usage_line(
     usage: &UsageTotals,
     cost_usd: f64,
+    cost_rates: Option<(f64, f64)>,
     status_label: Span<'static>,
     leading_value: Option<String>,
     palette: &theme::Palette,
@@ -797,20 +797,30 @@ fn usage_line(
             price_style,
         ),
     ]);
+    if let Some((cost_per_min_usd, cost_per_hour_usd)) = cost_rates {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("$", label_style));
+        spans.push(Span::styled(format_usd_compact(cost_per_min_usd), price_style));
+        spans.push(Span::styled("/min", label_style));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("$", label_style));
+        spans.push(Span::styled(format_usd_compact(cost_per_hour_usd), price_style));
+        spans.push(Span::styled("/h", label_style));
+    }
     Line::from(spans)
 }
 
-fn hourly_cost_rate_from_window(window_cost_usd: f64, window_ms: u128) -> f64 {
-    if window_ms == 0 {
-        return 0.0;
+fn session_cost_rates(cost_usd: f64, elapsed: Duration) -> (f64, f64) {
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs <= 0.0 {
+        return (0.0, 0.0);
     }
-    window_cost_usd * 3_600_000.0 / window_ms as f64
+    let cost_per_min_usd = cost_usd * 60.0 / elapsed_secs;
+    (cost_per_min_usd, cost_per_min_usd * 60.0)
 }
 
 fn live_usage_rate_line(
     usage: &UsageTotals,
-    cost_per_min_usd: f64,
-    cost_per_hour_usd: f64,
     status_label: Span<'static>,
     palette: &theme::Palette,
 ) -> Line<'static> {
@@ -818,14 +828,9 @@ fn live_usage_rate_line(
     let value_style = Style::default()
         .fg(palette.secondary_fg)
         .add_modifier(Modifier::BOLD);
-    let price_style = Style::default()
-        .fg(palette.success_fg)
-        .add_modifier(Modifier::BOLD);
     let input = format_token_compact(usage.tool_input_tokens);
     let output = format_token_compact(usage.tool_output_tokens);
     let total = format_token_compact(usage.total_tokens);
-    let cost_per_min = format_usd_compact(cost_per_min_usd);
-    let cost_per_hour = format_usd_compact(cost_per_hour_usd);
 
     Line::from(vec![
         status_label,
@@ -840,14 +845,6 @@ fn live_usage_rate_line(
         Span::styled("Σ", label_style),
         Span::styled(total, value_style),
         Span::styled("/min", label_style),
-        Span::raw("  "),
-        Span::styled("$", label_style),
-        Span::styled(cost_per_min, price_style),
-        Span::styled("/min", label_style),
-        Span::raw("  "),
-        Span::styled("$", label_style),
-        Span::styled(cost_per_hour, price_style),
-        Span::styled("/h", label_style),
     ])
 }
 
@@ -3216,7 +3213,7 @@ mod tests {
             &["tools/call:search".to_string()],
             super::FlowDirection::Forward,
         );
-        app.record_turn_usage(1_200, 300);
+        app.record_turn_usage(0, 1_000_000);
         app.request_count = 42;
 
         let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
@@ -3228,7 +3225,7 @@ mod tests {
                     frame,
                     &app,
                     3,
-                    Duration::from_secs(60 * 60 + 23 * 60 + 45),
+                    Duration::from_secs(120),
                     0,
                     true,
                     &mut log_view,
@@ -3245,9 +3242,9 @@ mod tests {
             "Bg jobs 3",
             "Requests 42",
             "60s rate",
-            "1h 23m",
-            "/min",
-            "/h",
+            "2m 0s",
+            "$2.5/min",
+            "$150/h",
         ] {
             assert!(
                 text.contains(expected),
@@ -3300,11 +3297,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(workspace);
-    }
-
-    #[test]
-    fn five_minute_cost_window_scales_to_hourly_rate() {
-        assert!((super::hourly_cost_rate_from_window(0.50, 300_000) - 6.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -5799,15 +5791,10 @@ fn draw_ui(
     let flow_block_lines = 3;
 
     let rolling_usage_totals = app.rolling_usage_totals(now_millis, LIVE_USAGE_WINDOW_MS);
-    let rolling_usage_cost_usd = estimate_gpt_5_6_and_earlier_usage_cost_usd(&rolling_usage_totals);
-    let hourly_usage_totals = app.rolling_usage_totals(now_millis, HOURLY_USAGE_WINDOW_MS);
-    let hourly_window_cost_usd =
-        estimate_gpt_5_6_and_earlier_usage_cost_usd(&hourly_usage_totals);
-    let smoothed_hourly_cost_usd =
-        hourly_cost_rate_from_window(hourly_window_cost_usd, HOURLY_USAGE_WINDOW_MS);
     let all_time_usage_totals = app.all_time_usage_totals();
     let session_usage_cost_usd =
         estimate_gpt_5_6_and_earlier_usage_cost_usd(&app.session_usage_totals);
+    let session_cost_rates = session_cost_rates(session_usage_cost_usd, session_elapsed);
     let all_time_usage_cost_usd = estimate_all_time_usage_cost_usd(app);
     let usage_widths = usage_value_widths(
         &app.session_usage_totals,
@@ -5979,14 +5966,13 @@ fn draw_ui(
         },
         live_usage_rate_line(
             &rolling_usage_totals,
-            rolling_usage_cost_usd,
-            smoothed_hourly_cost_usd,
             status_label(ui_language.text("60s rate", "60 秒速率")),
             &palette,
         ),
         usage_line(
             &app.session_usage_totals,
             session_usage_cost_usd,
+            Some(session_cost_rates),
             status_label(ui_language.text("Session", "本次工作階段")),
             Some(format_session_duration(session_elapsed)),
             &palette,
@@ -5996,6 +5982,7 @@ fn draw_ui(
         usage_line(
             &all_time_usage_totals,
             all_time_usage_cost_usd,
+            None,
             status_label(ui_language.text("All-time", "累計")),
             None,
             &palette,
