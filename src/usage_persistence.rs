@@ -14,6 +14,7 @@ type UsageSnapshot = BTreeMap<String, UsageTotals>;
 struct PendingUsage {
     generation: u64,
     snapshot: UsageSnapshot,
+    total_request_count: u64,
 }
 
 #[cfg(not(test))]
@@ -61,7 +62,7 @@ impl UsagePersistence {
         }
     }
 
-    pub(crate) fn schedule(&self, snapshot: UsageSnapshot) {
+    pub(crate) fn schedule(&self, snapshot: UsageSnapshot, total_request_count: u64) {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         *self
             .pending
@@ -69,6 +70,7 @@ impl UsagePersistence {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingUsage {
             generation,
             snapshot,
+            total_request_count,
         });
 
         let Some(wake_tx) = self.wake_tx.as_ref() else {
@@ -119,6 +121,7 @@ fn flush_pending(
     match persist_usage_by_model_at_path_if_current(
         config_path,
         pending_usage.snapshot.clone(),
+        pending_usage.total_request_count,
         pending_usage.generation,
         current_generation,
     ) {
@@ -171,6 +174,7 @@ mod tests {
         let pending = Mutex::new(Some(PendingUsage {
             generation: 1,
             snapshot: usage,
+            total_request_count: 0,
         }));
         let generation = AtomicU64::new(1);
 

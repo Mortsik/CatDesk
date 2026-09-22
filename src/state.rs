@@ -370,6 +370,8 @@ pub struct AppConfig {
     pub tool_mode: ToolMode,
     #[serde(default)]
     pub usage_by_model: BTreeMap<String, UsageTotals>,
+    #[serde(default)]
+    pub total_request_count: u64,
     pub selected_browser: Option<DetectedBrowser>,
 }
 
@@ -393,6 +395,7 @@ impl Default for AppConfig {
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
             usage_by_model: BTreeMap::new(),
+            total_request_count: 0,
             selected_browser: None,
         }
     }
@@ -689,6 +692,7 @@ pub struct AppState {
     pub flow_bootstrap_progress: HashMap<String, FlowBootstrapProgress>,
     connected_chat_ids: HashSet<String>,
     pub request_count: u64,
+    pub total_request_count: u64,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
     usage_rate_samples: VecDeque<UsageRateSample>,
@@ -774,6 +778,7 @@ where
 pub(crate) fn persist_usage_by_model_at_path_if_current(
     path: &Path,
     usage_by_model: BTreeMap<String, UsageTotals>,
+    total_request_count: u64,
     expected_generation: u64,
     current_generation: &AtomicU64,
 ) -> std::io::Result<bool> {
@@ -785,6 +790,7 @@ pub(crate) fn persist_usage_by_model_at_path_if_current(
     }
     let mut config = AppConfig::load_from_path(path)?;
     config.usage_by_model = usage_by_model;
+    config.total_request_count = total_request_count;
     config.save_to_path(path)?;
     Ok(true)
 }
@@ -1084,6 +1090,7 @@ impl AppState {
             flow_bootstrap_progress: HashMap::new(),
             connected_chat_ids: HashSet::new(),
             request_count: 0,
+            total_request_count: config.total_request_count,
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
             usage_rate_samples: VecDeque::new(),
@@ -1142,6 +1149,7 @@ impl AppState {
         config.show_detail_mode = self.show_detail_mode;
         config.ui_language = self.ui_language;
         config.usage_by_model = self.usage_by_model.clone();
+        config.total_request_count = self.total_request_count;
         config.selected_browser = self.selected_browser.clone();
         Ok(config.normalized())
     }
@@ -1164,7 +1172,8 @@ impl AppState {
             self.app_config()?.save_to_path(&self.config_path)
         })();
         if result.is_err() {
-            self.usage_persistence.schedule(self.usage_by_model.clone());
+            self.usage_persistence
+                .schedule(self.usage_by_model.clone(), self.total_request_count);
         }
         result
     }
@@ -1188,7 +1197,8 @@ impl AppState {
     }
 
     pub fn schedule_usage_persistence(&self) {
-        self.usage_persistence.schedule(self.usage_by_model.clone());
+        self.usage_persistence
+            .schedule(self.usage_by_model.clone(), self.total_request_count);
     }
 
     fn record_turn_usage_at(
@@ -1235,6 +1245,8 @@ impl AppState {
         match event {
             ServerUiEvent::IncrementRequestCount => {
                 self.request_count = self.request_count.saturating_add(1);
+                self.total_request_count = self.total_request_count.saturating_add(1);
+                self.schedule_usage_persistence();
             }
             ServerUiEvent::RecordBootstrapDiscoverResponse { flow_id, success } => {
                 self.record_bootstrap_discover_response(&flow_id, success);
@@ -1851,6 +1863,30 @@ toolCallCount = 1
             leftovers.is_empty(),
             "temporary config files leaked: {leftovers:?}"
         );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn total_request_count_persists_across_sessions() {
+        let (mut app, workspace, config_path) = test_app("catdesk-total-requests");
+        for _ in 0..3 {
+            app.apply_server_ui_event(ServerUiEvent::IncrementRequestCount);
+        }
+        assert_eq!(app.request_count, 3);
+        assert_eq!(app.total_request_count, 3);
+        drop(app);
+
+        let reloaded = AppState::from_config_path(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload request totals");
+        assert_eq!(reloaded.request_count, 0);
+        assert_eq!(reloaded.total_request_count, 3);
+        drop(reloaded);
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);

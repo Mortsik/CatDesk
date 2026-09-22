@@ -45,7 +45,7 @@ use ratatui::{
 };
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
-    LIVE_USAGE_WINDOW_MS, LogEntry, Mode, ServerUiEvent,
+    GPT_5_6_AND_EARLIER_USAGE_BUCKET, LIVE_USAGE_WINDOW_MS, LogEntry, Mode, ServerUiEvent,
     SharedState, ShowDetailMode, ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle,
     app_config_path, flow_anim_lit_count, load_app_config, load_macos_terminal_profile,
     load_ngrok_authtoken, load_ngrok_domain, local_now, save_macos_terminal_profile,
@@ -79,7 +79,7 @@ const NGROK_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓";
 const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
 const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
-const STATUS_LABEL_WIDTH: usize = 11;
+const STATUS_LABEL_WIDTH: usize = 13;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
@@ -340,6 +340,16 @@ fn estimate_gpt_5_6_and_earlier_usage_cost_usd(usage: &UsageTotals) -> f64 {
     (usage.tool_input_tokens as f64 * GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M
         + usage.tool_output_tokens as f64 * GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M)
         / 1_000_000.0
+}
+
+fn estimate_all_time_usage_cost_usd(app: &AppState) -> f64 {
+    app.usage_by_model
+        .iter()
+        .map(|(bucket, usage)| match bucket.as_str() {
+            GPT_5_6_AND_EARLIER_USAGE_BUCKET => estimate_gpt_5_6_and_earlier_usage_cost_usd(usage),
+            _ => panic!("missing pricing for usage bucket `{bucket}`"),
+        })
+        .sum()
 }
 
 fn format_usd_compact(usd: f64) -> String {
@@ -730,11 +740,7 @@ fn flow_call_offset(text: &str, left_label: &str) -> String {
     " ".repeat(terminal_cell_width(left_label) + centered_in_lane)
 }
 
-fn flow_turn_usage_line(
-    flow: &FlowLane,
-    palette: &theme::Palette,
-    ui_language: UiLanguage,
-) -> Line<'static> {
+fn flow_turn_usage_spans(flow: &FlowLane, palette: &theme::Palette) -> Vec<Span<'static>> {
     let label_style = Style::default().fg(palette.muted_fg);
     let value_style = Style::default()
         .fg(palette.secondary_fg)
@@ -748,34 +754,18 @@ fn flow_turn_usage_line(
             let input = format_token_compact(usage.tool_input_tokens);
             let output = format_token_compact(usage.tool_output_tokens);
             let cost = format_usd_compact(estimate_gpt_5_6_and_earlier_usage_cost_usd(usage));
-            let usage_text = format!("↓{input}  ↑{output}  ${cost}");
-            let indent = format!(
-                "    {}",
-                flow_call_offset(&usage_text, flow_lane_left_label(ui_language))
-            );
-            Line::from(vec![
-                Span::raw(indent),
+            vec![
                 Span::styled("↓", label_style),
                 Span::styled(input, value_style),
-                Span::raw("  "),
+                Span::raw(" "),
                 Span::styled("↑", label_style),
                 Span::styled(output, value_style),
-                Span::raw("  "),
+                Span::raw(" "),
                 Span::styled("$", label_style),
                 Span::styled(cost, price_style),
-            ])
+            ]
         }
-        None => {
-            let usage_text = "↓--  ↑--  $--";
-            let indent = format!(
-                "    {}",
-                flow_call_offset(usage_text, flow_lane_left_label(ui_language))
-            );
-            Line::from(vec![
-                Span::raw(indent),
-                Span::styled(usage_text, label_style),
-            ])
-        }
+        None => vec![Span::styled("↓-- ↑-- $--", label_style)],
     }
 }
 
@@ -3029,15 +3019,18 @@ mod tests {
         for expected in [
             "讓ChatGPTWeb變成程式代理",
             "狀態",
-            "請求",
+            "即時請求",
             "執行",
             "排隊",
-            "總計",
             "聊天",
             "工作",
+            "工作階段請求",
+            "累計請求",
             "即時成本",
-            "工作階段平均",
-            "工作階段",
+            "工作階段成本",
+            "平均",
+            "已花費",
+            "累計成本",
             "Token60秒",
             "系統",
             "等待連線",
@@ -3082,8 +3075,13 @@ mod tests {
             &["tools/call:search".to_string()],
             super::FlowDirection::Forward,
         );
+        app.usage_by_model
+            .entry(super::state::CURRENT_USAGE_BUCKET.to_string())
+            .or_default()
+            .accumulate(0, 1_000_000, 20);
         app.record_turn_usage(0, 1_000_000);
         app.request_count = 42;
+        app.total_request_count = 142;
 
         let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
         let mut log_view = None;
@@ -3107,21 +3105,24 @@ mod tests {
 
         let text = terminal_buffer_text(&terminal);
         for expected in [
-            "REQUESTS",
+            "REQ NOW",
             "RUN 0",
             "QUEUED 0",
-            "TOTAL 42",
             "CHATS 2",
             "JOBS 3",
+            "REQ SESSION",
+            "42",
+            "REQ TOTAL",
+            "142",
             "COST NOW",
             "$300/h",
             "$5/min",
-            "SESSION AVG",
-            "$150/h",
-            "$2.5/min",
-            "SESSION",
-            "$5",
+            "COST SESSION",
+            "AVG $150/h",
+            "SPENT $5",
             "2m 0s",
+            "COST TOTAL",
+            "SPENT $10",
             "TOKENS 60s",
             "SYSTEM",
         ] {
@@ -3142,6 +3143,61 @@ mod tests {
     }
 
     #[test]
+    fn main_dashboard_renders_each_active_flow_on_one_line() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-main-flow-row-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let config_path = workspace.join("config.toml");
+        let mut app =
+            AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+                .expect("create app");
+        app.server_running = true;
+        app.ngrok_running = true;
+        app.record_flow(
+            "session:a",
+            &["tools/call:run_command › echo dashboard".to_string()],
+            super::FlowDirection::Forward,
+        );
+        app.record_flow_turn_usage("session:a", 45, 2_100);
+
+        let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
+        let mut log_view = None;
+        let revealed_logs = HashMap::new();
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    &app,
+                    0,
+                    Duration::from_secs(120),
+                    0,
+                    true,
+                    &mut log_view,
+                    None,
+                    None,
+                    &revealed_logs,
+                )
+            })
+            .expect("draw flow dashboard");
+
+        let text = terminal_buffer_text(&terminal);
+        let flow_rows = text
+            .lines()
+            .filter(|line| line.contains("Your computer"))
+            .collect::<Vec<_>>();
+        assert_eq!(flow_rows.len(), 1, "one active flow must consume one dashboard row");
+        let row = flow_rows[0];
+        for expected in ["ChatGPT Web", "run_command", "↓45", "↑2.1K", "$0.01185"] {
+            assert!(row.contains(expected), "flow row missing {expected}: {row}");
+        }
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn main_dashboard_keeps_requests_visible_without_flow_slots() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3154,6 +3210,7 @@ mod tests {
             AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
                 .expect("create app");
         app.request_count = 42;
+        app.total_request_count = 142;
 
         let mut terminal = Terminal::new(TestBackend::new(180, 28)).expect("create terminal");
         let mut log_view = None;
@@ -3177,8 +3234,12 @@ mod tests {
 
         let text = terminal_buffer_text(&terminal);
         assert!(
-            text.contains("TOTAL 42"),
-            "request counter must remain in the always-visible status area"
+            text.contains("REQ SESSION") && text.contains("42"),
+            "session request counter must remain in the always-visible status area"
+        );
+        assert!(
+            text.contains("REQ TOTAL") && text.contains("142"),
+            "persisted total request counter must remain in the always-visible status area"
         );
 
         let _ = std::fs::remove_dir_all(workspace);
@@ -5657,7 +5718,7 @@ fn draw_ui(
         )
     };
     let status_content_height = status_height.saturating_sub(4) as usize;
-    let flow_block_lines = 3;
+    let flow_block_lines = 1;
 
     let rolling_usage_totals = app.rolling_usage_totals(now_millis, LIVE_USAGE_WINDOW_MS);
     let rolling_usage_cost_usd = estimate_gpt_5_6_and_earlier_usage_cost_usd(&rolling_usage_totals);
@@ -5667,8 +5728,9 @@ fn draw_ui(
     );
     let session_usage_cost_usd =
         estimate_gpt_5_6_and_earlier_usage_cost_usd(&app.session_usage_totals);
-    let (session_cost_per_min_usd, session_cost_per_hour_usd) =
+    let (_session_cost_per_min_usd, session_cost_per_hour_usd) =
         session_cost_rates(session_usage_cost_usd, session_elapsed);
+    let all_time_usage_cost_usd = estimate_all_time_usage_cost_usd(app);
     let request_snapshot = request_workers::global_request_scheduler().snapshot();
     let request_gates = [
         request_snapshot.control,
@@ -5705,67 +5767,75 @@ fn draw_ui(
 
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
-            status_label(ui_language.text("REQUESTS", "請求")),
+            status_label(ui_language.text("REQ NOW", "即時請求")),
             Span::styled(format!("{} ", ui_language.text("RUN", "執行")), muted_style),
             Span::styled(active_request_count.to_string(), value_style),
-            Span::styled(format!("  {} ", ui_language.text("QUEUED", "排隊")), muted_style),
+            Span::styled(format!("      {} ", ui_language.text("QUEUED", "排隊")), muted_style),
             Span::styled(queued_request_count.to_string(), value_style),
-            Span::styled(format!("  {} ", ui_language.text("TOTAL", "總計")), muted_style),
-            Span::styled(app.request_count.to_string(), value_style),
-            Span::styled(format!("  {} ", ui_language.text("CHATS", "聊天")), muted_style),
+            Span::styled(format!("      {} ", ui_language.text("CHATS", "聊天")), muted_style),
             Span::styled(app.connected_chat_count().to_string(), value_style),
-            Span::styled(format!("  {} ", ui_language.text("JOBS", "工作")), muted_style),
+            Span::styled(format!("      {} ", ui_language.text("JOBS", "工作")), muted_style),
             Span::styled(active_job_count.to_string(), value_style),
         ]),
+        Line::from(vec![
+            status_label(ui_language.text("REQ SESSION", "工作階段請求")),
+            Span::styled(app.request_count.to_string(), value_style),
+        ]),
+        Line::from(vec![
+            status_label(ui_language.text("REQ TOTAL", "累計請求")),
+            Span::styled(app.total_request_count.to_string(), value_style),
+        ]),
+        Line::from(""),
         Line::from(vec![
             status_label(ui_language.text("COST NOW", "即時成本")),
             Span::styled(
                 format!("${}/h", format_usd_compact(live_cost_per_hour_usd)),
                 cost_style,
             ),
-            Span::raw("  "),
+            Span::raw("      "),
             Span::styled(
                 format!("${}/min", format_usd_compact(live_cost_per_min_usd)),
                 cost_style,
             ),
-            Span::styled(
-                format!("    {} ", ui_language.text("SESSION AVG", "工作階段平均")),
-                muted_style,
-            ),
+        ]),
+        Line::from(vec![
+            status_label(ui_language.text("COST SESSION", "工作階段成本")),
+            Span::styled(ui_language.text("AVG ", "平均 "), muted_style),
             Span::styled(
                 format!("${}/h", format_usd_compact(session_cost_per_hour_usd)),
                 cost_style,
             ),
-            Span::raw("  "),
-            Span::styled(
-                format!("${}/min", format_usd_compact(session_cost_per_min_usd)),
-                cost_style,
-            ),
-        ]),
-        Line::from(vec![
-            status_label(ui_language.text("SESSION", "工作階段")),
-            Span::styled(format_session_duration(session_elapsed), value_style),
-            Span::raw("  "),
+            Span::styled(ui_language.text("      SPENT ", "      已花費 "), muted_style),
             Span::styled(
                 format!("${}", format_usd_compact(session_usage_cost_usd)),
                 cost_style,
             ),
+            Span::raw("      "),
+            Span::styled(format_session_duration(session_elapsed), value_style),
+        ]),
+        Line::from(vec![
+            status_label(ui_language.text("COST TOTAL", "累計成本")),
+            Span::styled(ui_language.text("SPENT ", "已花費 "), muted_style),
             Span::styled(
-                format!("    {} ", ui_language.text("TOKENS 60s", "Token 60秒")),
-                muted_style,
+                format!("${}", format_usd_compact(all_time_usage_cost_usd)),
+                cost_style,
             ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            status_label(ui_language.text("TOKENS 60s", "Token 60秒")),
             Span::styled("↓", muted_style),
             Span::styled(
                 format_token_compact(rolling_usage_totals.tool_input_tokens),
                 value_style,
             ),
-            Span::raw("  "),
+            Span::raw("      "),
             Span::styled("↑", muted_style),
             Span::styled(
                 format_token_compact(rolling_usage_totals.tool_output_tokens),
                 value_style,
             ),
-            Span::raw("  "),
+            Span::raw("      "),
             Span::styled("Σ", muted_style),
             Span::styled(
                 format_token_compact(rolling_usage_totals.total_tokens),
@@ -5776,11 +5846,11 @@ fn draw_ui(
             status_label(ui_language.text("SYSTEM", "系統")),
             Span::styled("MCP ", muted_style),
             Span::styled(if app.server_running { "✓" } else { "×" }, health_style(app.server_running)),
-            Span::styled("  NGROK ", muted_style),
+            Span::styled("      NGROK ", muted_style),
             Span::styled(if app.ngrok_running { "✓" } else { "×" }, health_style(app.ngrok_running)),
-            Span::styled("  DEVTOOLS ", muted_style),
+            Span::styled("      DEVTOOLS ", muted_style),
             Span::styled(devtools_indicator.0, devtools_indicator.1.add_modifier(Modifier::BOLD)),
-            Span::styled(format!("    {} ", ui_language.text("MODE", "模式")), muted_style),
+            Span::styled(format!("      {} ", ui_language.text("MODE", "模式")), muted_style),
             Span::styled(mode_label, value_style),
             Span::styled(" / ", muted_style),
             Span::styled(tool_mode_label, value_style),
@@ -5801,12 +5871,6 @@ fn draw_ui(
             } else {
                 ui_language.text("awaiting connection", "等待連線")
             };
-            let call_offset = flow_call_offset(call_text, flow_lane_left_label(ui_language));
-            status_lines.push(Line::from(vec![
-                Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                Span::styled(call_offset, Style::default().fg(palette.muted_fg)),
-                Span::styled(call_text, flow_meta_style),
-            ]));
             let lane = lane_for(false, None);
             let mut row = vec![
                 Span::styled("    ", Style::default().fg(palette.muted_fg)),
@@ -5814,6 +5878,8 @@ fn draw_ui(
             ];
             row.extend(lane);
             row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
+            row.push(Span::raw("   "));
+            row.push(Span::styled(call_text, flow_meta_style));
             status_lines.push(Line::from(row));
         } else {
             for flow in app
@@ -5823,13 +5889,7 @@ fn draw_ui(
                 .take(visible_flow_slots)
             {
                 let latest_action = latest_flow_action(flow);
-                let call_text = trim_line(&latest_action, FLOW_ROW_CELLS);
-                let call_offset = flow_call_offset(&call_text, flow_lane_left_label(ui_language));
-                status_lines.push(Line::from(vec![
-                    Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                    Span::styled(call_offset, Style::default().fg(palette.muted_fg)),
-                    Span::styled(call_text, flow_meta_style),
-                ]));
+                let call_text = trim_line(&latest_action, 36);
                 let closing = flow.closing_started_ms.is_some();
                 let lane_active = closing
                     || !flow.anim_queue.is_empty()
@@ -5841,8 +5901,11 @@ fn draw_ui(
                 ];
                 row.extend(lane);
                 row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
+                row.push(Span::raw("   "));
+                row.push(Span::styled(call_text, flow_meta_style));
+                row.push(Span::raw("   "));
+                row.extend(flow_turn_usage_spans(flow, &palette));
                 status_lines.push(Line::from(row));
-                status_lines.push(flow_turn_usage_line(flow, &palette, ui_language));
             }
         }
     }
@@ -6080,7 +6143,11 @@ fn draw_ui(
         horizontal: 2,
         vertical: 1,
     });
-    let status = Paragraph::new(status_lines).wrap(Wrap { trim: false });
+    let status = if show_guide || bootstrap_status_flow.is_some() {
+        Paragraph::new(status_lines).wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(status_lines)
+    };
     f.render_widget(status, status_content);
 
     // ── Keys ──
