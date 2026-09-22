@@ -3344,6 +3344,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reserved_mcp_listener_accepts_tcp_before_axum_serve_starts() {
+        let listener = super::reserve_mcp_listener(0)
+            .await
+            .expect("reserve MCP listener");
+        let address = listener.local_addr().expect("reserved listener address");
+        let connected = tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .expect("TCP connect timed out before axum started")
+        .expect("reserved listener refused TCP connect before axum started");
+        drop(connected);
+        drop(listener);
+    }
+
     #[test]
     fn exported_log_filename_includes_utc_offset() {
         let utc = time::OffsetDateTime::from_unix_timestamp(0).expect("unix epoch");
@@ -4909,6 +4926,10 @@ async fn ensure_selected_browser_remote_debugging(
 
 // ── Start services ──────────────────────────────────────────
 
+async fn reserve_mcp_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(("127.0.0.1", port)).await
+}
+
 async fn start_services(
     state: SharedState,
     ui_events: Sender<ServerUiEvent>,
@@ -4921,6 +4942,21 @@ async fn start_services(
             app.detected_browsers.clone(),
             app.selected_browser.clone(),
         )
+    };
+
+    // Reserve the origin port before browser/DevTools startup. Those steps may
+    // legitimately take several seconds, and leaving the port unbound makes an
+    // otherwise healthy external tunnel fail immediately with connection refused.
+    let listener = match reserve_mcp_listener(port).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            diagnostics::event("server_bind_failed");
+            state
+                .lock()
+                .await
+                .log("ERROR", format!("Failed to bind port {port}: {error}"));
+            return None;
+        }
     };
 
     if mode.browser_enabled() && detected_browsers.is_empty() {
@@ -5059,18 +5095,6 @@ async fn start_services(
         mcp_path,
         ui_events,
     );
-    let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
-        Ok(l) => l,
-        Err(e) => {
-            diagnostics::event("server_bind_failed");
-            state
-                .lock()
-                .await
-                .log("ERROR", format!("Failed to bind port {port}: {e}"));
-            return devtools_bridge;
-        }
-    };
-
     let handle = tokio::spawn(async move {
         diagnostics::event("server_started");
         match axum::serve(listener, router).await {

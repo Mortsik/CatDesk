@@ -4145,7 +4145,7 @@ async fn post_mcp_http(
     let scheduling_key = request_scheduling_key(&client_session, &s.catdesk_instruction_called);
     let id = metadata.as_ref().and_then(|v| v.get("id").cloned());
     match global_request_scheduler()
-        .run_keyed(
+        .run_keyed_timed(
             class,
             scheduling_key,
             async move { post_mcp_inner(State(s), body_bytes, &headers, None).await },
@@ -4153,25 +4153,47 @@ async fn post_mcp_http(
         )
         .await
     {
-        Ok(response) => response,
+        Ok(result) => {
+            let mut response = result.value;
+            response
+                .extensions_mut()
+                .insert(crate::diagnostics::SchedulerTiming {
+                    class: class.as_str(),
+                    queue_wait_ms: result.timing.queue_wait_ms,
+                    execution_ms: result.timing.execution_ms,
+                    deadline_stage: result.timing.deadline_stage.map(|stage| stage.as_str()),
+                });
+            response
+        }
         Err(error) => {
             use crate::request_workers::RequestFailure;
-            let status = match error {
+            let status = match &error.failure {
                 RequestFailure::Busy => StatusCode::SERVICE_UNAVAILABLE,
                 RequestFailure::Deadline => StatusCode::GATEWAY_TIMEOUT,
                 RequestFailure::Failed => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            crate::diagnostics::event(request_failure_event(class, &error));
+            crate::diagnostics::event(request_failure_event(class, &error.failure));
             let payload = mcp::JsonRpcResponse::error(
                 id,
                 -32000,
-                format!("CatDesk {} request: {error}", class.as_str()),
+                format!("CatDesk {} request: {}", class.as_str(), error.failure),
             );
             let mut response = Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::to_vec(&payload).unwrap())).unwrap();
-            response.extensions_mut().insert(crate::diagnostics::RpcError(-32000));
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap();
+            response
+                .extensions_mut()
+                .insert(crate::diagnostics::RpcError(-32000));
+            response
+                .extensions_mut()
+                .insert(crate::diagnostics::SchedulerTiming {
+                    class: class.as_str(),
+                    queue_wait_ms: error.timing.queue_wait_ms,
+                    execution_ms: error.timing.execution_ms,
+                    deadline_stage: error.timing.deadline_stage.map(|stage| stage.as_str()),
+                });
             response
         }
     }

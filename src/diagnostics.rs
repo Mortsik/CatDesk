@@ -299,6 +299,16 @@ mod tests {
                 .any(|r| r["status"] == 405 && r["rpc_error_code"] == -32601)
         );
         assert!(
+            records.iter().any(|r| {
+                r["event"] == "http_finished"
+                    && r["scheduler_class"] == "control"
+                    && r["scheduler_queue_wait_ms"].is_number()
+                    && r["scheduler_execution_ms"].is_number()
+                    && r["scheduler_deadline_stage"].is_null()
+            }),
+            "scheduled MCP calls must persist queue/execution timing without payloads"
+        );
+        assert!(
             records
                 .iter()
                 .any(|r| r["event"] == "http_started" && r["route_matched"] == true)
@@ -517,6 +527,14 @@ pub(crate) struct ToolResult {
     pub content_items: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SchedulerTiming {
+    pub class: &'static str,
+    pub queue_wait_ms: u64,
+    pub execution_ms: u64,
+    pub deadline_stage: Option<&'static str>,
+}
+
 struct RequestLog {
     log: Diagnostics,
     id: String,
@@ -559,10 +577,15 @@ pub(crate) async fn http_request(
     REQUEST.scope(trace, async {
         let response = next.run(request).await;
         REQUEST.with(|trace| {
+            let scheduler = response.extensions().get::<SchedulerTiming>().copied();
             trace.log.record(json!({"event": "http_finished", "request_id": trace.id,
                 "status": response.status().as_u16(), "rpc_error_code": response.extensions().get::<RpcError>().map(|e| e.0),
                 "tool_error": response.extensions().get::<ToolResult>().and_then(|r| r.is_error),
                 "content_items": response.extensions().get::<ToolResult>().and_then(|r| r.content_items),
+                "scheduler_class": scheduler.map(|timing| timing.class),
+                "scheduler_queue_wait_ms": scheduler.map(|timing| timing.queue_wait_ms),
+                "scheduler_execution_ms": scheduler.map(|timing| timing.execution_ms),
+                "scheduler_deadline_stage": scheduler.and_then(|timing| timing.deadline_stage),
                 "elapsed_ms": trace.started.elapsed().as_millis()}));
             trace.complete.store(true, Ordering::Relaxed);
         });

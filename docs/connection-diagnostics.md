@@ -18,9 +18,15 @@ Records contain Unix milliseconds (`timestamp_ms`), process ID (`pid`), and:
   names, commands, output, credentials and connector URLs are never saved.
 - `http_finished`: HTTP `status`, numeric `rpc_error_code` when provided by the
   MCP handler, `tool_error` and `content_items` for tool responses, and `elapsed_ms`.
-  The latter two fields record only the error flag and content count, not content.
-  This means the handler produced its response;
-  it does not prove that ChatGPT received it.
+  Scheduled MCP calls additionally record `scheduler_class`,
+  `scheduler_queue_wait_ms`, `scheduler_execution_ms`, and
+  `scheduler_deadline_stage` (`queue`, `execution`, or null). These timing fields
+  contain no arguments or payloads. They distinguish a 504 caused by waiting for
+  capacity from one caused after tool execution had already started. `execution_ms`
+  is the time CatDesk waited for the response, not necessarily the full lifetime of
+  work that continues after a response deadline. The tool fields record only the
+  error flag and content count, not content. An `http_finished` record means the
+  handler produced its response; it does not prove that ChatGPT received it.
 - `http_cancelled`: the request future ended without producing a response.
 - Process, server and tunnel lifecycle events such as `process_started`,
   `server_started`, `tunnel_started`, `tunnel_failed` and `process_stopping`.
@@ -65,13 +71,18 @@ New logging starts only after restarting CatDesk with the updated binary.
 ## Stalls, busy responses and memory
 
 Synchronous tool and filesystem operations run outside the async network
-workers. At most twelve HTTP operations occupy this pool; excess requests return
-503 with `request_workers_busy`. A request that exceeds its 180-second response
-deadline returns 504 with `request_worker_timeout`. The worker continues to own
-its slot until the operation actually ends, including after client disconnection.
+workers. Capacity is isolated by request class (control, filesystem, process,
+browser and general), while temporary saturation queues fairly by session/project
+instead of immediately failing. Queue safety budgets remain bounded; exhausting a
+budget returns 503 with a class-specific `request_*_busy` event. Response deadlines
+are 45 seconds for control, 60 seconds for general, and 180 seconds for filesystem,
+process and browser work. A deadline returns 504 with `request_worker_timeout`.
+Check `scheduler_deadline_stage` to see whether it expired in `queue` or during
+`execution`. Once execution starts, the worker continues to own its slot until the
+operation actually ends, including after client disconnection or response timeout.
 **A timeout does not prove that a command or write stopped.** Inspect the result
 or poll an existing command job before retrying. MCP `ping` stays independent of
-this pool and of the shared application-state lock, with normal MCP validation.
+this scheduler and of the shared application-state lock, with normal MCP validation.
 
 Browser calls wait at most two seconds for the serialized DevTools bridge.
 Writing to its stdin is limited to ten seconds; a request has a 120-second total
@@ -99,6 +110,23 @@ These are application bounds, not an OS memory quota: arbitrary commands,
 browser processes and other file operations can still consume substantial RAM.
 On Linux, compare `/proc/<pid>/status`, `/proc/pressure/memory` and kernel OOM
 records. A large swap allocation alone is not proof of an OOM kill.
+
+## External cloudflared reliability
+
+When CatDesk is exposed through a separately managed `cloudflared.service`, keep
+that tunnel independently supervised. CatDesk reserves its local listener before
+potentially slow browser/DevTools startup, so a reconnecting tunnel can establish a
+TCP connection instead of receiving `connection refused` while those components
+initialize.
+
+Recent cloudflared releases run DNS, UDP/QUIC and TCP/HTTP2 connectivity prechecks
+on startup. If the local precheck reports QUIC failure but HTTP/2 success, the
+repository includes `ops/systemd/user/cloudflared.service.d/20-catdesk-reliability.conf`
+as a user-service drop-in that forces HTTP/2. It also sets `MemoryLow=64M` (memory
+protection, not a limit), restores a neutral `OOMScoreAdjust=0`, keeps automatic
+restart enabled, and shortens `RestartSec` to one second. Install the drop-in only
+for a dedicated CatDesk tunnel and verify that the journal shows four registered
+`protocol=http2` connections after restart.
 
 See the [2026-09-19 investigation](findings/2026-09-19-mcp-stalls.md) for the
 evidence and remaining limitations.

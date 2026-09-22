@@ -26,6 +26,44 @@ impl std::fmt::Display for RequestFailure {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestDeadlineStage {
+    Queue,
+    Execution,
+}
+
+impl RequestDeadlineStage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Execution => "execution",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestTiming {
+    pub(crate) queue_wait_ms: u64,
+    pub(crate) execution_ms: u64,
+    pub(crate) deadline_stage: Option<RequestDeadlineStage>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TimedRequestResult<T> {
+    pub(crate) value: T,
+    pub(crate) timing: RequestTiming,
+}
+
+#[derive(Debug)]
+pub(crate) struct TimedRequestError {
+    pub(crate) failure: RequestFailure,
+    pub(crate) timing: RequestTiming,
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 #[derive(Clone)]
 pub(crate) struct RequestWorkers {
     gate: FairGate,
@@ -38,6 +76,89 @@ impl RequestWorkers {
         }
     }
 
+    async fn run_timed<F>(
+        &self,
+        key: SchedulingKey,
+        work: F,
+        deadline: Duration,
+    ) -> Result<TimedRequestResult<F::Output>, TimedRequestError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let request_started = Instant::now();
+        let absolute_deadline = request_started + deadline;
+        let permit = match self.gate.acquire(key, absolute_deadline).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                let (failure, deadline_stage) = match error {
+                    FairAcquireError::Deadline => {
+                        (RequestFailure::Deadline, Some(RequestDeadlineStage::Queue))
+                    }
+                    FairAcquireError::Overloaded => (RequestFailure::Busy, None),
+                    FairAcquireError::Closed => (RequestFailure::Failed, None),
+                };
+                return Err(TimedRequestError {
+                    failure,
+                    timing: RequestTiming {
+                        queue_wait_ms: elapsed_ms(request_started),
+                        execution_ms: 0,
+                        deadline_stage,
+                    },
+                });
+            }
+        };
+        let queue_wait_ms = elapsed_ms(request_started);
+        let remaining = absolute_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            drop(permit);
+            return Err(TimedRequestError {
+                failure: RequestFailure::Deadline,
+                timing: RequestTiming {
+                    queue_wait_ms,
+                    execution_ms: 0,
+                    deadline_stage: Some(RequestDeadlineStage::Queue),
+                },
+            });
+        }
+
+        let execution_started = Instant::now();
+        let runtime = tokio::runtime::Handle::current();
+        let task = tokio::task::spawn_blocking(move || {
+            // Once synchronous work has started, a disconnected client or response timeout
+            // cannot safely cancel it. Keep the physical slot until the real work ends.
+            let _permit = permit;
+            runtime.block_on(work)
+        });
+        match tokio::time::timeout(remaining, task).await {
+            Ok(Ok(value)) => Ok(TimedRequestResult {
+                value,
+                timing: RequestTiming {
+                    queue_wait_ms,
+                    execution_ms: elapsed_ms(execution_started),
+                    deadline_stage: None,
+                },
+            }),
+            Ok(Err(_)) => Err(TimedRequestError {
+                failure: RequestFailure::Failed,
+                timing: RequestTiming {
+                    queue_wait_ms,
+                    execution_ms: elapsed_ms(execution_started),
+                    deadline_stage: None,
+                },
+            }),
+            Err(_) => Err(TimedRequestError {
+                failure: RequestFailure::Deadline,
+                timing: RequestTiming {
+                    queue_wait_ms,
+                    execution_ms: elapsed_ms(execution_started),
+                    deadline_stage: Some(RequestDeadlineStage::Execution),
+                },
+            }),
+        }
+    }
+
+    #[cfg(test)]
     async fn run<F>(
         &self,
         key: SchedulingKey,
@@ -48,34 +169,10 @@ impl RequestWorkers {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let absolute_deadline = Instant::now() + deadline;
-        let permit =
-            self.gate
-                .acquire(key, absolute_deadline)
-                .await
-                .map_err(|error| match error {
-                    FairAcquireError::Deadline => RequestFailure::Deadline,
-                    FairAcquireError::Overloaded => RequestFailure::Busy,
-                    FairAcquireError::Closed => RequestFailure::Failed,
-                })?;
-        let remaining = absolute_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            drop(permit);
-            return Err(RequestFailure::Deadline);
-        }
-
-        let runtime = tokio::runtime::Handle::current();
-        let task = tokio::task::spawn_blocking(move || {
-            // Once synchronous work has started, a disconnected client or response timeout
-            // cannot safely cancel it. Keep the physical slot until the real work ends.
-            let _permit = permit;
-            runtime.block_on(work)
-        });
-        match tokio::time::timeout(remaining, task).await {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(_)) => Err(RequestFailure::Failed),
-            Err(_) => Err(RequestFailure::Deadline),
-        }
+        self.run_timed(key, work, deadline)
+            .await
+            .map(|result| result.value)
+            .map_err(|error| error.failure)
     }
 
     fn snapshot(&self) -> FairGateSnapshot {
@@ -170,6 +267,21 @@ impl RequestScheduler {
         }
     }
 
+    pub(crate) async fn run_keyed_timed<F>(
+        &self,
+        class: RequestClass,
+        key: SchedulingKey,
+        work: F,
+        deadline: Duration,
+    ) -> Result<TimedRequestResult<F::Output>, TimedRequestError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.workers(class).run_timed(key, work, deadline).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn run_keyed<F>(
         &self,
         class: RequestClass,
@@ -181,7 +293,10 @@ impl RequestScheduler {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.workers(class).run(key, work, deadline).await
+        self.run_keyed_timed(class, key, work, deadline)
+            .await
+            .map(|result| result.value)
+            .map_err(|error| error.failure)
     }
 
     pub(crate) fn snapshot(&self) -> RequestSchedulerSnapshot {
@@ -485,6 +600,99 @@ mod tests {
         assert!(blocker.await.unwrap().is_ok());
         tokio::task::yield_now().await;
         assert!(!side_effect.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn timed_scheduler_distinguishes_queue_deadline_from_execution_deadline() {
+        let scheduler = RequestScheduler::with_limits(RequestLimits {
+            control: 1,
+            filesystem: 1,
+            process: 1,
+            browser: 1,
+            general: 1,
+        });
+        let release = Arc::new(tokio::sync::Notify::new());
+        let blocker_scheduler = scheduler.clone();
+        let blocker_release = release.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_scheduler
+                .run_keyed(
+                    RequestClass::Filesystem,
+                    key("holder"),
+                    async move { blocker_release.notified().await },
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        wait_until(|| scheduler.snapshot().filesystem.active == 1).await;
+
+        let queued = scheduler
+            .run_keyed_timed(
+                RequestClass::Filesystem,
+                key("queued"),
+                async { 7u8 },
+                Duration::from_millis(20),
+            )
+            .await
+            .expect_err("queued request should hit its response deadline");
+        assert_eq!(queued.failure, RequestFailure::Deadline);
+        assert_eq!(
+            queued.timing.deadline_stage,
+            Some(RequestDeadlineStage::Queue)
+        );
+        assert_eq!(queued.timing.execution_ms, 0);
+        assert!(queued.timing.queue_wait_ms > 0);
+
+        release.notify_waiters();
+        assert!(blocker.await.unwrap().is_ok());
+
+        let (finish, wait) = std::sync::mpsc::channel();
+        let watchdog = finish.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            let _ = watchdog.send(());
+        });
+        let running = scheduler
+            .run_keyed_timed(
+                RequestClass::Filesystem,
+                key("running"),
+                async move {
+                    let _ = wait.recv_timeout(Duration::from_secs(2));
+                    9u8
+                },
+                Duration::from_millis(20),
+            )
+            .await
+            .expect_err("running request should hit its response deadline");
+        assert_eq!(running.failure, RequestFailure::Deadline);
+        assert_eq!(
+            running.timing.deadline_stage,
+            Some(RequestDeadlineStage::Execution)
+        );
+        assert!(running.timing.execution_ms > 0);
+        let _ = finish.send(());
+    }
+
+    #[tokio::test]
+    async fn timed_scheduler_reports_successful_queue_and_execution_waits() {
+        let scheduler = RequestScheduler::with_limits(RequestLimits {
+            control: 1,
+            filesystem: 1,
+            process: 1,
+            browser: 1,
+            general: 1,
+        });
+        let result = scheduler
+            .run_keyed_timed(
+                RequestClass::Control,
+                key("success"),
+                async { 42u8 },
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("timed request should succeed");
+        assert_eq!(result.value, 42);
+        assert_eq!(result.timing.deadline_stage, None);
     }
 
     #[tokio::test]
