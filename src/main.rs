@@ -45,7 +45,7 @@ use ratatui::{
 };
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
-    GPT_5_6_AND_EARLIER_USAGE_BUCKET, LIVE_USAGE_WINDOW_MS, LogEntry, Mode, ServerUiEvent,
+    LIVE_USAGE_WINDOW_MS, LogEntry, Mode, ServerUiEvent,
     SharedState, ShowDetailMode, ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle,
     app_config_path, flow_anim_lit_count, load_app_config, load_macos_terminal_profile,
     load_ngrok_authtoken, load_ngrok_domain, local_now, save_macos_terminal_profile,
@@ -79,7 +79,7 @@ const NGROK_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓";
 const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
 const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
-const STATUS_LABEL_WIDTH: usize = 19;
+const STATUS_LABEL_WIDTH: usize = 11;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
@@ -340,16 +340,6 @@ fn estimate_gpt_5_6_and_earlier_usage_cost_usd(usage: &UsageTotals) -> f64 {
     (usage.tool_input_tokens as f64 * GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M
         + usage.tool_output_tokens as f64 * GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M)
         / 1_000_000.0
-}
-
-fn estimate_all_time_usage_cost_usd(app: &AppState) -> f64 {
-    app.usage_by_model
-        .iter()
-        .map(|(bucket, usage)| match bucket.as_str() {
-            GPT_5_6_AND_EARLIER_USAGE_BUCKET => estimate_gpt_5_6_and_earlier_usage_cost_usd(usage),
-            _ => panic!("missing pricing for usage bucket `{bucket}`"),
-        })
-        .sum()
 }
 
 fn format_usd_compact(usd: f64) -> String {
@@ -721,95 +711,6 @@ fn mcp_url_reveal_bar_segments(remaining: Duration) -> (String, String) {
     )
 }
 
-fn formatted_usage_values(usage: &UsageTotals, cost_usd: f64) -> [String; 5] {
-    [
-        format_token_compact(usage.tool_input_tokens),
-        format_token_compact(usage.tool_output_tokens),
-        format_token_compact(usage.total_tokens),
-        format_token_compact(usage.tool_call_count),
-        format_usd_compact(cost_usd),
-    ]
-}
-
-fn usage_value_widths(
-    first: &UsageTotals,
-    first_cost_usd: f64,
-    second: &UsageTotals,
-    second_cost_usd: f64,
-) -> [usize; 5] {
-    let first = formatted_usage_values(first, first_cost_usd);
-    let second = formatted_usage_values(second, second_cost_usd);
-    std::array::from_fn(|index| first[index].len().max(second[index].len()))
-}
-
-fn usage_line(
-    usage: &UsageTotals,
-    cost_usd: f64,
-    cost_rates: Option<(f64, f64)>,
-    status_label: Span<'static>,
-    leading_value: Option<String>,
-    palette: &theme::Palette,
-    value_widths: &[usize; 5],
-    _ui_language: UiLanguage,
-) -> Line<'static> {
-    let label_style = Style::default().fg(palette.muted_fg);
-    let value_style = Style::default()
-        .fg(palette.secondary_fg)
-        .add_modifier(Modifier::BOLD);
-    let price_style = Style::default()
-        .fg(palette.success_fg)
-        .add_modifier(Modifier::BOLD);
-    let values = formatted_usage_values(usage, cost_usd);
-
-    let mut spans = vec![status_label];
-    if let Some(value) = leading_value {
-        spans.push(Span::styled(value, value_style));
-        spans.push(Span::raw("  "));
-    }
-    spans.extend([
-        Span::styled("↓", label_style),
-        Span::styled(
-            format!("{:<width$}", values[0], width = value_widths[0]),
-            value_style,
-        ),
-        Span::raw("  "),
-        Span::styled("↑", label_style),
-        Span::styled(
-            format!("{:<width$}", values[1], width = value_widths[1]),
-            value_style,
-        ),
-        Span::raw("  "),
-        Span::styled("Σ", label_style),
-        Span::styled(
-            format!("{:<width$}", values[2], width = value_widths[2]),
-            value_style,
-        ),
-        Span::raw("  "),
-        Span::styled("ƒ", label_style),
-        Span::styled(
-            format!("{:<width$}", values[3], width = value_widths[3]),
-            value_style,
-        ),
-        Span::raw("  "),
-        Span::styled("$", label_style),
-        Span::styled(
-            format!("{:<width$}", values[4], width = value_widths[4]),
-            price_style,
-        ),
-    ]);
-    if let Some((cost_per_min_usd, cost_per_hour_usd)) = cost_rates {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("$", label_style));
-        spans.push(Span::styled(format_usd_compact(cost_per_min_usd), price_style));
-        spans.push(Span::styled("/min", label_style));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("$", label_style));
-        spans.push(Span::styled(format_usd_compact(cost_per_hour_usd), price_style));
-        spans.push(Span::styled("/h", label_style));
-    }
-    Line::from(spans)
-}
-
 fn session_cost_rates(cost_usd: f64, elapsed: Duration) -> (f64, f64) {
     let elapsed_secs = elapsed.as_secs_f64();
     if elapsed_secs <= 0.0 {
@@ -817,35 +718,6 @@ fn session_cost_rates(cost_usd: f64, elapsed: Duration) -> (f64, f64) {
     }
     let cost_per_min_usd = cost_usd * 60.0 / elapsed_secs;
     (cost_per_min_usd, cost_per_min_usd * 60.0)
-}
-
-fn live_usage_rate_line(
-    usage: &UsageTotals,
-    status_label: Span<'static>,
-    palette: &theme::Palette,
-) -> Line<'static> {
-    let label_style = Style::default().fg(palette.muted_fg);
-    let value_style = Style::default()
-        .fg(palette.secondary_fg)
-        .add_modifier(Modifier::BOLD);
-    let input = format_token_compact(usage.tool_input_tokens);
-    let output = format_token_compact(usage.tool_output_tokens);
-    let total = format_token_compact(usage.total_tokens);
-
-    Line::from(vec![
-        status_label,
-        Span::styled("↓", label_style),
-        Span::styled(input, value_style),
-        Span::styled("/min", label_style),
-        Span::raw("  "),
-        Span::styled("↑", label_style),
-        Span::styled(output, value_style),
-        Span::styled("/min", label_style),
-        Span::raw("  "),
-        Span::styled("Σ", label_style),
-        Span::styled(total, value_style),
-        Span::styled("/min", label_style),
-    ])
 }
 
 fn flow_lane_left_label(ui_language: UiLanguage) -> &'static str {
@@ -3157,22 +3029,19 @@ mod tests {
         for expected in [
             "讓ChatGPTWeb變成程式代理",
             "狀態",
-            "模式",
-            "工具模式",
-            "伺服器",
-            "工作區",
-            "遠端已連線",
-            "聊天數",
-            "背景工作",
-            "60秒速率",
-            "本次工作階段",
-            "累計",
-            "本機瀏覽器",
-            "遠端除錯支援",
-            "選取的瀏覽器",
+            "請求",
+            "執行",
+            "排隊",
+            "總計",
+            "聊天",
+            "工作",
+            "即時成本",
+            "工作階段平均",
+            "工作階段",
+            "Token60秒",
+            "系統",
             "等待連線",
             "你的電腦",
-            "請求",
             "按鍵",
             "離開",
             "捲動",
@@ -3238,17 +3107,33 @@ mod tests {
 
         let text = terminal_buffer_text(&terminal);
         for expected in [
-            "Chats 2",
-            "Bg jobs 3",
-            "Requests 42",
-            "60s rate",
-            "2m 0s",
-            "$2.5/min",
+            "REQUESTS",
+            "RUN 0",
+            "QUEUED 0",
+            "TOTAL 42",
+            "CHATS 2",
+            "JOBS 3",
+            "COST NOW",
+            "$300/h",
+            "$5/min",
+            "SESSION AVG",
             "$150/h",
+            "$2.5/min",
+            "SESSION",
+            "$5",
+            "2m 0s",
+            "TOKENS 60s",
+            "SYSTEM",
         ] {
             assert!(
                 text.contains(expected),
                 "missing live telemetry text: {expected}"
+            );
+        }
+        for hidden in ["Workspace", "All-time", "MCP Server URL"] {
+            assert!(
+                !text.contains(hidden),
+                "normal status should hide low-priority field: {hidden}"
             );
         }
         assert!(!text.contains("(tool input, llm output)"));
@@ -3292,7 +3177,7 @@ mod tests {
 
         let text = terminal_buffer_text(&terminal);
         assert!(
-            text.contains("Requests 42"),
+            text.contains("TOTAL 42"),
             "request counter must remain in the always-visible status area"
         );
 
@@ -5703,27 +5588,6 @@ fn draw_ui(
     // ── Status ──
     let mode_label = app.mode.label_for(ui_language);
     let tool_mode_label = app.tool_mode.label_for(ui_language);
-    let server_status = if app.server_running {
-        if ui_language.is_traditional_chinese() {
-            format!("執行中（連接埠 {}）", app.port)
-        } else {
-            format!("RUNNING (port {})", app.port)
-        }
-    } else {
-        ui_language.text("STOPPED", "已停止").into()
-    };
-    let ngrok_status: &str = if app.ngrok_running {
-        ui_language.text("RUNNING", "執行中")
-    } else {
-        ui_language.text("STOPPED", "已停止")
-    };
-    let devtools_status: &str = if app.devtools_running {
-        ui_language.text("RUNNING", "執行中")
-    } else if app.mode.browser_enabled() {
-        ui_language.text("STOPPED", "已停止")
-    } else {
-        ui_language.text("N/A", "不適用")
-    };
     let full_mcp_url = app.public_mcp_url();
     let mcp_url_is_revealed = full_mcp_url.is_some() && mcp_url_reveal_remaining.is_some();
     let mcp_url = match (&full_mcp_url, mcp_url_is_revealed) {
@@ -5739,25 +5603,6 @@ fn draw_ui(
             format!("[ EXPOSED {:>2}s ]", seconds)
         }
     });
-    let browser_summary = browser::format_browser_names(&app.detected_browsers);
-    let remote_support_summary = browser::format_remote_debug_names(&app.detected_browsers);
-    let remote_active_summary = browser::format_active_remote_debug_names(&app.detected_browsers);
-    let selected_browser_summary = app
-        .selected_browser
-        .as_ref()
-        .map(|b| format!("{} ({})", b.name, b.binary))
-        .unwrap_or_else(|| "--".into());
-    let selected_target_summary = app
-        .selected_browser
-        .as_ref()
-        .map(|b| {
-            b.remote_debug_target.clone().unwrap_or_else(|| {
-                ui_language
-                    .text("launch new browser instance", "啟動新的瀏覽器執行個體")
-                    .into()
-            })
-        })
-        .unwrap_or_else(|| "--".into());
     let computer_role_style = Style::default()
         .fg(if app.server_running {
             palette.success_fg
@@ -5791,237 +5636,132 @@ fn draw_ui(
     let flow_block_lines = 3;
 
     let rolling_usage_totals = app.rolling_usage_totals(now_millis, LIVE_USAGE_WINDOW_MS);
-    let all_time_usage_totals = app.all_time_usage_totals();
+    let rolling_usage_cost_usd = estimate_gpt_5_6_and_earlier_usage_cost_usd(&rolling_usage_totals);
+    let (live_cost_per_min_usd, live_cost_per_hour_usd) = session_cost_rates(
+        rolling_usage_cost_usd,
+        Duration::from_millis(LIVE_USAGE_WINDOW_MS as u64),
+    );
     let session_usage_cost_usd =
         estimate_gpt_5_6_and_earlier_usage_cost_usd(&app.session_usage_totals);
-    let session_cost_rates = session_cost_rates(session_usage_cost_usd, session_elapsed);
-    let all_time_usage_cost_usd = estimate_all_time_usage_cost_usd(app);
-    let usage_widths = usage_value_widths(
-        &app.session_usage_totals,
-        session_usage_cost_usd,
-        &all_time_usage_totals,
-        all_time_usage_cost_usd,
-    );
+    let (session_cost_per_min_usd, session_cost_per_hour_usd) =
+        session_cost_rates(session_usage_cost_usd, session_elapsed);
+    let request_snapshot = request_workers::global_request_scheduler().snapshot();
+    let request_gates = [
+        request_snapshot.control,
+        request_snapshot.filesystem,
+        request_snapshot.process,
+        request_snapshot.browser,
+        request_snapshot.general,
+    ];
+    let active_request_count: usize = request_gates.iter().map(|gate| gate.active).sum();
+    let queued_request_count: usize = request_gates.iter().map(|gate| gate.queued).sum();
+    let muted_style = Style::default().fg(palette.muted_fg);
+    let value_style = Style::default()
+        .fg(palette.secondary_fg)
+        .add_modifier(Modifier::BOLD);
+    let cost_style = Style::default()
+        .fg(palette.success_fg)
+        .add_modifier(Modifier::BOLD);
+    let health_style = |healthy: bool| {
+        Style::default()
+            .fg(if healthy {
+                palette.success_fg
+            } else {
+                palette.danger_fg
+            })
+            .add_modifier(Modifier::BOLD)
+    };
+    let devtools_indicator = if app.devtools_running {
+        ("✓", Style::default().fg(palette.success_fg))
+    } else if app.mode.browser_enabled() {
+        ("×", Style::default().fg(palette.danger_fg))
+    } else {
+        ("-", Style::default().fg(palette.muted_fg))
+    };
+
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
-            status_label(ui_language.text("Mode", "模式")),
+            status_label(ui_language.text("REQUESTS", "請求")),
+            Span::styled(format!("{} ", ui_language.text("RUN", "執行")), muted_style),
+            Span::styled(active_request_count.to_string(), value_style),
+            Span::styled(format!("  {} ", ui_language.text("QUEUED", "排隊")), muted_style),
+            Span::styled(queued_request_count.to_string(), value_style),
+            Span::styled(format!("  {} ", ui_language.text("TOTAL", "總計")), muted_style),
+            Span::styled(app.request_count.to_string(), value_style),
+            Span::styled(format!("  {} ", ui_language.text("CHATS", "聊天")), muted_style),
+            Span::styled(app.connected_chat_count().to_string(), value_style),
+            Span::styled(format!("  {} ", ui_language.text("JOBS", "工作")), muted_style),
+            Span::styled(active_job_count.to_string(), value_style),
+        ]),
+        Line::from(vec![
+            status_label(ui_language.text("COST NOW", "即時成本")),
             Span::styled(
-                mode_label,
-                Style::default()
-                    .fg(palette.secondary_fg)
-                    .add_modifier(Modifier::BOLD),
+                format!("${}/h", format_usd_compact(live_cost_per_hour_usd)),
+                cost_style,
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("${}/min", format_usd_compact(live_cost_per_min_usd)),
+                cost_style,
+            ),
+            Span::styled(
+                format!("    {} ", ui_language.text("SESSION AVG", "工作階段平均")),
+                muted_style,
+            ),
+            Span::styled(
+                format!("${}/h", format_usd_compact(session_cost_per_hour_usd)),
+                cost_style,
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("${}/min", format_usd_compact(session_cost_per_min_usd)),
+                cost_style,
             ),
         ]),
         Line::from(vec![
-            status_label(ui_language.text("Tool mode", "工具模式")),
+            status_label(ui_language.text("SESSION", "工作階段")),
+            Span::styled(format_session_duration(session_elapsed), value_style),
+            Span::raw("  "),
             Span::styled(
-                tool_mode_label,
-                Style::default()
-                    .fg(palette.secondary_fg)
-                    .add_modifier(Modifier::BOLD),
+                format!("${}", format_usd_compact(session_usage_cost_usd)),
+                cost_style,
+            ),
+            Span::styled(
+                format!("    {} ", ui_language.text("TOKENS 60s", "Token 60秒")),
+                muted_style,
+            ),
+            Span::styled("↓", muted_style),
+            Span::styled(
+                format_token_compact(rolling_usage_totals.tool_input_tokens),
+                value_style,
+            ),
+            Span::raw("  "),
+            Span::styled("↑", muted_style),
+            Span::styled(
+                format_token_compact(rolling_usage_totals.tool_output_tokens),
+                value_style,
+            ),
+            Span::raw("  "),
+            Span::styled("Σ", muted_style),
+            Span::styled(
+                format_token_compact(rolling_usage_totals.total_tokens),
+                value_style,
             ),
         ]),
         Line::from(vec![
-            status_label(ui_language.text("Server", "伺服器")),
-            Span::styled(
-                &server_status,
-                Style::default().fg(if app.server_running {
-                    palette.success_fg
-                } else {
-                    palette.danger_fg
-                }),
-            ),
+            status_label(ui_language.text("SYSTEM", "系統")),
+            Span::styled("MCP ", muted_style),
+            Span::styled(if app.server_running { "✓" } else { "×" }, health_style(app.server_running)),
+            Span::styled("  NGROK ", muted_style),
+            Span::styled(if app.ngrok_running { "✓" } else { "×" }, health_style(app.ngrok_running)),
+            Span::styled("  DEVTOOLS ", muted_style),
+            Span::styled(devtools_indicator.0, devtools_indicator.1.add_modifier(Modifier::BOLD)),
+            Span::styled(format!("    {} ", ui_language.text("MODE", "模式")), muted_style),
+            Span::styled(mode_label, value_style),
+            Span::styled(" / ", muted_style),
+            Span::styled(tool_mode_label, value_style),
         ]),
-        Line::from(vec![
-            status_label("ngrok"),
-            Span::styled(
-                ngrok_status,
-                Style::default().fg(if app.ngrok_running {
-                    palette.success_fg
-                } else {
-                    palette.danger_fg
-                }),
-            ),
-        ]),
-        Line::from(vec![
-            status_label("DevTools"),
-            Span::styled(
-                devtools_status,
-                Style::default().fg(if app.devtools_running {
-                    palette.success_fg
-                } else {
-                    palette.muted_fg
-                }),
-            ),
-        ]),
-        {
-            let mut spans = vec![
-                status_label(ui_language.text("MCP Server URL", "MCP 伺服器 URL")),
-                Span::styled(
-                    &mcp_url,
-                    Style::default().fg(if has_url {
-                        if mcp_url_is_revealed {
-                            palette.info_fg
-                        } else {
-                            palette.muted_fg
-                        }
-                    } else {
-                        palette.muted_fg
-                    }),
-                ),
-            ];
-            if has_url {
-                spans.push(Span::raw("  "));
-                let security_text = mcp_url_security_status
-                    .as_deref()
-                    .unwrap_or(ui_language.text("Click to reveal", "點擊顯示"));
-                let security_color = match mcp_url_reveal_remaining {
-                    Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => palette.danger_fg,
-                    Some(_) => palette.warning_fg,
-                    None => palette.muted_fg,
-                };
-                spans.push(Span::styled(
-                    security_text.to_string(),
-                    Style::default()
-                        .fg(security_color)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                if let Some(remaining) = mcp_url_reveal_remaining {
-                    let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
-                    spans.push(Span::raw("  "));
-                    spans.push(Span::styled(
-                        remaining_bar,
-                        Style::default()
-                            .fg(security_color)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    spans.push(Span::styled(
-                        elapsed_bar,
-                        Style::default().fg(palette.muted_fg),
-                    ));
-                }
-            }
-            Line::from(spans)
-        },
-        Line::from(vec![
-            status_label(ui_language.text("Workspace", "工作區")),
-            Span::styled(
-                &*app.workspace_root,
-                Style::default().fg(palette.secondary_fg),
-            ),
-        ]),
-        {
-            let mut spans = vec![status_label(
-                ui_language.text("Remote connected", "遠端已連線"),
-            )];
-            if app.remote_connected {
-                spans.push(Span::styled(
-                    "V",
-                    Style::default()
-                        .fg(palette.success_fg)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    "X",
-                    Style::default()
-                        .fg(palette.danger_fg)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                format!("{} ", ui_language.text("Chats", "聊天數")),
-                Style::default().fg(palette.muted_fg),
-            ));
-            spans.push(Span::styled(
-                app.connected_chat_count().to_string(),
-                Style::default()
-                    .fg(palette.secondary_fg)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                format!("{} ", ui_language.text("Bg jobs", "背景工作")),
-                Style::default().fg(palette.muted_fg),
-            ));
-            spans.push(Span::styled(
-                active_job_count.to_string(),
-                Style::default()
-                    .fg(palette.secondary_fg)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                format!("{} ", ui_language.text("Requests", "請求")),
-                Style::default().fg(palette.muted_fg),
-            ));
-            spans.push(Span::styled(
-                app.request_count.to_string(),
-                Style::default()
-                    .fg(palette.secondary_fg)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            Line::from(spans)
-        },
-        live_usage_rate_line(
-            &rolling_usage_totals,
-            status_label(ui_language.text("60s rate", "60 秒速率")),
-            &palette,
-        ),
-        usage_line(
-            &app.session_usage_totals,
-            session_usage_cost_usd,
-            Some(session_cost_rates),
-            status_label(ui_language.text("Session", "本次工作階段")),
-            Some(format_session_duration(session_elapsed)),
-            &palette,
-            &usage_widths,
-            ui_language,
-        ),
-        usage_line(
-            &all_time_usage_totals,
-            all_time_usage_cost_usd,
-            None,
-            status_label(ui_language.text("All-time", "累計")),
-            None,
-            &palette,
-            &usage_widths,
-            ui_language,
-        ),
     ];
-
-    if !show_guide {
-        status_lines.push(Line::from(vec![
-            status_label(ui_language.text("Local browsers", "本機瀏覽器")),
-            Span::styled(browser_summary, Style::default().fg(palette.title_fg)),
-        ]));
-        status_lines.push(Line::from(vec![
-            status_label(ui_language.text("Remote dbg support", "遠端除錯支援")),
-            Span::styled(remote_support_summary, Style::default().fg(palette.info_fg)),
-        ]));
-        status_lines.push(Line::from(vec![
-            status_label(ui_language.text("Remote dbg active", "遠端除錯啟用")),
-            Span::styled(
-                remote_active_summary,
-                Style::default().fg(palette.success_fg),
-            ),
-        ]));
-        status_lines.push(Line::from(vec![
-            status_label(ui_language.text("Selected browser", "選取的瀏覽器")),
-            Span::styled(
-                selected_browser_summary,
-                Style::default().fg(palette.secondary_fg),
-            ),
-        ]));
-        status_lines.push(Line::from(vec![
-            status_label(ui_language.text("Selected target", "選取的目標")),
-            Span::styled(
-                selected_target_summary,
-                Style::default().fg(palette.info_fg),
-            ),
-        ]));
-    }
 
     let visible_flow_slots = if show_flow_panel {
         status_content_height.saturating_sub(status_lines.len() + 1) / flow_block_lines.max(1)
