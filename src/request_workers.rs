@@ -643,7 +643,7 @@ mod tests {
         assert_eq!(queued.timing.execution_ms, 0);
         assert!(queued.timing.queue_wait_ms > 0);
 
-        release.notify_waiters();
+        release.notify_one();
         assert!(blocker.await.unwrap().is_ok());
 
         let (finish, wait) = std::sync::mpsc::channel();
