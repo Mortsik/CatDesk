@@ -33,6 +33,7 @@ use crate::state::{
 
 const STATELESS_FLOW_ID: &str = "stateless";
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const OPENAI_SESSION_META_KEY: &str = "openai/session";
 #[derive(Clone, Debug)]
 struct ClientSession {
     id: Option<String>,
@@ -41,21 +42,52 @@ struct ClientSession {
 
 impl ClientSession {
     fn from_headers(headers: &HeaderMap) -> Self {
-        let id = headers
+        Self::from_request(headers, None)
+    }
+
+    fn from_request(headers: &HeaderMap, body: Option<&Value>) -> Self {
+        let header_id = headers
             .get(MCP_SESSION_ID_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
             .filter(|value| !value.is_empty() && value.len() <= 512)
             .map(str::to_string);
-        let flow_id = id
-            .as_deref()
-            .map(|session_id| {
-                let mut hasher = DefaultHasher::new();
-                session_id.hash(&mut hasher);
-                format!("session:{:016x}", hasher.finish())
-            })
-            .unwrap_or_else(|| STATELESS_FLOW_ID.to_string());
-        Self { id, flow_id }
+        if let Some(id) = header_id {
+            let flow_id = Self::hashed_flow_id(&id);
+            return Self {
+                id: Some(id),
+                flow_id,
+            };
+        }
+
+        let openai_session = body
+            .and_then(|body| body.get("params"))
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get(OPENAI_SESSION_META_KEY))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 512);
+        if let Some(session_id) = openai_session {
+            let mut hasher = DefaultHasher::new();
+            OPENAI_SESSION_META_KEY.hash(&mut hasher);
+            session_id.hash(&mut hasher);
+            let digest = hasher.finish();
+            return Self {
+                id: Some(format!("openai:{digest:016x}")),
+                flow_id: format!("session:{digest:016x}"),
+            };
+        }
+
+        Self {
+            id: None,
+            flow_id: STATELESS_FLOW_ID.to_string(),
+        }
+    }
+
+    fn hashed_flow_id(session_id: &str) -> String {
+        let mut hasher = DefaultHasher::new();
+        session_id.hash(&mut hasher);
+        format!("session:{:016x}", hasher.finish())
     }
 
     fn namespace(&self) -> Option<&str> {
@@ -1589,6 +1621,34 @@ mod tests {
     }
 
     #[test]
+    fn client_session_falls_back_to_openai_session_metadata() {
+        fn body_with_openai_session(session_id: &str) -> Value {
+            let bytes = tool_call_body("read", json!({ "paths": ["x"] }));
+            let mut body: Value = serde_json::from_slice(&bytes).expect("parse tool call");
+            body["params"]["_meta"]["openai/session"] = json!(session_id);
+            body
+        }
+
+        let body_a = body_with_openai_session("chat-a");
+        let body_b = body_with_openai_session("chat-b");
+        let session_a = ClientSession::from_request(&HeaderMap::new(), Some(&body_a));
+        let same_session_a = ClientSession::from_request(&HeaderMap::new(), Some(&body_a));
+        let session_b = ClientSession::from_request(&HeaderMap::new(), Some(&body_b));
+
+        assert_eq!(session_a.flow_id, same_session_a.flow_id);
+        assert_ne!(session_a.flow_id, session_b.flow_id);
+        assert_ne!(session_a.flow_id, STATELESS_FLOW_ID);
+        assert!(!session_a.flow_id.contains("chat-a"));
+        assert_ne!(session_a.namespace(), Some("chat-a"));
+        assert_ne!(session_a.namespace(), session_b.namespace());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(MCP_SESSION_ID_HEADER, "header-session".parse().unwrap());
+        let header_session = ClientSession::from_request(&headers, Some(&body_a));
+        assert_eq!(header_session.namespace(), Some("header-session"));
+    }
+
+    #[test]
     fn scheduling_key_uses_named_session_and_active_project() {
         let body = tool_call_body("read", json!({ "paths": ["x"] }));
         let session = ClientSession::from_headers(&modern_mcp_headers_for_session(&body, "session-a"));
@@ -3114,6 +3174,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_session_metadata_tracks_parallel_chats_without_mcp_session_header() {
+        fn with_openai_session(body: Bytes, session_id: &str) -> Bytes {
+            let mut value: Value = serde_json::from_slice(&body).expect("parse test request");
+            value["params"]["_meta"][OPENAI_SESSION_META_KEY] = json!(session_id);
+            Bytes::from(serde_json::to_vec(&value).expect("serialize test request"))
+        }
+
+        let workspace_root = unique_temp_path("catdesk-openai-session-workspace");
+        let config_root = unique_temp_path("catdesk-openai-session-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let server_state = ServerState {
+            app: app_state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: InstructionGate::with_anonymous(false),
+        };
+
+        for session_id in ["chat-a", "chat-b"] {
+            let body = with_openai_session(
+                tool_call_body("catdesk_instruction", json!({})),
+                session_id,
+            );
+            let headers = modern_mcp_headers_for_body(&body);
+            assert!(headers.get(MCP_SESSION_ID_HEADER).is_none());
+            let response = post_mcp_http(State(server_state.clone()), headers, body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let app = app_state.lock().await;
+        assert_eq!(app.connected_chat_count(), 2);
+        assert!(app.flows.iter().all(|flow| !flow.flow_id.contains("chat-")));
+        drop(app);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
     async fn authoritative_session_state_survives_a_full_ui_event_queue() {
         let workspace_root = unique_temp_path("catdesk-authoritative-session-workspace");
         let config_root = unique_temp_path("catdesk-authoritative-session-config");
@@ -4030,9 +4141,9 @@ async fn post_mcp_http(
         .as_ref()
         .map(request_class)
         .unwrap_or(RequestClass::General);
-    let client_session = ClientSession::from_headers(&headers);
+    let client_session = ClientSession::from_request(&headers, metadata.as_ref());
     let scheduling_key = request_scheduling_key(&client_session, &s.catdesk_instruction_called);
-    let id = metadata.and_then(|v| v.get("id").cloned());
+    let id = metadata.as_ref().and_then(|v| v.get("id").cloned());
     match global_request_scheduler()
         .run_keyed(
             class,
@@ -4165,7 +4276,7 @@ async fn post_mcp_inner(
 
     crate::diagnostics::rpc_request(&body);
     let _ = s.ui_events.try_send(ServerUiEvent::IncrementRequestCount);
-    let client_session = ClientSession::from_headers(headers);
+    let client_session = ClientSession::from_request(headers, Some(&body));
     let flow_id = client_session.flow_id.clone();
 
     let has_method = body.get("method").and_then(Value::as_str).is_some();

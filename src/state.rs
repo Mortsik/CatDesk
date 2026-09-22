@@ -121,6 +121,7 @@ impl UsageTotals {
 }
 
 pub(crate) const LIVE_USAGE_WINDOW_MS: u128 = 60_000;
+pub(crate) const HOURLY_USAGE_WINDOW_MS: u128 = 5 * 60_000;
 
 #[derive(Clone, Debug)]
 struct UsageRateSample {
@@ -1209,7 +1210,7 @@ impl AppState {
             tool_output_tokens,
         });
         while self.usage_rate_samples.front().is_some_and(|sample| {
-            now_ms.saturating_sub(sample.recorded_at_ms) > LIVE_USAGE_WINDOW_MS
+            now_ms.saturating_sub(sample.recorded_at_ms) > HOURLY_USAGE_WINDOW_MS
         }) {
             self.usage_rate_samples.pop_front();
         }
@@ -2375,16 +2376,20 @@ toolCallCount = 0
     }
 
     #[test]
-    fn rolling_usage_samples_are_pruned_to_the_live_window() {
+    fn rolling_usage_samples_retain_five_minutes_for_smoothed_hourly_rate() {
         let (mut app, workspace, config_path) = test_app("catdesk-rolling-usage-prune");
         app.record_turn_usage_at(10, 1, 1_000);
         app.record_turn_usage_at(20, 2, 61_001);
 
-        assert_eq!(app.usage_rate_samples.len(), 1);
-        let rolling = app.rolling_usage_totals(61_001, 60_000);
-        assert_eq!(rolling.tool_input_tokens, 20);
-        assert_eq!(rolling.tool_output_tokens, 2);
-        assert_eq!(rolling.tool_call_count, 1);
+        assert_eq!(app.usage_rate_samples.len(), 2);
+        let minute = app.rolling_usage_totals(61_001, LIVE_USAGE_WINDOW_MS);
+        assert_eq!(minute.tool_input_tokens, 20);
+        assert_eq!(minute.tool_output_tokens, 2);
+        assert_eq!(minute.tool_call_count, 1);
+        let five_minutes = app.rolling_usage_totals(61_001, HOURLY_USAGE_WINDOW_MS);
+        assert_eq!(five_minutes.tool_input_tokens, 30);
+        assert_eq!(five_minutes.tool_output_tokens, 3);
+        assert_eq!(five_minutes.tool_call_count, 2);
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
