@@ -1244,13 +1244,7 @@ impl AppState {
     }
 
     pub fn record_turn_usage(&mut self, tool_input_tokens: u64, tool_output_tokens: u64) {
-        let day_key = local_usage_day_key(local_now());
-        self.record_turn_usage_at_day(
-            tool_input_tokens,
-            tool_output_tokens,
-            now_unix_millis(),
-            &day_key,
-        );
+        self.record_turn_usage_at(tool_input_tokens, tool_output_tokens, now_unix_millis());
     }
 
     pub fn schedule_usage_persistence(&self) {
@@ -2360,10 +2354,26 @@ toolCallCount = 0
             .get(CURRENT_USAGE_BUCKET)
             .and_then(toml::Value::as_table)
             .expect("daily current-model usage must be persisted");
-        assert_eq!(usage.get("toolInputTokens").and_then(toml::Value::as_integer), Some(25));
-        assert_eq!(usage.get("toolOutputTokens").and_then(toml::Value::as_integer), Some(5));
-        assert_eq!(usage.get("totalTokens").and_then(toml::Value::as_integer), Some(30));
-        assert_eq!(usage.get("toolCallCount").and_then(toml::Value::as_integer), Some(2));
+        assert_eq!(
+            usage
+                .get("toolInputTokens")
+                .and_then(toml::Value::as_integer),
+            Some(25)
+        );
+        assert_eq!(
+            usage
+                .get("toolOutputTokens")
+                .and_then(toml::Value::as_integer),
+            Some(5)
+        );
+        assert_eq!(
+            usage.get("totalTokens").and_then(toml::Value::as_integer),
+            Some(30)
+        );
+        assert_eq!(
+            usage.get("toolCallCount").and_then(toml::Value::as_integer),
+            Some(2)
+        );
 
         drop(app);
         let _ = std::fs::remove_file(config_path);
@@ -2531,6 +2541,10 @@ toolCallCount = 0
         assert!(
             saved.usage_by_model.is_empty(),
             "an older deferred usage snapshot must not overwrite a newer full config persist"
+        );
+        assert!(
+            saved.daily_usage_by_model.is_empty(),
+            "an older deferred daily snapshot must not overwrite a newer billing reset"
         );
         drop(app);
 

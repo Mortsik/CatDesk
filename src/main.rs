@@ -3226,7 +3226,10 @@ mod tests {
         );
         let row = flow_rows[0];
         for expected in ["ChatGPT Web", "search", "↓12", "↑345"] {
-            assert!(row.contains(expected), "latest flow row missing {expected}: {row}");
+            assert!(
+                row.contains(expected),
+                "latest flow row missing {expected}: {row}"
+            );
         }
         for stale in ["run_command", "poll_command"] {
             assert!(

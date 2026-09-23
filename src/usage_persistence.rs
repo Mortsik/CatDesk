@@ -6,9 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::state::{
-    DailyUsageByModel, UsageTotals, persist_usage_by_model_at_path_if_current,
-};
+use crate::state::{DailyUsageByModel, UsageTotals, persist_usage_by_model_at_path_if_current};
 
 type UsageSnapshot = BTreeMap<String, UsageTotals>;
 
