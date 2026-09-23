@@ -89,6 +89,8 @@ pub struct UsageTotals {
     pub tool_call_count: u64,
 }
 
+pub type DailyUsageByModel = BTreeMap<String, BTreeMap<String, UsageTotals>>;
+
 impl UsageTotals {
     pub fn accumulate(
         &mut self,
@@ -371,6 +373,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     #[serde(default)]
+    pub daily_usage_by_model: DailyUsageByModel,
+    #[serde(default)]
     pub total_request_count: u64,
     pub selected_browser: Option<DetectedBrowser>,
 }
@@ -395,6 +399,7 @@ impl Default for AppConfig {
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
             usage_by_model: BTreeMap::new(),
+            daily_usage_by_model: DailyUsageByModel::new(),
             total_request_count: 0,
             selected_browser: None,
         }
@@ -422,6 +427,17 @@ impl AppConfig {
             .usage_by_model
             .into_iter()
             .map(|(bucket, usage)| (bucket, usage.normalized()))
+            .collect();
+        self.daily_usage_by_model = self
+            .daily_usage_by_model
+            .into_iter()
+            .map(|(day, usage_by_model)| {
+                let usage_by_model = usage_by_model
+                    .into_iter()
+                    .map(|(bucket, usage)| (bucket, usage.normalized()))
+                    .collect();
+                (day, usage_by_model)
+            })
             .collect();
         self
     }
@@ -694,6 +710,7 @@ pub struct AppState {
     pub request_count: u64,
     pub total_request_count: u64,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
+    pub daily_usage_by_model: DailyUsageByModel,
     pub session_usage_totals: UsageTotals,
     usage_rate_samples: VecDeque<UsageRateSample>,
     usage_persistence: UsagePersistence,
@@ -778,6 +795,7 @@ where
 pub(crate) fn persist_usage_by_model_at_path_if_current(
     path: &Path,
     usage_by_model: BTreeMap<String, UsageTotals>,
+    daily_usage_by_model: DailyUsageByModel,
     total_request_count: u64,
     expected_generation: u64,
     current_generation: &AtomicU64,
@@ -790,6 +808,7 @@ pub(crate) fn persist_usage_by_model_at_path_if_current(
     }
     let mut config = AppConfig::load_from_path(path)?;
     config.usage_by_model = usage_by_model;
+    config.daily_usage_by_model = daily_usage_by_model;
     config.total_request_count = total_request_count;
     config.save_to_path(path)?;
     Ok(true)
@@ -855,6 +874,10 @@ pub(crate) fn local_now() -> OffsetDateTime {
     let now = OffsetDateTime::now_utc();
     let offset = UtcOffset::local_offset_at(now).unwrap_or(UtcOffset::UTC);
     now.to_offset(offset)
+}
+
+pub(crate) fn local_usage_day_key(now: OffsetDateTime) -> String {
+    now.date().to_string()
 }
 
 fn format_hms(now: OffsetDateTime) -> String {
@@ -1092,6 +1115,7 @@ impl AppState {
             request_count: 0,
             total_request_count: config.total_request_count,
             usage_by_model: config.usage_by_model,
+            daily_usage_by_model: config.daily_usage_by_model,
             session_usage_totals: UsageTotals::default(),
             usage_rate_samples: VecDeque::new(),
             usage_persistence: UsagePersistence::new(config_path.clone()),
@@ -1149,6 +1173,7 @@ impl AppState {
         config.show_detail_mode = self.show_detail_mode;
         config.ui_language = self.ui_language;
         config.usage_by_model = self.usage_by_model.clone();
+        config.daily_usage_by_model = self.daily_usage_by_model.clone();
         config.total_request_count = self.total_request_count;
         config.selected_browser = self.selected_browser.clone();
         Ok(config.normalized())
@@ -1172,8 +1197,11 @@ impl AppState {
             self.app_config()?.save_to_path(&self.config_path)
         })();
         if result.is_err() {
-            self.usage_persistence
-                .schedule(self.usage_by_model.clone(), self.total_request_count);
+            self.usage_persistence.schedule(
+                self.usage_by_model.clone(),
+                self.daily_usage_by_model.clone(),
+                self.total_request_count,
+            );
         }
         result
     }
@@ -1192,13 +1220,40 @@ impl AppState {
         totals
     }
 
+    pub fn today_usage_by_model(&self) -> Option<&BTreeMap<String, UsageTotals>> {
+        let day_key = local_usage_day_key(local_now());
+        self.daily_usage_by_model.get(&day_key)
+    }
+
+    pub fn tracked_usage_day_count(&self) -> usize {
+        self.daily_usage_by_model
+            .values()
+            .filter(|usage_by_model| {
+                usage_by_model.values().any(|usage| {
+                    usage.tool_call_count > 0
+                        || usage.tool_input_tokens > 0
+                        || usage.tool_output_tokens > 0
+                })
+            })
+            .count()
+    }
+
     pub fn record_turn_usage(&mut self, tool_input_tokens: u64, tool_output_tokens: u64) {
-        self.record_turn_usage_at(tool_input_tokens, tool_output_tokens, now_unix_millis());
+        let day_key = local_usage_day_key(local_now());
+        self.record_turn_usage_at_day(
+            tool_input_tokens,
+            tool_output_tokens,
+            now_unix_millis(),
+            &day_key,
+        );
     }
 
     pub fn schedule_usage_persistence(&self) {
-        self.usage_persistence
-            .schedule(self.usage_by_model.clone(), self.total_request_count);
+        self.usage_persistence.schedule(
+            self.usage_by_model.clone(),
+            self.daily_usage_by_model.clone(),
+            self.total_request_count,
+        );
     }
 
     fn record_turn_usage_at(
@@ -1207,7 +1262,24 @@ impl AppState {
         tool_output_tokens: u64,
         now_ms: u128,
     ) {
+        let day_key = local_usage_day_key(local_now());
+        self.record_turn_usage_at_day(tool_input_tokens, tool_output_tokens, now_ms, &day_key);
+    }
+
+    fn record_turn_usage_at_day(
+        &mut self,
+        tool_input_tokens: u64,
+        tool_output_tokens: u64,
+        now_ms: u128,
+        day_key: &str,
+    ) {
         self.usage_by_model
+            .entry(CURRENT_USAGE_BUCKET.to_string())
+            .or_default()
+            .accumulate(tool_input_tokens, tool_output_tokens, 1);
+        self.daily_usage_by_model
+            .entry(day_key.to_string())
+            .or_default()
             .entry(CURRENT_USAGE_BUCKET.to_string())
             .or_default()
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
@@ -2261,6 +2333,114 @@ toolCallCount = 0
     }
 
     #[test]
+    fn record_turn_usage_persists_one_daily_usage_bucket() {
+        let (mut app, workspace, config_path) = test_app("catdesk-daily-usage");
+        app.record_turn_usage(10, 2);
+        app.record_turn_usage(15, 3);
+        app.persist_state().expect("persist daily usage");
+
+        let saved_text = std::fs::read_to_string(&config_path).expect("read daily usage config");
+        let saved: toml::Value = toml::from_str(&saved_text).expect("parse daily usage config");
+        let daily = saved
+            .get("dailyUsageByModel")
+            .and_then(toml::Value::as_table)
+            .expect("dailyUsageByModel must be persisted");
+        assert_eq!(daily.len(), 1, "two calls today must share one day bucket");
+        let models = daily
+            .values()
+            .next()
+            .and_then(toml::Value::as_table)
+            .expect("daily usage day must contain model buckets");
+        let usage = models
+            .get(CURRENT_USAGE_BUCKET)
+            .and_then(toml::Value::as_table)
+            .expect("daily current-model usage must be persisted");
+        assert_eq!(usage.get("toolInputTokens").and_then(toml::Value::as_integer), Some(25));
+        assert_eq!(usage.get("toolOutputTokens").and_then(toml::Value::as_integer), Some(5));
+        assert_eq!(usage.get("totalTokens").and_then(toml::Value::as_integer), Some(30));
+        assert_eq!(usage.get("toolCallCount").and_then(toml::Value::as_integer), Some(2));
+
+        drop(app);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn record_turn_usage_tracks_distinct_calendar_days() {
+        let (mut app, workspace, config_path) = test_app("catdesk-daily-distinct-days");
+        app.record_turn_usage_at_day(10, 2, 1_000, "2026-09-22");
+        app.record_turn_usage_at_day(20, 3, 2_000, "2026-09-23");
+        app.record_turn_usage_at_day(5, 1, 3_000, "2026-09-23");
+
+        assert_eq!(app.tracked_usage_day_count(), 2);
+        assert_eq!(app.daily_usage_by_model.len(), 2);
+        let first = app.daily_usage_by_model["2026-09-22"]
+            .get(CURRENT_USAGE_BUCKET)
+            .expect("first day usage");
+        assert_eq!(first.tool_input_tokens, 10);
+        assert_eq!(first.tool_output_tokens, 2);
+        assert_eq!(first.tool_call_count, 1);
+        let second = app.daily_usage_by_model["2026-09-23"]
+            .get(CURRENT_USAGE_BUCKET)
+            .expect("second day usage");
+        assert_eq!(second.tool_input_tokens, 25);
+        assert_eq!(second.tool_output_tokens, 4);
+        assert_eq!(second.tool_call_count, 2);
+
+        app.persist_state().expect("persist distinct daily usage");
+        drop(app);
+        let reloaded = AppState::from_config_path(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload distinct daily usage");
+        assert_eq!(reloaded.tracked_usage_day_count(), 2);
+        assert_eq!(reloaded.daily_usage_by_model.len(), 2);
+        drop(reloaded);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn legacy_usage_migration_does_not_backfill_daily_history() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace =
+            std::env::temp_dir().join(format!("catdesk-daily-legacy-migration-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create temp workspace");
+        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
+        std::fs::write(&config_path, LEGACY_CONFIG_FIXTURE).expect("write legacy config");
+
+        let migrated = AppConfig::load_from_path(&config_path).expect("migrate legacy config");
+        assert!(
+            migrated
+                .usage_by_model
+                .get(GPT_5_6_AND_EARLIER_USAGE_BUCKET)
+                .is_some(),
+            "legacy all-time usage must still migrate"
+        );
+        let migrated_text =
+            std::fs::read_to_string(&config_path).expect("read migrated daily config");
+        let migrated_value: toml::Value =
+            toml::from_str(&migrated_text).expect("parse migrated daily config");
+        let daily = migrated_value
+            .get("dailyUsageByModel")
+            .and_then(toml::Value::as_table)
+            .expect("new config must carry an explicit daily usage map");
+        assert!(
+            daily.is_empty(),
+            "legacy all-time usage must not be fabricated as today's usage"
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn deferred_usage_coalesces_latest_totals_and_preserves_other_config_fields() {
         let (mut app, workspace, config_path) = test_app("catdesk-usage-coalescing");
         app.persist_state().expect("seed config");
@@ -2298,6 +2478,16 @@ toolCallCount = 0
         assert_eq!(usage.tool_input_tokens, 80);
         assert_eq!(usage.tool_output_tokens, 16);
         assert_eq!(usage.tool_call_count, 8);
+        assert_eq!(saved.daily_usage_by_model.len(), 1);
+        let daily_usage = saved
+            .daily_usage_by_model
+            .values()
+            .next()
+            .and_then(|usage_by_model| usage_by_model.get(CURRENT_USAGE_BUCKET))
+            .expect("missing deferred daily usage bucket after persistence deadline");
+        assert_eq!(daily_usage.tool_input_tokens, 80);
+        assert_eq!(daily_usage.tool_output_tokens, 16);
+        assert_eq!(daily_usage.tool_call_count, 8);
         drop(app);
 
         let _ = std::fs::remove_file(config_path);
