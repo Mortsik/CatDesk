@@ -459,8 +459,9 @@ fn bubblewrap_executable(workspace: &Path) -> Option<PathBuf> {
     bubblewrap_executable_in_paths(std::env::split_paths(&path), workspace)
 }
 
-/// Build a bubblewrap invocation that confines `command` to `workspace` plus its
-/// private `scratch` directory.
+/// Build the bubblewrap argument vector (everything after the `bwrap`
+/// executable) that confines `command` to `workspace` plus its private
+/// `scratch` directory.
 ///
 /// The namespace contains only what [`runtime_read_paths`] returns plus the
 /// workspace, scratch and any external git metadata directories, so an unbound
@@ -469,48 +470,52 @@ fn bubblewrap_executable(workspace: &Path) -> Option<PathBuf> {
 /// `/dev/tty` and the like), `--tmpfs /tmp` keeps the host's `/tmp` out of
 /// reach, and `--unshare-pid` hides host processes. `--new-session` gives the
 /// sandboxed command its own session.
-fn bubblewrap_command(
-    bwrap: &Path,
+fn bubblewrap_argv(
     command: &str,
     workspace: &Path,
     cwd: &Path,
     scratch: &Path,
-) -> io::Result<Command> {
+) -> io::Result<Vec<OsString>> {
     let workspace = canonical_existing(workspace)?;
     let cwd = canonical_existing(cwd)?;
     let scratch = canonical_existing(scratch)?;
 
-    let mut bwrap_command = Command::new(bwrap);
-    bwrap_command
-        .arg("--unshare-user")
-        .arg("--unshare-pid")
-        .arg("--unshare-ipc")
-        .arg("--unshare-uts")
-        .arg("--new-session")
-        .arg("--die-with-parent")
-        .arg("--proc")
-        .arg("/proc")
-        .arg("--dev")
-        .arg("/dev")
-        .arg("--tmpfs")
-        .arg("/tmp");
+    let mut argv: Vec<OsString> = vec![
+        "--unshare-user".into(),
+        "--unshare-pid".into(),
+        "--unshare-ipc".into(),
+        "--unshare-uts".into(),
+        "--new-session".into(),
+        "--die-with-parent".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
+    ];
 
     for path in runtime_read_paths() {
-        bwrap_command.arg("--ro-bind-try").arg(&path).arg(&path);
+        argv.push("--ro-bind-try".into());
+        argv.push(path.as_os_str().to_os_string());
+        argv.push(path.as_os_str().to_os_string());
     }
 
     // Root-owned SSH client config appears as uid 65534 inside the unprivileged
     // user namespace, which OpenSSH rejects before authentication. Hide the
     // system config and let OpenSSH use the read-only user config/defaults.
     if Path::new("/etc/ssh").is_dir() {
-        bwrap_command.arg("--tmpfs").arg("/etc/ssh");
+        argv.push("--tmpfs".into());
+        argv.push("/etc/ssh".into());
     }
 
     let ssh_agent_socket = ssh_agent_socket();
     if let Some(socket) = &ssh_agent_socket {
         // Forward only the agent socket. Private key files remain outside the
         // sandbox while Git/SSH can authenticate and perform SSH signing.
-        bwrap_command.arg("--bind").arg(socket).arg(socket);
+        argv.push("--bind".into());
+        argv.push(socket.as_os_str().to_os_string());
+        argv.push(socket.as_os_str().to_os_string());
     }
 
     // Replicate merged-/usr symlinks. runtime_read_paths canonicalises, so on
@@ -521,42 +526,144 @@ fn bubblewrap_command(
     for link in ["/bin", "/sbin", "/lib", "/lib64"] {
         let link = Path::new(link);
         if let Ok(target) = std::fs::read_link(link) {
-            bwrap_command.arg("--symlink").arg(target).arg(link);
+            argv.push("--symlink".into());
+            argv.push(target.into_os_string());
+            argv.push(link.as_os_str().to_os_string());
         }
     }
 
     // Git metadata that lives outside the workspace (repo checkouts, worktrees,
     // submodules). Empty for a plain checkout.
     for path in workspace_git_paths(&workspace) {
-        bwrap_command.arg("--bind-try").arg(&path).arg(&path);
+        argv.push("--bind-try".into());
+        argv.push(path.as_os_str().to_os_string());
+        argv.push(path.as_os_str().to_os_string());
     }
 
     for path in [&workspace, &scratch] {
-        bwrap_command.arg("--bind").arg(path).arg(path);
+        argv.push("--bind".into());
+        argv.push(path.as_os_str().to_os_string());
+        argv.push(path.as_os_str().to_os_string());
     }
 
-    bwrap_command.arg("--chdir").arg(&cwd);
+    argv.push("--chdir".into());
+    argv.push(cwd.as_os_str().to_os_string());
     if let Some(socket) = &ssh_agent_socket {
-        bwrap_command
-            .arg("--setenv")
-            .arg("SSH_AUTH_SOCK")
-            .arg(socket);
+        argv.push("--setenv".into());
+        argv.push("SSH_AUTH_SOCK".into());
+        argv.push(socket.as_os_str().to_os_string());
     }
-    bwrap_command
-        .arg("--setenv")
-        .arg("TMPDIR")
-        .arg(&scratch)
-        .arg("--setenv")
-        .arg("TMP")
-        .arg(&scratch)
-        .arg("--setenv")
-        .arg("TEMP")
-        .arg(&scratch)
-        .arg("/bin/bash")
-        .arg("-c")
-        .arg(command);
+    argv.extend([
+        "--setenv".into(),
+        "TMPDIR".into(),
+        scratch.as_os_str().to_os_string(),
+        "--setenv".into(),
+        "TMP".into(),
+        scratch.as_os_str().to_os_string(),
+        "--setenv".into(),
+        "TEMP".into(),
+        scratch.as_os_str().to_os_string(),
+        "/bin/bash".into(),
+        "-c".into(),
+        command.into(),
+    ]);
 
-    Ok(bwrap_command)
+    Ok(argv)
+}
+
+/// Locate an executable on `PATH` outside the workspace, mirroring
+/// [`bubblewrap_executable`]: a non-executable file or a workspace-local
+/// candidate must never shadow the real binary.
+fn executable_on_path(workspace: &Path, executable: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    executable_in_paths(std::env::split_paths(&path), workspace, executable)
+}
+
+fn systemd_run_executable(workspace: &Path) -> Option<PathBuf> {
+    executable_on_path(workspace, "systemd-run")
+}
+
+/// Memory ceilings for a single sandboxed command, applied through cgroup v2
+/// (transient systemd user scope). WSL2 died twice on 2026-09-23 because
+/// unbounded agent workloads (poe_pricer evals at 1.3-1.5 G RSS each, nested
+/// sandboxes, multiprocessing) exhausted host memory; a per-sandbox hard limit
+/// keeps one agent from starving everything else on the host.
+struct SandboxMemoryLimits {
+    high: String,
+    max: String,
+    swap_max: String,
+}
+
+/// `CATDESK_SANDBOX_MEMORY=off` disables the scope entirely. Individual limits
+/// accept systemd size strings (K/M/G/...); an unparsable value is rejected
+/// by systemd-run and fails the command rather than running it unbounded.
+fn sandbox_memory_limits() -> Option<SandboxMemoryLimits> {
+    if std::env::var("CATDESK_SANDBOX_MEMORY").ok().as_deref() == Some("off") {
+        return None;
+    }
+    Some(SandboxMemoryLimits {
+        high: memory_limit_from_env("CATDESK_SANDBOX_MEMORY_HIGH", "6G"),
+        max: memory_limit_from_env("CATDESK_SANDBOX_MEMORY_MAX", "8G"),
+        swap_max: memory_limit_from_env("CATDESK_SANDBOX_MEMORY_SWAP_MAX", "0"),
+    })
+}
+
+fn memory_limit_from_env(variable: &str, default: &str) -> String {
+    std::env::var(variable)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// Compose the final sandbox command: the bubblewrap invocation, optionally
+/// wrapped in a transient systemd user scope carrying the memory limits.
+///
+/// `--scope` execs in place inside the scope, so the parent stays the CatDesk
+/// process tree: `--die-with-parent`, the spawn-time process group and exit
+/// status propagation all keep working, and the cgroup covers the whole
+/// descendant tree (nested sandboxes included). `--collect` unloads the scope
+/// even when it ends up failed — an OOM kill fails the unit. `--quiet` keeps
+/// "Running as unit" noise out of the command's captured stderr. The scope is
+/// named after the scratch directory's id, so `systemctl --user status` maps
+/// units to jobs one-to-one.
+///
+/// Fails open: without `systemd-run` on `PATH` the sandbox still runs with its
+/// mount-namespace confinement intact — the memory ceilings protect the host
+/// on setups that have a user manager (WSL2/systemd), they are not a
+/// confinement boundary. The executable is resolved outside the workspace like
+/// `bwrap`, so a hijacked copy cannot run anything unsandboxed.
+fn sandbox_command(
+    bwrap: &Path,
+    argv: Vec<OsString>,
+    sandbox_id: &str,
+    workspace: &Path,
+) -> Command {
+    let (Some(limits), Some(systemd_run)) =
+        (sandbox_memory_limits(), systemd_run_executable(workspace))
+    else {
+        let mut command = Command::new(bwrap);
+        command.args(argv);
+        return command;
+    };
+    let mut command = Command::new(systemd_run);
+    command
+        .arg("--user")
+        .arg("--scope")
+        .arg("--collect")
+        .arg("--quiet")
+        // systemd 254+ only: keep $VAR in agent command strings unexpanded
+        // regardless of the planned default flip.
+        .arg("--expand-environment=no")
+        .arg(format!("--unit=catdesk-sb-{sandbox_id}"))
+        .arg("-p")
+        .arg(format!("MemoryHigh={}", limits.high))
+        .arg("-p")
+        .arg(format!("MemoryMax={}", limits.max))
+        .arg("-p")
+        .arg(format!("MemorySwapMax={}", limits.swap_max))
+        .arg(bwrap);
+    command.args(argv);
+    command
 }
 
 /// Build the command that runs `command` confined to `workspace`, together with
@@ -572,8 +679,8 @@ pub fn helper_command(
     workspace: &Path,
     cwd: &Path,
 ) -> io::Result<(Command, PathBuf)> {
-    let scratch_dir =
-        std::env::temp_dir().join(format!("catdesk-sandbox-{}", uuid::Uuid::new_v4()));
+    let sandbox_id = uuid::Uuid::new_v4().to_string();
+    let scratch_dir = std::env::temp_dir().join(format!("catdesk-sandbox-{sandbox_id}"));
     let mut dir_builder = std::fs::DirBuilder::new();
     dir_builder
         .mode(0o700)
@@ -589,7 +696,8 @@ pub fn helper_command(
         })?;
 
     let prepared = match bubblewrap_executable(workspace) {
-        Some(bwrap) => bubblewrap_command(&bwrap, command, workspace, cwd, &scratch_dir),
+        Some(bwrap) => bubblewrap_argv(command, workspace, cwd, &scratch_dir)
+            .map(|argv| sandbox_command(&bwrap, argv, &sandbox_id, workspace)),
         None => Err(io::Error::other(
             "no usable sandbox: bwrap was not found on PATH outside the workspace. Install \
              bubblewrap to run commands confined.",
@@ -654,6 +762,19 @@ mod tests {
 
         fn set(name: &'static str, value: &Path) -> Self {
             Self::set_many(&[(name, value)])
+        }
+
+        /// Env override for a non-path value (e.g. `CATDESK_SANDBOX_MEMORY=off`):
+        /// same locking and restore semantics as `set`, with a `&str` value.
+        fn set_str(name: &'static str, value: &str) -> Self {
+            let guard = env_lock();
+            let prev = vec![(name, std::env::var_os(name))];
+            // SAFETY: same serialization as in `set_many`.
+            unsafe { std::env::set_var(name, value) };
+            Self {
+                prev,
+                _guard: guard,
+            }
         }
 
         /// Read-only env tests go through here so every env access in this
@@ -829,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn bubblewrap_command_chdirs_to_cwd_and_uses_new_session() {
+    fn bubblewrap_argv_chdirs_to_cwd_and_uses_new_session() {
         let _env = EnvGuards::read();
         let tree = TempTree::new();
         let workspace = tree.path().join("workspace");
@@ -838,29 +959,148 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("create cwd");
         std::fs::create_dir_all(&scratch).expect("create scratch");
 
-        let command = bubblewrap_command(
-            Path::new("/usr/bin/bwrap"),
-            "pwd",
-            &workspace,
-            &cwd,
-            &scratch,
-        )
-        .expect("build bubblewrap command");
-        let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
+        let argv =
+            bubblewrap_argv("pwd", &workspace, &cwd, &scratch).expect("build bubblewrap argv");
 
-        assert!(args.iter().any(|arg| arg.as_os_str() == "--new-session"));
+        assert!(argv.iter().any(|arg| arg.as_os_str() == "--new-session"));
         if Path::new("/etc/ssh").is_dir() {
-            assert!(args.windows(2).any(|pair| {
+            assert!(argv.windows(2).any(|pair| {
                 pair[0].as_os_str() == OsStr::new("--tmpfs")
                     && pair[1].as_os_str() == OsStr::new("/etc/ssh")
             }));
         }
-        let chdir = args
+        let chdir = argv
             .windows(2)
             .find(|pair| pair[0].as_os_str() == OsStr::new("--chdir"))
-            .map(|pair| PathBuf::from(pair[1].clone()))
+            .map(|pair| PathBuf::from(&pair[1]))
             .expect("--chdir argument");
         assert_eq!(chdir, cwd.canonicalize().expect("canonical cwd"));
+    }
+
+    #[test]
+    fn sandbox_command_wraps_bwrap_in_a_memory_limited_scope() {
+        let _env = EnvGuards::read();
+        // systemd-run may be absent in minimal environments; the wrap is a
+        // host-protection extra, so there is nothing to assert without it.
+        if systemd_run_executable(Path::new(".")).is_none() {
+            return;
+        }
+
+        let argv = vec![
+            OsString::from("--unshare-pid"),
+            OsString::from("/bin/bash"),
+            OsString::from("-c"),
+            OsString::from("pwd"),
+        ];
+        let command = sandbox_command(
+            Path::new("/usr/bin/bwrap"),
+            argv,
+            "test-scope-id",
+            Path::new("."),
+        );
+        assert!(
+            Path::new(command.get_program())
+                .file_name()
+                .is_some_and(|name| name == "systemd-run"),
+            "expected systemd-run as the program"
+        );
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
+
+        for flag in [
+            "--user",
+            "--scope",
+            "--collect",
+            "--quiet",
+            "--expand-environment=no",
+            "--unit=catdesk-sb-test-scope-id",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg.as_os_str() == OsStr::new(flag)),
+                "missing {flag}"
+            );
+        }
+        for property in ["MemoryHigh=6G", "MemoryMax=8G", "MemorySwapMax=0"] {
+            assert!(
+                args.windows(2).any(|pair| {
+                    pair[0].as_os_str() == OsStr::new("-p")
+                        && pair[1].as_os_str() == OsStr::new(property)
+                }),
+                "missing -p {property}"
+            );
+        }
+        // The bwrap executable plus its argv must follow the wrapper flags
+        // verbatim so systemd-run execs the sandbox in place.
+        let bwrap_position = args
+            .iter()
+            .position(|arg| arg.as_os_str() == OsStr::new("/usr/bin/bwrap"))
+            .expect("bwrap program after the wrapper flags");
+        assert_eq!(
+            args[bwrap_position..],
+            [
+                OsString::from("/usr/bin/bwrap"),
+                OsString::from("--unshare-pid"),
+                OsString::from("/bin/bash"),
+                OsString::from("-c"),
+                OsString::from("pwd"),
+            ]
+        );
+    }
+
+    #[test]
+    fn sandbox_command_scope_limits_come_from_env_overrides() {
+        let _env = EnvGuards::set_str("CATDESK_SANDBOX_MEMORY_HIGH", "2G");
+        if systemd_run_executable(Path::new(".")).is_none() {
+            return;
+        }
+
+        let command = sandbox_command(
+            Path::new("/usr/bin/bwrap"),
+            Vec::new(),
+            "test-scope-id",
+            Path::new("."),
+        );
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
+        assert!(
+            args.windows(2).any(|pair| {
+                pair[0].as_os_str() == OsStr::new("-p")
+                    && pair[1].as_os_str() == OsStr::new("MemoryHigh=2G")
+            }),
+            "expected the overridden MemoryHigh, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_command_scope_off_returns_plain_bwrap() {
+        let _env = EnvGuards::set_str("CATDESK_SANDBOX_MEMORY", "off");
+
+        let command = sandbox_command(
+            Path::new("/usr/bin/bwrap"),
+            vec![OsString::from("--die-with-parent")],
+            "test-scope-id",
+            Path::new("."),
+        );
+        assert_eq!(command.get_program(), Path::new("/usr/bin/bwrap"));
+        assert_eq!(command.get_args().count(), 1);
+    }
+
+    #[test]
+    fn sandbox_command_fails_open_without_systemd_run() {
+        // PATH without systemd-run must degrade to the plain bwrap command:
+        // the memory ceilings protect the host, they are not a confinement
+        // boundary, so a missing user-manager client must not fail commands.
+        let tree = TempTree::new();
+        let empty_bin = tree.path().join("empty-bin");
+        std::fs::create_dir_all(&empty_bin).expect("create empty bin");
+        let _env = EnvGuards::set("PATH", &empty_bin);
+
+        let command = sandbox_command(
+            Path::new("/usr/bin/bwrap"),
+            vec![OsString::from("--die-with-parent")],
+            "test-scope-id",
+            Path::new("."),
+        );
+        assert_eq!(command.get_program(), Path::new("/usr/bin/bwrap"));
+        assert_eq!(command.get_args().count(), 1);
     }
 
     #[test]
