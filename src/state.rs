@@ -1238,6 +1238,11 @@ impl AppState {
             .count()
     }
 
+    pub fn reset_usage_billing(&mut self) {
+        self.usage_by_model.clear();
+        self.daily_usage_by_model.clear();
+    }
+
     pub fn record_turn_usage(&mut self, tool_input_tokens: u64, tool_output_tokens: u64) {
         let day_key = local_usage_day_key(local_now());
         self.record_turn_usage_at_day(
@@ -2404,6 +2409,23 @@ toolCallCount = 0
     }
 
     #[test]
+    fn reset_usage_billing_clears_all_time_and_daily_history() {
+        let (mut app, workspace, config_path) = test_app("catdesk-daily-reset");
+        app.record_turn_usage_at_day(10, 2, 1_000, "2026-09-22");
+        assert!(!app.usage_by_model.is_empty());
+        assert!(!app.daily_usage_by_model.is_empty());
+
+        app.reset_usage_billing();
+
+        assert!(app.usage_by_model.is_empty());
+        assert!(app.daily_usage_by_model.is_empty());
+        assert_eq!(app.tracked_usage_day_count(), 0);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn legacy_usage_migration_does_not_backfill_daily_history() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -2500,7 +2522,7 @@ toolCallCount = 0
         app.record_turn_usage(100, 25);
         app.schedule_usage_persistence();
 
-        app.usage_by_model.clear();
+        app.reset_usage_billing();
         app.persist_state().expect("persist reset usage state");
         std::thread::sleep(std::time::Duration::from_millis(80));
 

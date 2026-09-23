@@ -342,14 +342,20 @@ fn estimate_gpt_5_6_and_earlier_usage_cost_usd(usage: &UsageTotals) -> f64 {
         / 1_000_000.0
 }
 
-fn estimate_all_time_usage_cost_usd(app: &AppState) -> f64 {
-    app.usage_by_model
+fn estimate_usage_by_model_cost_usd(
+    usage_by_model: &std::collections::BTreeMap<String, UsageTotals>,
+) -> f64 {
+    usage_by_model
         .iter()
         .map(|(bucket, usage)| match bucket.as_str() {
             GPT_5_6_AND_EARLIER_USAGE_BUCKET => estimate_gpt_5_6_and_earlier_usage_cost_usd(usage),
             _ => panic!("missing pricing for usage bucket `{bucket}`"),
         })
         .sum()
+}
+
+fn estimate_all_time_usage_cost_usd(app: &AppState) -> f64 {
+    estimate_usage_by_model_cost_usd(&app.usage_by_model)
 }
 
 fn format_usd_compact(usd: f64) -> String {
@@ -3028,9 +3034,12 @@ mod tests {
             "累計請求",
             "即時成本",
             "工作階段成本",
+            "今日成本",
             "平均",
             "已花費",
+            "呼叫",
             "累計成本",
+            "天數",
             "Token60秒",
             "系統",
             "等待連線",
@@ -3078,8 +3087,14 @@ mod tests {
         app.usage_by_model
             .entry(super::state::CURRENT_USAGE_BUCKET.to_string())
             .or_default()
-            .accumulate(0, 1_000_000, 20);
+            .accumulate(0, 1_600_000, 20);
         app.record_turn_usage(0, 1_000_000);
+        app.daily_usage_by_model
+            .entry("1900-01-01".to_string())
+            .or_default()
+            .entry(super::state::CURRENT_USAGE_BUCKET.to_string())
+            .or_default()
+            .accumulate(0, 600_000, 3);
         app.request_count = 42;
         app.total_request_count = 142;
 
@@ -3121,8 +3136,13 @@ mod tests {
             "AVG $150/h",
             "SPENT $5",
             "2m 0s",
+            "COST TODAY",
+            "AVG $5/call",
+            "CALLS 1",
             "COST TOTAL",
-            "SPENT $10",
+            "SPENT $13",
+            "DAYS 2",
+            "AVG $4/day",
             "TOKENS 60s",
             "SYSTEM",
         ] {
@@ -3943,7 +3963,7 @@ async fn run_settings(
                             continue;
                         }
                         let mut app = state.lock().await;
-                        app.usage_by_model.clear();
+                        app.reset_usage_billing();
                         app.log("INFO", "Token billing totals reset".into());
                         app.persist_state_with_log();
                         confirm_reset_token_billing = false;
@@ -5752,6 +5772,34 @@ fn draw_ui(
     let (_session_cost_per_min_usd, session_cost_per_hour_usd) =
         session_cost_rates(session_usage_cost_usd, session_elapsed);
     let all_time_usage_cost_usd = estimate_all_time_usage_cost_usd(app);
+    let today_usage_by_model = app.today_usage_by_model();
+    let today_usage_cost_usd = today_usage_by_model
+        .map(estimate_usage_by_model_cost_usd)
+        .unwrap_or_default();
+    let today_tool_call_count = today_usage_by_model
+        .map(|usage_by_model| {
+            usage_by_model
+                .values()
+                .map(|usage| usage.tool_call_count)
+                .sum::<u64>()
+        })
+        .unwrap_or_default();
+    let today_average_cost_per_call_usd = if today_tool_call_count == 0 {
+        0.0
+    } else {
+        today_usage_cost_usd / today_tool_call_count as f64
+    };
+    let tracked_usage_day_count = app.tracked_usage_day_count();
+    let tracked_daily_usage_cost_usd = app
+        .daily_usage_by_model
+        .values()
+        .map(estimate_usage_by_model_cost_usd)
+        .sum::<f64>();
+    let tracked_average_cost_per_day_usd = if tracked_usage_day_count == 0 {
+        0.0
+    } else {
+        tracked_daily_usage_cost_usd / tracked_usage_day_count as f64
+    };
     let request_snapshot = request_workers::global_request_scheduler().snapshot();
     let request_gates = [
         request_snapshot.control,
@@ -5835,10 +5883,40 @@ fn draw_ui(
             Span::styled(format_session_duration(session_elapsed), value_style),
         ]),
         Line::from(vec![
+            status_label(ui_language.text("COST TODAY", "今日成本")),
+            Span::styled(ui_language.text("SPENT ", "已花費 "), muted_style),
+            Span::styled(
+                format!("${}", format_usd_compact(today_usage_cost_usd)),
+                cost_style,
+            ),
+            Span::styled(ui_language.text("      AVG ", "      平均 "), muted_style),
+            Span::styled(
+                format!(
+                    "${}{}",
+                    format_usd_compact(today_average_cost_per_call_usd),
+                    ui_language.text("/call", "/次")
+                ),
+                cost_style,
+            ),
+            Span::styled(ui_language.text("      CALLS ", "      呼叫 "), muted_style),
+            Span::styled(today_tool_call_count.to_string(), value_style),
+        ]),
+        Line::from(vec![
             status_label(ui_language.text("COST TOTAL", "累計成本")),
             Span::styled(ui_language.text("SPENT ", "已花費 "), muted_style),
             Span::styled(
                 format!("${}", format_usd_compact(all_time_usage_cost_usd)),
+                cost_style,
+            ),
+            Span::styled(ui_language.text("      DAYS ", "      天數 "), muted_style),
+            Span::styled(tracked_usage_day_count.to_string(), value_style),
+            Span::styled(ui_language.text("      AVG ", "      平均 "), muted_style),
+            Span::styled(
+                format!(
+                    "${}{}",
+                    format_usd_compact(tracked_average_cost_per_day_usd),
+                    ui_language.text("/day", "/天")
+                ),
                 cost_style,
             ),
         ]),
