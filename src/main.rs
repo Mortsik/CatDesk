@@ -3143,7 +3143,7 @@ mod tests {
     }
 
     #[test]
-    fn main_dashboard_renders_each_active_flow_on_one_line() {
+    fn main_dashboard_renders_only_latest_active_flow_row() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -3162,6 +3162,17 @@ mod tests {
             super::FlowDirection::Forward,
         );
         app.record_flow_turn_usage("session:a", 45, 2_100);
+        app.record_flow(
+            "session:b",
+            &["tools/call:poll_command › job 123".to_string()],
+            super::FlowDirection::Forward,
+        );
+        app.record_flow(
+            "session:c",
+            &["tools/call:search › dashboard status".to_string()],
+            super::FlowDirection::Forward,
+        );
+        app.record_flow_turn_usage("session:c", 12, 345);
 
         let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
         let mut log_view = None;
@@ -3188,10 +3199,20 @@ mod tests {
             .lines()
             .filter(|line| line.contains("Your computer"))
             .collect::<Vec<_>>();
-        assert_eq!(flow_rows.len(), 1, "one active flow must consume one dashboard row");
+        assert_eq!(
+            flow_rows.len(),
+            1,
+            "normal status must collapse all active flows into one dashboard row: {flow_rows:?}"
+        );
         let row = flow_rows[0];
-        for expected in ["ChatGPT Web", "run_command", "↓45", "↑2.1K", "$0.01185"] {
-            assert!(row.contains(expected), "flow row missing {expected}: {row}");
+        for expected in ["ChatGPT Web", "search", "↓12", "↑345"] {
+            assert!(row.contains(expected), "latest flow row missing {expected}: {row}");
+        }
+        for stale in ["run_command", "poll_command"] {
+            assert!(
+                !row.contains(stale),
+                "latest flow row must not show stale action {stale}: {row}"
+            );
         }
 
         let _ = std::fs::remove_dir_all(workspace);
@@ -5881,32 +5902,29 @@ fn draw_ui(
             row.push(Span::raw("   "));
             row.push(Span::styled(call_text, flow_meta_style));
             status_lines.push(Line::from(row));
-        } else {
-            for flow in app
-                .flows
-                .iter()
-                .filter(|flow| should_display_flow_row(flow, app.remote_connected))
-                .take(visible_flow_slots)
-            {
-                let latest_action = latest_flow_action(flow);
-                let call_text = trim_line(&latest_action, 36);
-                let closing = flow.closing_started_ms.is_some();
-                let lane_active = closing
-                    || !flow.anim_queue.is_empty()
-                    || (app.server_running && app.ngrok_running && app.remote_connected);
-                let lane = lane_for(lane_active, Some(flow));
-                let mut row = vec![
-                    Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                    Span::styled(flow_lane_left_label(ui_language), computer_role_style),
-                ];
-                row.extend(lane);
-                row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
-                row.push(Span::raw("   "));
-                row.push(Span::styled(call_text, flow_meta_style));
-                row.push(Span::raw("   "));
-                row.extend(flow_turn_usage_spans(flow, &palette));
-                status_lines.push(Line::from(row));
-            }
+        } else if let Some(flow) = app
+            .flows
+            .iter()
+            .find(|flow| should_display_flow_row(flow, app.remote_connected))
+        {
+            let latest_action = latest_flow_action(flow);
+            let call_text = trim_line(&latest_action, 36);
+            let closing = flow.closing_started_ms.is_some();
+            let lane_active = closing
+                || !flow.anim_queue.is_empty()
+                || (app.server_running && app.ngrok_running && app.remote_connected);
+            let lane = lane_for(lane_active, Some(flow));
+            let mut row = vec![
+                Span::styled("    ", Style::default().fg(palette.muted_fg)),
+                Span::styled(flow_lane_left_label(ui_language), computer_role_style),
+            ];
+            row.extend(lane);
+            row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
+            row.push(Span::raw("   "));
+            row.push(Span::styled(call_text, flow_meta_style));
+            row.push(Span::raw("   "));
+            row.extend(flow_turn_usage_spans(flow, &palette));
+            status_lines.push(Line::from(row));
         }
     }
 
