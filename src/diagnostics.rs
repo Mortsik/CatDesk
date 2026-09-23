@@ -105,12 +105,43 @@ mod tests {
             write_failures: Arc::new(AtomicU64::new(0)),
             write_dropped: Arc::new(AtomicU64::new(0)),
             active: Arc::new(AtomicU64::new(0)),
+            active_started: Arc::new(StdMutex::new(HashMap::new())),
         };
         log.record(json!({"event": "first"}));
         log.record(json!({"event": "dropped"}));
         assert_eq!(receiver.recv().unwrap().unwrap()["event"], "first");
         log.record(json!({"event": "next"}));
         assert_eq!(receiver.recv().unwrap().unwrap()["dropped_records"], 1);
+    }
+
+    #[test]
+    fn active_request_snapshot_tracks_oldest_remaining_request() {
+        let root = std::env::temp_dir().join(format!(
+            "catdesk-active-request-age-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (log, guard) = Diagnostics::start(&root).unwrap();
+        let now = Instant::now();
+
+        let first = log.begin_request("first", now - Duration::from_millis(100));
+        assert_eq!(first.active_requests, 1);
+        assert!(first.oldest_active_request_ms >= 50);
+
+        let second = log.begin_request("second", now - Duration::from_millis(10));
+        assert_eq!(second.active_requests, 2);
+        assert!(second.oldest_active_request_ms >= 50);
+
+        let remaining = log.finish_request("first");
+        assert_eq!(remaining.active_requests, 1);
+        assert!(remaining.oldest_active_request_ms >= 5);
+        assert!(remaining.oldest_active_request_ms < 1_000);
+
+        let empty = log.finish_request("second");
+        assert_eq!(empty.active_requests, 0);
+        assert_eq!(empty.oldest_active_request_ms, 0);
+
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -266,12 +297,16 @@ mod tests {
             .collect();
         assert_eq!(starts.len(), 6);
         for start in &starts {
+            assert!(start["active_requests"].is_number());
+            assert!(start["oldest_active_request_ms"].is_number());
             let finishes: Vec<_> = records
                 .iter()
                 .filter(|r| r["event"] == "http_finished" && r["request_id"] == start["request_id"])
                 .collect();
             assert_eq!(finishes.len(), 1);
             assert!(finishes[0]["elapsed_ms"].is_number());
+            assert!(finishes[0]["active_requests"].is_number());
+            assert!(finishes[0]["oldest_active_request_ms"].is_number());
         }
         let init = records
             .iter()
@@ -330,11 +365,12 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -354,6 +390,7 @@ pub(crate) struct Diagnostics {
     write_failures: Arc<AtomicU64>,
     write_dropped: Arc<AtomicU64>,
     active: Arc<AtomicU64>,
+    active_started: Arc<StdMutex<HashMap<String, Instant>>>,
 }
 
 /// Drain accepted records on ordinary exit. A crash may lose queued records.
@@ -373,7 +410,48 @@ impl Drop for Guard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveRequestSnapshot {
+    active_requests: u64,
+    oldest_active_request_ms: u64,
+}
+
 impl Diagnostics {
+    fn active_request_snapshot(active_started: &HashMap<String, Instant>) -> ActiveRequestSnapshot {
+        ActiveRequestSnapshot {
+            active_requests: u64::try_from(active_started.len()).unwrap_or(u64::MAX),
+            oldest_active_request_ms: active_started
+                .values()
+                .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    fn begin_request(&self, id: &str, started: Instant) -> ActiveRequestSnapshot {
+        let mut active_started = self
+            .active_started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active_started.insert(id.to_string(), started);
+        let snapshot = Self::active_request_snapshot(&active_started);
+        self.active
+            .store(snapshot.active_requests, Ordering::Relaxed);
+        snapshot
+    }
+
+    fn finish_request(&self, id: &str) -> ActiveRequestSnapshot {
+        let mut active_started = self
+            .active_started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active_started.remove(id);
+        let snapshot = Self::active_request_snapshot(&active_started);
+        self.active
+            .store(snapshot.active_requests, Ordering::Relaxed);
+        snapshot
+    }
+
     fn start(root: &Path) -> io::Result<(Self, Guard)> {
         // An overlapping restart must not silently lose all diagnostics while
         // the old process still holds the primary log. Two fixed slots retain
@@ -389,6 +467,7 @@ impl Diagnostics {
             write_failures: write_failures.clone(),
             write_dropped: write_dropped.clone(),
             active: Arc::new(AtomicU64::new(0)),
+            active_started: Arc::new(StdMutex::new(HashMap::new())),
         };
         let writer_root = writer.root.clone();
         let writer_limit = writer.limit;
@@ -544,11 +623,13 @@ struct RequestLog {
 
 impl Drop for RequestLog {
     fn drop(&mut self) {
-        self.log.active.fetch_sub(1, Ordering::Relaxed);
         if !self.complete.load(Ordering::Relaxed) {
+            let active = self.log.finish_request(&self.id);
             self.log
                 .record(json!({"event": "http_cancelled", "request_id": self.id,
-                "elapsed_ms": self.started.elapsed().as_millis()}));
+                "elapsed_ms": self.started.elapsed().as_millis(),
+                "active_requests": active.active_requests,
+                "oldest_active_request_ms": active.oldest_active_request_ms}));
         }
     }
 }
@@ -571,13 +652,19 @@ pub(crate) async fn http_request(
         started: Instant::now(),
         complete: AtomicBool::new(false),
     };
-    let active = trace.log.active.fetch_add(1, Ordering::Relaxed) + 1;
-    trace.log.record(json!({"event": "http_started", "request_id": trace.id, "http_method": method,
-        "route_matched": request.extensions().get::<MatchedPath>().is_some(), "active_requests": active}));
+    let active = trace.log.begin_request(&trace.id, trace.started);
+    trace.log.record(
+        json!({"event": "http_started", "request_id": trace.id, "http_method": method,
+        "route_matched": request.extensions().get::<MatchedPath>().is_some(),
+        "active_requests": active.active_requests,
+        "oldest_active_request_ms": active.oldest_active_request_ms}),
+    );
     REQUEST.scope(trace, async {
         let response = next.run(request).await;
         REQUEST.with(|trace| {
             let scheduler = response.extensions().get::<SchedulerTiming>().copied();
+            let active = trace.log.finish_request(&trace.id);
+            trace.complete.store(true, Ordering::Relaxed);
             trace.log.record(json!({"event": "http_finished", "request_id": trace.id,
                 "status": response.status().as_u16(), "rpc_error_code": response.extensions().get::<RpcError>().map(|e| e.0),
                 "tool_error": response.extensions().get::<ToolResult>().and_then(|r| r.is_error),
@@ -586,8 +673,9 @@ pub(crate) async fn http_request(
                 "scheduler_queue_wait_ms": scheduler.map(|timing| timing.queue_wait_ms),
                 "scheduler_execution_ms": scheduler.map(|timing| timing.execution_ms),
                 "scheduler_deadline_stage": scheduler.and_then(|timing| timing.deadline_stage),
-                "elapsed_ms": trace.started.elapsed().as_millis()}));
-            trace.complete.store(true, Ordering::Relaxed);
+                "elapsed_ms": trace.started.elapsed().as_millis(),
+                "active_requests": active.active_requests,
+                "oldest_active_request_ms": active.oldest_active_request_ms}));
         });
         response
     }).await

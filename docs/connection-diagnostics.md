@@ -75,8 +75,15 @@ workers. Capacity is isolated by request class (control, filesystem, process,
 browser and general), while temporary saturation queues fairly by session/project
 instead of immediately failing. Queue safety budgets remain bounded; exhausting a
 budget returns 503 with a class-specific `request_*_busy` event. Response deadlines
-are 45 seconds for control, 60 seconds for general, and 180 seconds for filesystem,
-process and browser work. A deadline returns 504 with `request_worker_timeout`.
+are 45 seconds for control, 60 seconds for general, and 120 seconds for filesystem,
+process and browser work, so every scheduled MCP request has a hard 120-second
+response ceiling. A deadline returns 504 with `request_worker_timeout`.
+
+Each `http_started`, `http_finished`, and `http_cancelled` record also includes
+`active_requests` and `oldest_active_request_ms`. The latter is recomputed from the
+requests that are still active, so it can be correlated with client-side stream/resume
+failures without persisting MCP payloads or session secrets.
+
 Check `scheduler_deadline_stage` to see whether it expired in `queue` or during
 `execution`. Once execution starts, the worker continues to own its slot until the
 operation actually ends, including after client disconnection or response timeout.

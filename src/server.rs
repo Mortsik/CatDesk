@@ -32,6 +32,7 @@ use crate::state::{
 };
 
 const STATELESS_FLOW_ID: &str = "stateless";
+const MCP_HTTP_REQUEST_MAX_DURATION: StdDuration = StdDuration::from_secs(120);
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const OPENAI_SESSION_META_KEY: &str = "openai/session";
 #[derive(Clone, Debug)]
@@ -565,7 +566,7 @@ fn request_deadline(class: RequestClass) -> StdDuration {
         // without allowing a stalled control call to retain a slot for minutes.
         RequestClass::Control => StdDuration::from_secs(45),
         RequestClass::Filesystem | RequestClass::Process | RequestClass::Browser => {
-            StdDuration::from_secs(180)
+            MCP_HTTP_REQUEST_MAX_DURATION
         }
         RequestClass::General => StdDuration::from_secs(60),
     }
@@ -1617,6 +1618,26 @@ mod tests {
         for (body, expected) in cases {
             let body: Value = serde_json::from_slice(&body).expect("parse test request");
             assert_eq!(request_class(&body), expected, "unexpected class for {body}");
+        }
+    }
+
+    #[test]
+    fn request_deadlines_never_exceed_mcp_http_ceiling() {
+        let ceiling = StdDuration::from_secs(120);
+        for class in [
+            RequestClass::Control,
+            RequestClass::Filesystem,
+            RequestClass::Process,
+            RequestClass::Browser,
+            RequestClass::General,
+        ] {
+            assert!(
+                request_deadline(class) <= ceiling,
+                "{} request deadline {:?} exceeds the MCP HTTP ceiling {:?}",
+                class.as_str(),
+                request_deadline(class),
+                ceiling
+            );
         }
     }
 
