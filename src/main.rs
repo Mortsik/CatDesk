@@ -3039,6 +3039,7 @@ mod tests {
             "已花費",
             "呼叫",
             "累計成本",
+            "追蹤成本",
             "天數",
             "Token60秒",
             "系統",
@@ -3141,6 +3142,8 @@ mod tests {
             "CALLS 1",
             "COST TOTAL",
             "SPENT $13",
+            "COST TRACKED",
+            "SPENT $8",
             "DAYS 2",
             "AVG $4/day",
             "TOKENS 60s",
@@ -3158,6 +3161,67 @@ mod tests {
             );
         }
         assert!(!text.contains("(tool input, llm output)"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn main_dashboard_separates_legacy_total_from_tracked_daily_average() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-main-cost-history-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let config_path = workspace.join("config.toml");
+        let mut app =
+            AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+                .expect("create app");
+
+        // $1,924.70 of legacy usage has no trustworthy per-day history.
+        app.usage_by_model
+            .entry(super::state::CURRENT_USAGE_BUCKET.to_string())
+            .or_default()
+            .accumulate(0, 384_940_000, 1_000);
+        // The new daily tracker knows only about this $0.30 call today.
+        app.record_turn_usage(0, 60_000);
+
+        let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
+        let mut log_view = None;
+        let revealed_logs = HashMap::new();
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    &app,
+                    0,
+                    Duration::from_secs(120),
+                    0,
+                    true,
+                    &mut log_view,
+                    None,
+                    None,
+                    &revealed_logs,
+                )
+            })
+            .expect("draw main dashboard");
+
+        let text = terminal_buffer_text(&terminal);
+        let total_line = text
+            .lines()
+            .find(|line| line.contains("COST TOTAL"))
+            .expect("COST TOTAL line");
+        assert!(total_line.contains("SPENT $1925"), "{total_line}");
+        assert!(!total_line.contains("DAYS"), "{total_line}");
+        assert!(!total_line.contains("AVG"), "{total_line}");
+
+        let tracked_line = text
+            .lines()
+            .find(|line| line.contains("COST TRACKED"))
+            .expect("COST TRACKED line");
+        assert!(tracked_line.contains("SPENT $0.3"), "{tracked_line}");
+        assert!(tracked_line.contains("DAYS 1"), "{tracked_line}");
+        assert!(tracked_line.contains("AVG $0.3/day"), "{tracked_line}");
 
         let _ = std::fs::remove_dir_all(workspace);
     }
@@ -5911,6 +5975,14 @@ fn draw_ui(
                 format!("${}", format_usd_compact(all_time_usage_cost_usd)),
                 cost_style,
             ),
+        ]),
+        Line::from(vec![
+            status_label(ui_language.text("COST TRACKED", "追蹤成本")),
+            Span::styled(ui_language.text("SPENT ", "已花費 "), muted_style),
+            Span::styled(
+                format!("${}", format_usd_compact(tracked_daily_usage_cost_usd)),
+                cost_style,
+            ),
             Span::styled(ui_language.text("      DAYS ", "      天數 "), muted_style),
             Span::styled(tracked_usage_day_count.to_string(), value_style),
             Span::styled(ui_language.text("      AVG ", "      平均 "), muted_style),
@@ -5923,7 +5995,6 @@ fn draw_ui(
                 cost_style,
             ),
         ]),
-        Line::from(""),
         Line::from(vec![
             status_label(ui_language.text("TOKENS 60s", "Token 60秒")),
             Span::styled("↓", muted_style),
