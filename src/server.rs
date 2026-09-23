@@ -172,6 +172,10 @@ impl InstructionGate {
         self.contexts.record_tool_call(session.namespace());
     }
 
+    fn rearm_checkpoint(&self, session: &ClientSession) {
+        self.contexts.rearm_checkpoint(session.namespace());
+    }
+
     fn claim_checkpoint(&self, session: &ClientSession) -> Option<CheckpointRecommendation> {
         self.contexts.claim_checkpoint(session.namespace())
     }
@@ -3209,6 +3213,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_create_handoff_rearms_checkpoint_window_without_idle_wait() {
+        let workspace_root = unique_temp_path("catdesk-checkpoint-rearm-workspace");
+        let config_root = unique_temp_path("catdesk-checkpoint-rearm-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+        std::fs::write(workspace_root.join("hello.txt"), "hello world\n").expect("write file");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let gate = InstructionGate::with_anonymous(false);
+        let session_id = "checkpoint-rearm-session";
+        let read_body = tool_call_body("read", json!({ "paths": ["hello.txt"] }));
+        let session = ClientSession::from_headers(&modern_mcp_headers_for_session(
+            &read_body,
+            session_id,
+        ));
+        gate.mark_called(&session);
+        for _ in 0..59 {
+            gate.contexts.record_tool_call(Some(session_id));
+        }
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: gate.clone(),
+        };
+
+        let first_checkpoint = post_mcp_http(
+            State(server_state.clone()),
+            modern_mcp_headers_for_session(&read_body, session_id),
+            read_body,
+        )
+        .await;
+        let first_bytes = to_bytes(first_checkpoint.into_body(), usize::MAX)
+            .await
+            .expect("read first checkpoint response");
+        let first_payload: Value = serde_json::from_slice(&first_bytes).unwrap();
+        assert_eq!(
+            first_payload.pointer("/result/structuredContent/checkpointRecommended"),
+            Some(&Value::Bool(true))
+        );
+
+        let handoff_body = tool_call_body(
+            "create_handoff",
+            json!({ "goal": "Preserve checkpoint state before continuing" }),
+        );
+        let handoff = post_mcp_http(
+            State(server_state.clone()),
+            modern_mcp_headers_for_session(&handoff_body, session_id),
+            handoff_body,
+        )
+        .await;
+        assert_eq!(handoff.status(), StatusCode::OK);
+        let handoff_bytes = to_bytes(handoff.into_body(), usize::MAX)
+            .await
+            .expect("read handoff response");
+        let handoff_payload: Value = serde_json::from_slice(&handoff_bytes).unwrap();
+        assert_eq!(
+            handoff_payload
+                .pointer("/result/structuredContent/toolName")
+                .and_then(Value::as_str),
+            Some("create_handoff")
+        );
+
+        for _ in 0..59 {
+            gate.contexts.record_tool_call(Some(session_id));
+        }
+        let second_read_body = tool_call_body("read", json!({ "paths": ["hello.txt"] }));
+        let second_checkpoint = post_mcp_http(
+            State(server_state),
+            modern_mcp_headers_for_session(&second_read_body, session_id),
+            second_read_body,
+        )
+        .await;
+        let second_bytes = to_bytes(second_checkpoint.into_body(), usize::MAX)
+            .await
+            .expect("read second checkpoint response");
+        let second_payload: Value = serde_json::from_slice(&second_bytes).unwrap();
+        assert_eq!(
+            second_payload.pointer("/result/structuredContent/checkpointRecommended"),
+            Some(&Value::Bool(true)),
+            "successful create_handoff must re-arm checkpointing immediately for the next active window"
+        );
+        assert_eq!(
+            second_payload
+                .pointer("/result/structuredContent/checkpointToolCalls")
+                .and_then(Value::as_u64),
+            Some(60)
+        );
+
+        let _ = std::fs::remove_file(workspace_root.join("hello.txt"));
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
     async fn deleting_one_named_session_cancels_only_its_jobs_and_keeps_other_session_connected() {
         let workspace_root = unique_temp_path("catdesk-delete-session-workspace");
         let config_root = unique_temp_path("catdesk-delete-session-config");
@@ -4596,6 +4705,11 @@ async fn post_mcp_inner(
                 })
             {
                 s.catdesk_instruction_called.mark_called(&client_session);
+            }
+            if req.params.get("name").and_then(Value::as_str) == Some("create_handoff")
+                && tool_call_succeeded(&resp)
+            {
+                s.catdesk_instruction_called.rearm_checkpoint(&client_session);
             }
             let turn_token_usage = turn_token_usage_for_response(&req, resp.result.as_ref());
             let usage_totals = {

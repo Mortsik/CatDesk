@@ -215,6 +215,19 @@ impl SessionContextStore {
         }
     }
 
+    pub(crate) fn rearm_checkpoint(&self, session_id: Option<&str>) {
+        let Some(session_id) = session_id else {
+            return;
+        };
+        let now = Instant::now();
+        let mut state = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_sessions(&mut state, now);
+        Self::session_mut(&mut state, session_id, now).checkpoint = None;
+    }
+
     pub(crate) fn claim_checkpoint(
         &self,
         session_id: Option<&str>,

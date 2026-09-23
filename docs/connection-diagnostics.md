@@ -91,9 +91,11 @@ The window resets after five minutes without a tool call. After ten minutes of c
 activity or 60 tool calls, whichever happens first, the next normal structured tool
 response carries `checkpointRecommended: true` plus an instruction to reach a safe
 boundary, preserve state with `create_handoff`, and finish the current assistant
-turn. The hint is delivered at most once per active window and never cancels a
-background command job. Anonymous/stateless requests are not tracked. `read_image`
-keeps its native multimodal result shape and cannot consume the checkpoint; the next
+turn. The hint is delivered at most once per active window. A successful
+`create_handoff` immediately re-arms checkpointing for the same named session, so the
+next active run gets a fresh ten-minute/60-call window without waiting for the five-minute
+idle fallback. Re-arming never cancels a background command job. Anonymous/stateless
+requests are not tracked. `read_image` keeps its native multimodal result shape and cannot consume the checkpoint; the next
 normal structured response can deliver it instead. A delivered hint emits
 `checkpoint_recommended` with numeric `age_ms` and `tool_calls` only; raw session
 IDs, arguments and result content are not logged.
