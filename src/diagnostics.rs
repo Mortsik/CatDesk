@@ -31,6 +31,15 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_record_contains_only_bounded_numeric_metadata() {
+        let record = checkpoint_record(612_345, 67);
+        assert_eq!(record["event"], "checkpoint_recommended");
+        assert_eq!(record["age_ms"], 612_345);
+        assert_eq!(record["tool_calls"], 67);
+        assert_eq!(record.as_object().map(|object| object.len()), Some(3));
+    }
+
+    #[test]
     fn writer_persists_records_and_rotates_with_private_permissions() {
         let root =
             std::env::temp_dir().join(format!("catdesk-diagnostics-{}", uuid::Uuid::new_v4()));
@@ -536,6 +545,20 @@ pub(crate) fn global() -> Option<Diagnostics> {
 pub(crate) fn event(event: &'static str) {
     if let Some(log) = GLOBAL.get() {
         log.record(json!({"event": event}));
+    }
+}
+
+fn checkpoint_record(age_ms: u64, tool_calls: u64) -> Value {
+    json!({
+        "event": "checkpoint_recommended",
+        "age_ms": age_ms,
+        "tool_calls": tool_calls,
+    })
+}
+
+pub(crate) fn checkpoint_recommended(age_ms: u64, tool_calls: u64) {
+    if let Some(log) = GLOBAL.get() {
+        log.record(checkpoint_record(age_ms, tool_calls));
     }
 }
 

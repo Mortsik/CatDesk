@@ -513,6 +513,22 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
     );
     properties.insert("message".to_string(), json!({ "type": "string" }));
     properties.insert("success".to_string(), json!({ "type": "boolean" }));
+    properties.insert(
+        "checkpointRecommended".to_string(),
+        json!({ "type": "boolean" }),
+    );
+    properties.insert(
+        "checkpointInstruction".to_string(),
+        json!({ "type": "string" }),
+    );
+    properties.insert(
+        "checkpointAgeMs".to_string(),
+        json!({ "type": "integer", "minimum": 0 }),
+    );
+    properties.insert(
+        "checkpointToolCalls".to_string(),
+        json!({ "type": "integer", "minimum": 0 }),
+    );
 
     match name {
         "catdesk_instruction" => {
@@ -5565,6 +5581,10 @@ mod tests {
             );
             assert!(properties.contains_key("message"));
             assert!(properties.contains_key("success"));
+            assert!(properties.contains_key("checkpointRecommended"));
+            assert!(properties.contains_key("checkpointInstruction"));
+            assert!(properties.contains_key("checkpointAgeMs"));
+            assert!(properties.contains_key("checkpointToolCalls"));
             assert!(
                 schema
                     .get("required")
