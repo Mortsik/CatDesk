@@ -470,11 +470,22 @@ fn bubblewrap_executable(workspace: &Path) -> Option<PathBuf> {
 /// `/dev/tty` and the like), `--tmpfs /tmp` keeps the host's `/tmp` out of
 /// reach, and `--unshare-pid` hides host processes. `--new-session` gives the
 /// sandboxed command its own session.
+///
+/// When the transient memory scope will actually be created (the caller
+/// resolves this once via [`sandbox_scope_systemd_run`] and passes it down as
+/// `scope_enabled`), the command also gets
+/// `CATDESK_SANDBOX_UNIT=catdesk-sb-<id>`: sandboxed scripts can then recognize
+/// the enclosing scope (nested cgroup guards reuse it instead of calling
+/// `systemd-run --user`, which has no user bus inside the namespace). The
+/// marker never appears without the unit — and it never substitutes for the
+/// kernel limits themselves.
 fn bubblewrap_argv(
     command: &str,
     workspace: &Path,
     cwd: &Path,
     scratch: &Path,
+    sandbox_id: &str,
+    scope_enabled: bool,
 ) -> io::Result<Vec<OsString>> {
     let workspace = canonical_existing(workspace)?;
     let cwd = canonical_existing(cwd)?;
@@ -552,6 +563,25 @@ fn bubblewrap_argv(
         argv.push("--setenv".into());
         argv.push("SSH_AUTH_SOCK".into());
         argv.push(socket.as_os_str().to_os_string());
+    }
+    if scope_enabled {
+        // Mirror of the transient unit name in [`sandbox_command`]; both come
+        // from one decision in [`helper_command`], so the marker can never
+        // name a scope that will not exist.
+        argv.extend([
+            "--setenv".into(),
+            "CATDESK_SANDBOX_UNIT".into(),
+            format!("catdesk-sb-{sandbox_id}").into(),
+        ]);
+    } else {
+        // bwrap inherits the parent environment: a stale or planted
+        // CATDESK_SANDBOX_UNIT from the CatDesk process must not leak into a
+        // sandbox that gets no scope (Sol r4 685bb5ea). Explicit removal keeps
+        // the invariant marker ⇒ existing scope.
+        argv.extend([
+            "--unsetenv".into(),
+            "CATDESK_SANDBOX_UNIT".into(),
+        ]);
     }
     argv.extend([
         "--setenv".into(),
@@ -632,19 +662,29 @@ fn memory_limit_from_env(variable: &str, default: &str) -> String {
 /// on setups that have a user manager (WSL2/systemd), they are not a
 /// confinement boundary. The executable is resolved outside the workspace like
 /// `bwrap`, so a hijacked copy cannot run anything unsandboxed.
+/// Jedna decyzja o transient scope: `Some(systemd-run)` gdy unit powstanie
+/// (limity pamięci włączone ORAZ `systemd-run` na `PATH`), `None` dla plain
+/// bwrap. Marker `CATDESK_SANDBOX_UNIT` w [`bubblewrap_argv`] i wrapper w
+/// [`sandbox_command`] muszą wynikać z tej samej decyzji — inaczej przy
+/// fail-open (brak systemd-run) sandbox dostałby marker nieistniejącego
+/// scope'a (Sol r2 b74ec89e).
+fn sandbox_scope_systemd_run(workspace: &Path) -> Option<PathBuf> {
+    sandbox_memory_limits()?;
+    systemd_run_executable(workspace)
+}
+
 fn sandbox_command(
     bwrap: &Path,
     argv: Vec<OsString>,
     sandbox_id: &str,
-    workspace: &Path,
+    scope: Option<&Path>,
 ) -> Command {
-    let (Some(limits), Some(systemd_run)) =
-        (sandbox_memory_limits(), systemd_run_executable(workspace))
-    else {
+    let Some(systemd_run) = scope else {
         let mut command = Command::new(bwrap);
         command.args(argv);
         return command;
     };
+    let limits = sandbox_memory_limits().expect("scope decision implies enabled memory limits");
     let mut command = Command::new(systemd_run);
     command
         .arg("--user")
@@ -695,9 +735,17 @@ pub fn helper_command(
             )
         })?;
 
+    let scope = sandbox_scope_systemd_run(workspace);
     let prepared = match bubblewrap_executable(workspace) {
-        Some(bwrap) => bubblewrap_argv(command, workspace, cwd, &scratch_dir)
-            .map(|argv| sandbox_command(&bwrap, argv, &sandbox_id, workspace)),
+        Some(bwrap) => bubblewrap_argv(
+            command,
+            workspace,
+            cwd,
+            &scratch_dir,
+            &sandbox_id,
+            scope.is_some(),
+        )
+        .map(|argv| sandbox_command(&bwrap, argv, &sandbox_id, scope.as_deref())),
         None => Err(io::Error::other(
             "no usable sandbox: bwrap was not found on PATH outside the workspace. Install \
              bubblewrap to run commands confined.",
@@ -960,7 +1008,8 @@ mod tests {
         std::fs::create_dir_all(&scratch).expect("create scratch");
 
         let argv =
-            bubblewrap_argv("pwd", &workspace, &cwd, &scratch).expect("build bubblewrap argv");
+            bubblewrap_argv("pwd", &workspace, &cwd, &scratch, "marker-sandbox-id", true)
+                .expect("build bubblewrap argv");
 
         assert!(argv.iter().any(|arg| arg.as_os_str() == "--new-session"));
         if Path::new("/etc/ssh").is_dir() {
@@ -975,6 +1024,91 @@ mod tests {
             .map(|pair| PathBuf::from(&pair[1]))
             .expect("--chdir argument");
         assert_eq!(chdir, cwd.canonicalize().expect("canonical cwd"));
+        // Default limits → the memory scope is enabled → the unit marker rides
+        // along so sandboxed scripts can identify the enclosing cgroup.
+        let marker = argv
+            .windows(3)
+            .find(|triple| triple[1].as_os_str() == OsStr::new("CATDESK_SANDBOX_UNIT"))
+            .expect("CATDESK_SANDBOX_UNIT setenv present");
+        assert_eq!(marker[0].as_os_str(), OsStr::new("--setenv"));
+        assert_eq!(
+            marker[2].as_os_str(),
+            OsStr::new("catdesk-sb-marker-sandbox-id")
+        );
+    }
+
+    #[test]
+    fn bubblewrap_argv_omits_unit_marker_without_scope() {
+        // Planted marker in the parent env must be actively removed: bwrap
+        // inherits the environment, so omission alone would still leak it
+        // into a scope-less sandbox (Sol r4 685bb5ea).
+        let _env = EnvGuards::set_str("CATDESK_SANDBOX_UNIT", "bogus-scope");
+        let tree = TempTree::new();
+        let workspace = tree.path().join("workspace");
+        let cwd = workspace.join("src");
+        let scratch = tree.path().join("scratch");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+
+        let argv = bubblewrap_argv("pwd", &workspace, &cwd, &scratch, "marker-sandbox-id", false)
+            .expect("build bubblewrap argv");
+        // Other --setenv entries (SSH_AUTH_SOCK, TMPDIR, ...) stay; only the
+        // marker must not be set...
+        assert!(
+            !argv
+                .windows(2)
+                .any(|pair| pair[0].as_os_str() == OsStr::new("--setenv")
+                    && pair[1].as_os_str() == OsStr::new("CATDESK_SANDBOX_UNIT")),
+            "no --setenv marker when the scope will not be created"
+        );
+        // ...and the inherited variable must be explicitly removed.
+        let unset = argv
+            .windows(2)
+            .find(|pair| pair[0].as_os_str() == OsStr::new("--unsetenv"))
+            .expect("--unsetenv present without the scope");
+        assert_eq!(unset[1].as_os_str(), OsStr::new("CATDESK_SANDBOX_UNIT"));
+    }
+
+    #[test]
+    fn helper_command_omits_unit_marker_when_scope_unavailable() {
+        // Sol r2 regression: memory limits ON but systemd-run missing must
+        // produce plain bwrap AND no CATDESK_SANDBOX_UNIT — the marker must
+        // never name a scope that will not exist.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tree = TempTree::new();
+        let bwrap_bin = tree.path().join("bwrap-bin");
+        std::fs::create_dir_all(&bwrap_bin).expect("create bwrap bin");
+        let bwrap = bwrap_bin.join("bwrap");
+        std::fs::write(&bwrap, b"#!/bin/sh\n").expect("write bwrap stub");
+        std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod bwrap stub");
+
+        let _env = EnvGuards::set("PATH", &bwrap_bin);
+
+        let workspace = tree.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let (command, scratch) =
+            helper_command("true", &workspace, &workspace).expect("helper command");
+        assert_eq!(
+            Path::new(command.get_program()).file_name(),
+            Some(OsStr::new("bwrap")),
+            "plain bwrap when systemd-run is unavailable"
+        );
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair[0] == OsStr::new("--setenv")
+                    && pair[1] == OsStr::new("CATDESK_SANDBOX_UNIT")),
+            "no --setenv unit marker without the scope"
+        );
+        assert!(
+            args.windows(2).any(|pair| pair[0] == OsStr::new("--unsetenv")
+                && pair[1] == OsStr::new("CATDESK_SANDBOX_UNIT")),
+            "inherited/planted marker must be actively removed"
+        );
+        std::fs::remove_dir_all(scratch).expect("remove scratch directory");
     }
 
     #[test]
@@ -982,7 +1116,8 @@ mod tests {
         let _env = EnvGuards::read();
         // systemd-run may be absent in minimal environments; the wrap is a
         // host-protection extra, so there is nothing to assert without it.
-        if systemd_run_executable(Path::new(".")).is_none() {
+        let scope = sandbox_scope_systemd_run(Path::new("."));
+        if scope.is_none() {
             return;
         }
 
@@ -996,7 +1131,7 @@ mod tests {
             Path::new("/usr/bin/bwrap"),
             argv,
             "test-scope-id",
-            Path::new("."),
+            scope.as_deref(),
         );
         assert!(
             Path::new(command.get_program())
@@ -1049,7 +1184,8 @@ mod tests {
     #[test]
     fn sandbox_command_scope_limits_come_from_env_overrides() {
         let _env = EnvGuards::set_str("CATDESK_SANDBOX_MEMORY_HIGH", "2G");
-        if systemd_run_executable(Path::new(".")).is_none() {
+        let scope = sandbox_scope_systemd_run(Path::new("."));
+        if scope.is_none() {
             return;
         }
 
@@ -1057,7 +1193,7 @@ mod tests {
             Path::new("/usr/bin/bwrap"),
             Vec::new(),
             "test-scope-id",
-            Path::new("."),
+            scope.as_deref(),
         );
         let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
         assert!(
@@ -1072,12 +1208,17 @@ mod tests {
     #[test]
     fn sandbox_command_scope_off_returns_plain_bwrap() {
         let _env = EnvGuards::set_str("CATDESK_SANDBOX_MEMORY", "off");
+        let scope = sandbox_scope_systemd_run(Path::new("."));
+        assert!(
+            scope.is_none(),
+            "scope decision must be None with CATDESK_SANDBOX_MEMORY=off"
+        );
 
         let command = sandbox_command(
             Path::new("/usr/bin/bwrap"),
             vec![OsString::from("--die-with-parent")],
             "test-scope-id",
-            Path::new("."),
+            scope.as_deref(),
         );
         assert_eq!(command.get_program(), Path::new("/usr/bin/bwrap"));
         assert_eq!(command.get_args().count(), 1);
@@ -1092,12 +1233,14 @@ mod tests {
         let empty_bin = tree.path().join("empty-bin");
         std::fs::create_dir_all(&empty_bin).expect("create empty bin");
         let _env = EnvGuards::set("PATH", &empty_bin);
+        let scope = sandbox_scope_systemd_run(Path::new("."));
+        assert!(scope.is_none(), "no systemd-run on PATH means no scope");
 
         let command = sandbox_command(
             Path::new("/usr/bin/bwrap"),
             vec![OsString::from("--die-with-parent")],
             "test-scope-id",
-            Path::new("."),
+            scope.as_deref(),
         );
         assert_eq!(command.get_program(), Path::new("/usr/bin/bwrap"));
         assert_eq!(command.get_args().count(), 1);
