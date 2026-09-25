@@ -8,6 +8,8 @@ use axum::{
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
+
+use crate::build_info;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path as FsPath, PathBuf};
@@ -1000,6 +1002,10 @@ async fn health(State(s): State<ServerState>) -> Json<Value> {
         "tool_mode": app.tool_mode.label(),
         "busy": false,
         "workspace": app.workspace_root,
+        "version": build_info::version_label(build_info::VERSION, build_info::GIT_SHA),
+        "git_sha": build_info::GIT_SHA,
+        "git_branch": build_info::GIT_BRANCH,
+        "build_time": build_info::BUILD_TIMESTAMP,
     }))
 }
 
@@ -2189,6 +2195,50 @@ mod tests {
         .expect("health must not wait for AppState");
         assert_eq!(result.0.get("status").and_then(Value::as_str), Some("ok"));
         assert_eq!(result.0.get("busy").and_then(Value::as_bool), Some(true));
+        assert!(
+            result.0.get("version").is_none(),
+            "busy fast-path must stay minimal: no build identity fields"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_exposes_build_identity_when_app_state_is_available() {
+        let root = unique_temp_path("catdesk-health-identity");
+        std::fs::create_dir_all(&root).unwrap();
+        let app = AppState::new_for_test(
+            0,
+            root.to_string_lossy().into_owned(),
+            root.join("config.toml"),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let (ui_events, _receiver) = channel(crate::state::UI_EVENT_CAPACITY);
+        let server = ServerState {
+            app: state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events,
+            catdesk_instruction_called: InstructionGate::with_anonymous(false),
+        };
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), health(State(server)))
+                .await
+                .expect("health must not wait for AppState");
+        assert_eq!(result.0.get("busy").and_then(Value::as_bool), Some(false));
+        for field in ["version", "git_sha", "git_branch", "build_time"] {
+            let value = result
+                .0
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("health must expose a string {field}"));
+            assert!(!value.is_empty(), "health {field} must not be empty");
+        }
+        let version = result.0.get("version").and_then(Value::as_str).unwrap();
+        assert!(
+            version.starts_with(&format!("v{}", crate::build_info::VERSION)),
+            "version must be the labeled package version, got {version}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

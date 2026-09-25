@@ -6,6 +6,33 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn process_started_record_carries_version_and_identity_line() {
+        let record = process_started_record();
+        assert_eq!(
+            record.get("event").and_then(Value::as_str),
+            Some("process_started")
+        );
+        assert_eq!(
+            record.get("version").and_then(Value::as_str),
+            Some(crate::build_info::VERSION)
+        );
+        assert_eq!(
+            record.get("build").and_then(Value::as_str),
+            Some(
+                crate::build_info::identity_line(
+                    crate::build_info::VERSION,
+                    crate::build_info::GIT_SHA,
+                    crate::build_info::GIT_BRANCH,
+                    crate::build_info::BUILD_TIMESTAMP,
+                )
+                .as_str()
+            )
+        );
+        // Identity fields only here; per-request records keep their shape.
+        assert!(!record.to_string().contains("rpc_method"));
+    }
+
+    #[test]
     fn request_metadata_does_not_persist_client_secrets() {
         let value = request_metadata(&json!({
             "id": "secret-client-id",
@@ -522,9 +549,9 @@ impl Diagnostics {
 pub(crate) fn init(root: &Path) -> io::Result<Guard> {
     let (log, guard) = Diagnostics::start(root)?;
     GLOBAL
-        .set(log)
+        .set(log.clone())
         .map_err(|_| io::Error::other("diagnostics already initialized"))?;
-    event("process_started");
+    log.record(process_started_record());
     Ok(guard)
 }
 
@@ -537,6 +564,21 @@ pub(crate) fn event(event: &'static str) {
     if let Some(log) = GLOBAL.get() {
         log.record(json!({"event": event}));
     }
+}
+
+/// Identity appears exactly once per process, in this record; per-request
+/// diagnostics keep their shape without build metadata.
+pub(crate) fn process_started_record() -> Value {
+    json!({
+        "event": "process_started",
+        "version": crate::build_info::VERSION,
+        "build": crate::build_info::identity_line(
+            crate::build_info::VERSION,
+            crate::build_info::GIT_SHA,
+            crate::build_info::GIT_BRANCH,
+            crate::build_info::BUILD_TIMESTAMP,
+        ),
+    })
 }
 
 fn request_metadata(body: &Value) -> Value {

@@ -15,7 +15,9 @@ fn main() {
     emit_git_watch_paths();
     println!(
         "cargo:rustc-env=CATDESK_GIT_SHA={}",
-        env_override("CATDESK_BUILD_SHA").or_else(git_sha).unwrap_or_else(|| UNKNOWN.to_string())
+        env_override("CATDESK_BUILD_SHA")
+            .or_else(git_sha)
+            .unwrap_or_else(|| UNKNOWN.to_string())
     );
     println!(
         "cargo:rustc-env=CATDESK_GIT_BRANCH={}",

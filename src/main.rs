@@ -2852,8 +2852,8 @@ mod tests {
         normalize_ngrok_authtoken_input, pad_right_to_cell_width, parse_terminal_profile_choice,
         redraw_due, terminal_cell_width, text_input_key_is_cancel, trim_line, wrap_log_message,
     };
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use crate::build_info;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};

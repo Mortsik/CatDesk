@@ -110,7 +110,10 @@ mod tests {
 
     #[test]
     fn identity_line_omits_unknown_segments() {
-        assert_eq!(identity_line("0.9.2", "unknown", "unknown", "unknown"), "0.9.2");
+        assert_eq!(
+            identity_line("0.9.2", "unknown", "unknown", "unknown"),
+            "0.9.2"
+        );
         assert_eq!(
             identity_line("0.9.2", "unknown", "feature/x", "unknown"),
             "0.9.2 feature/x"
@@ -123,6 +126,9 @@ mod tests {
 
     #[test]
     fn identity_line_omits_too_short_timestamp() {
-        assert_eq!(identity_line("0.9.2", "unknown", "unknown", "2026-9"), "0.9.2");
+        assert_eq!(
+            identity_line("0.9.2", "unknown", "unknown", "2026-9"),
+            "0.9.2"
+        );
     }
 }
