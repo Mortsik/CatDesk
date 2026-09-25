@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -34,11 +34,20 @@ const HARD_SEARCH_LIMIT: usize = 500;
 const HARD_SEARCH_CONTEXT_LINES: usize = 20;
 static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
 static GREP_AVAILABLE: OnceLock<bool> = OnceLock::new();
-/// Hard wall-clock bound for one text search. A rare pattern never reaches
-/// the `max_matches` cap, and without a deadline rg walks the whole tree
-/// (measured: 17+ min per search while six duplicates pinned every CPU and
-/// the GLM semaphore starved — 2026-09-20).
+/// Hard wall-clock bound for one text search, enforced by every backend: rg
+/// (watchdog SIGKILLs the child), grep (per-file child under the same
+/// watchdog) and the built-in scanner (loop checks). A rare pattern never
+/// reaches the `max_matches` cap, and without a deadline rg walks the whole
+/// tree (measured: 17+ min per search while six duplicates pinned every CPU
+/// and the GLM semaphore starved — 2026-09-20). The grep and built-in
+/// fallbacks need the same bound: their volume caps (2000 files / 64 MiB)
+/// bound the scan, not the clock — a tree of skipped entries is walked in
+/// full (catdesk-u9s).
 const SEARCH_DEADLINE: Duration = Duration::from_secs(60);
+/// A deadline cut is a first-class truncated outcome on every backend —
+/// partial results plus this note, never a backend failure.
+const SEARCH_DEADLINE_TRUNCATED_NOTE: &str =
+    "search exceeded its time budget and was truncated; narrow the path or refine the pattern";
 /// Excluded from every search unless the caller explicitly passes
 /// `no_ignore`. Appended AFTER the caller's glob because rg lets the LAST
 /// matching glob decide, so a caller whitelist like `**/*` must not
@@ -1063,6 +1072,46 @@ fn spawn_deadline_watchdog(
     Arc::new(AtomicBool::new(false))
 }
 
+/// Shared-pid variant of [`spawn_deadline_watchdog`] for the grep fallback,
+/// which runs one short-lived child per file: `pid` holds the child currently
+/// in flight (0 = between files) and is read only when the deadline fires.
+#[cfg(unix)]
+fn spawn_deadline_watchdog_cell(
+    pid: Arc<AtomicU32>,
+    deadline: Instant,
+    finished: Arc<AtomicBool>,
+) -> Arc<AtomicBool> {
+    let killed = Arc::new(AtomicBool::new(false));
+    let killed_flag = Arc::clone(&killed);
+    std::thread::spawn(move || {
+        let now = Instant::now();
+        if deadline > now {
+            std::thread::sleep(deadline - now);
+        }
+        if !finished.load(Ordering::SeqCst) {
+            // 0 means "no child in flight"; kill(0, ...) would signal the
+            // whole process group, so it must never reach libc::kill.
+            let active = pid.load(Ordering::SeqCst);
+            if active != 0 {
+                unsafe {
+                    libc::kill(active as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            killed_flag.store(true, Ordering::SeqCst);
+        }
+    });
+    killed
+}
+
+#[cfg(not(unix))]
+fn spawn_deadline_watchdog_cell(
+    _pid: Arc<AtomicU32>,
+    _deadline: Instant,
+    _finished: Arc<AtomicBool>,
+) -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
 fn search_text_rg(
     root: &Path,
     start: &Path,
@@ -1182,7 +1231,7 @@ fn search_text_rg_with_deadline(
         path: to_workspace_relative(root, start),
         backend: "rg".into(),
         backend_note: if killed_by_deadline {
-            "search exceeded its time budget and was truncated; narrow the path or refine the pattern".into()
+            SEARCH_DEADLINE_TRUNCATED_NOTE.into()
         } else {
             String::new()
         },
@@ -1198,14 +1247,36 @@ fn search_text_grep(
     start: &Path,
     options: ResolvedSearchTextOptions<'_>,
 ) -> Result<SearchTextOutput, SearchBackendError> {
-    let collected = collect_search_files(root, start, options)
+    search_text_grep_with_deadline(root, start, options, Instant::now() + SEARCH_DEADLINE)
+}
+
+fn search_text_grep_with_deadline(
+    root: &Path,
+    start: &Path,
+    options: ResolvedSearchTextOptions<'_>,
+    deadline: Instant,
+) -> Result<SearchTextOutput, SearchBackendError> {
+    let collected = collect_search_files(root, start, options, deadline)
         .map_err(|e| SearchBackendError::Failed(e.to_string()))?;
     let files = collected.files;
+    let mut deadline_exceeded = collected.deadline_hit;
+    // One watchdog for the whole search: it SIGKILLs whichever per-file grep
+    // child is in flight when the deadline fires (same primitive as the rg
+    // backend — grep on a single file finishes, but the guarantee must not
+    // rest on that).
+    let active_pid = Arc::new(AtomicU32::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+    let killed_by_deadline =
+        spawn_deadline_watchdog_cell(Arc::clone(&active_pid), deadline, Arc::clone(&finished));
     let mut results = Vec::new();
     let mut returned_matches = 0_usize;
     let mut truncated = false;
 
     for file in files.iter() {
+        if Instant::now() >= deadline {
+            deadline_exceeded = true;
+            break;
+        }
         let remaining_matches = options.max_matches.saturating_sub(returned_matches);
         let probe_limit = remaining_matches.saturating_add(1);
         let file_match_limit = options
@@ -1240,13 +1311,23 @@ fn search_text_grep(
         command.arg("--").arg(options.pattern).arg(file);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let output = command.output().map_err(|e| {
+        let child = command.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 SearchBackendError::Unavailable
             } else {
                 SearchBackendError::Failed(e.to_string())
             }
         })?;
+        active_pid.store(child.id(), Ordering::SeqCst);
+        let waited = child.wait_with_output();
+        active_pid.store(0, Ordering::SeqCst);
+        let output = waited.map_err(|e| SearchBackendError::Failed(e.to_string()))?;
+        if killed_by_deadline.load(Ordering::SeqCst) {
+            // A deadline kill surfaces as a signal exit; drop the partial
+            // chunk — same first-class truncated outcome as rg.
+            deadline_exceeded = true;
+            break;
+        }
         let status_code = output.status.code().unwrap_or(2);
         if status_code != 0 && status_code != 1 {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1287,11 +1368,20 @@ fn search_text_grep(
         }
     }
 
+    finished.store(true, Ordering::SeqCst);
+    if deadline_exceeded {
+        truncated = true;
+    }
+
     Ok(SearchTextOutput {
         pattern: options.pattern.to_string(),
         path: to_workspace_relative(root, start),
         backend: "grep".into(),
-        backend_note: fallback_search_note("rg not found; used grep", collected.limited),
+        backend_note: fallback_search_note(
+            "rg not found; used grep",
+            collected.limited,
+            deadline_exceeded,
+        ),
         match_count: returned_matches,
         truncated,
         limit: options.max_matches,
@@ -1305,10 +1395,26 @@ fn search_text_rust(
     options: ResolvedSearchTextOptions<'_>,
     backend_note: String,
 ) -> Result<SearchTextOutput, String> {
+    search_text_rust_with_deadline(
+        root,
+        start,
+        options,
+        backend_note,
+        Instant::now() + SEARCH_DEADLINE,
+    )
+}
+
+fn search_text_rust_with_deadline(
+    root: &Path,
+    start: &Path,
+    options: ResolvedSearchTextOptions<'_>,
+    backend_note: String,
+    deadline: Instant,
+) -> Result<SearchTextOutput, String> {
     let matcher = SearchMatcher::new(options)?;
-    let collected = collect_search_files(root, start, options)?;
+    let collected = collect_search_files(root, start, options, deadline)?;
     let files = collected.files;
-    let backend_note = fallback_search_note(&backend_note, collected.limited);
+    let mut deadline_exceeded = collected.deadline_hit;
     let mut results = Vec::new();
     let mut returned_matches = 0_usize;
     let mut truncated = false;
@@ -1316,6 +1422,10 @@ fn search_text_rust(
     for file in files.iter() {
         if returned_matches >= options.max_matches {
             truncated = true;
+            break;
+        }
+        if Instant::now() >= deadline {
+            deadline_exceeded = true;
             break;
         }
         let mut file_handle = fs::File::open(file).map_err(|e| e.to_string())?;
@@ -1360,6 +1470,11 @@ fn search_text_rust(
         );
         returned_matches += match_indexes.len();
     }
+
+    if deadline_exceeded {
+        truncated = true;
+    }
+    let backend_note = fallback_search_note(&backend_note, collected.limited, deadline_exceeded);
 
     Ok(SearchTextOutput {
         pattern: options.pattern.to_string(),
@@ -1482,21 +1597,27 @@ fn parse_grep_line_prefix(line: &str) -> Option<(usize, char, &str)> {
 struct CollectedSearchFiles {
     files: Vec<PathBuf>,
     limited: bool,
+    /// The clock ran out mid-walk: the volume caps did not stop it.
+    deadline_hit: bool,
 }
 
-fn fallback_search_note(base: &str, limited: bool) -> String {
-    if !limited {
-        return base.to_string();
+fn fallback_search_note(base: &str, limited: bool, deadline_exceeded: bool) -> String {
+    let mut note = base.to_string();
+    if limited {
+        note.push_str("; fallback scan bounded to 2 MiB per file, 64 MiB total, and 2000 files");
     }
-    format!(
-        "{base}; fallback scan bounded to 2 MiB per file, 64 MiB total, and 2000 files"
-    )
+    if deadline_exceeded {
+        note.push_str("; ");
+        note.push_str(SEARCH_DEADLINE_TRUNCATED_NOTE);
+    }
+    note
 }
 
 fn collect_search_files(
     root: &Path,
     start: &Path,
     options: ResolvedSearchTextOptions<'_>,
+    deadline: Instant,
 ) -> Result<CollectedSearchFiles, String> {
     let glob = compile_search_glob(options.glob)?;
     let mut builder = WalkBuilder::new(start);
@@ -1512,7 +1633,15 @@ fn collect_search_files(
     let mut files = Vec::new();
     let mut total_bytes = 0_u64;
     let mut limited = false;
+    let mut deadline_hit = false;
     for entry_result in builder.build() {
+        // The walk itself is the unbounded part of a fallback scan: files
+        // skipped by the volume caps still cost a visited directory entry,
+        // so a tree of skipped entries would be walked in full.
+        if Instant::now() >= deadline {
+            deadline_hit = true;
+            break;
+        }
         let entry = entry_result.map_err(|e| e.to_string())?;
         let path = entry.path();
         let Some(file_type) = entry.file_type() else {
@@ -1548,7 +1677,11 @@ fn collect_search_files(
         files.push(path.to_path_buf());
     }
     files.sort();
-    Ok(CollectedSearchFiles { files, limited })
+    Ok(CollectedSearchFiles {
+        files,
+        limited,
+        deadline_hit,
+    })
 }
 
 fn compile_search_glob(glob: Option<&str>) -> Result<Option<GlobSet>, String> {
@@ -2214,6 +2347,210 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    fn deadline_test_options(pattern: &'static str) -> ResolvedSearchTextOptions<'static> {
+        ResolvedSearchTextOptions {
+            pattern,
+            glob: None,
+            fixed_strings: true,
+            case_insensitive: false,
+            before: 0,
+            after: 0,
+            max_matches: 500,
+            max_matches_per_file: None,
+            include_hidden: false,
+            no_ignore: false,
+        }
+    }
+
+    fn deadline_note_present(note: &str) -> bool {
+        note.contains("exceeded its time budget")
+    }
+
+    #[test]
+    fn collect_search_files_stops_at_deadline() {
+        let workspace_root = test_workspace("search-deadline-collect");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        fs::write(workspace_root.join("a.txt"), "needle\n").expect("write file");
+        let options = deadline_test_options("needle");
+
+        let missed =
+            collect_search_files(&workspace_root, &workspace_root, options, Instant::now())
+                .expect("collect with an expired deadline");
+        assert!(missed.deadline_hit, "expired deadline must stop the walk");
+        assert!(missed.files.is_empty());
+
+        let full = collect_search_files(
+            &workspace_root,
+            &workspace_root,
+            options,
+            Instant::now() + SEARCH_DEADLINE,
+        )
+        .expect("collect within the deadline");
+        assert!(!full.deadline_hit);
+        assert_eq!(full.files.len(), 1);
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn builtin_search_deadline_surfaces_as_truncation_not_an_error() {
+        let workspace_root = test_workspace("search-deadline-rust");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        fs::write(workspace_root.join("a.txt"), "needle\n").expect("write file");
+
+        let output = search_text_rust_with_deadline(
+            &workspace_root,
+            &workspace_root,
+            deadline_test_options("needle"),
+            "test rust backend".into(),
+            Instant::now(),
+        )
+        .expect("deadline cut must stay a truncated result");
+
+        assert_eq!(output.backend, "rust");
+        assert_eq!(output.match_count, 0);
+        assert!(output.truncated);
+        assert!(deadline_note_present(&output.backend_note));
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn grep_search_deadline_surfaces_as_truncation_not_an_error() {
+        if !command_available("grep") {
+            return;
+        }
+
+        let workspace_root = test_workspace("search-deadline-grep");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        fs::write(workspace_root.join("a.txt"), "needle\n").expect("write file");
+
+        let output = search_text_grep_with_deadline(
+            &workspace_root,
+            &workspace_root,
+            deadline_test_options("needle"),
+            Instant::now(),
+        )
+        .unwrap_or_else(|e| panic!("deadline cut must stay a truncated result: {e:?}"));
+
+        assert_eq!(output.backend, "grep");
+        assert_eq!(output.match_count, 0);
+        assert!(output.truncated);
+        assert!(deadline_note_present(&output.backend_note));
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    // The fallback loops check the clock per visited entry / per file, so a
+    // deadline that expires while the scan is in flight cuts it mid-way: the
+    // volume caps bound bytes and file count, never the clock. The assertions
+    // are one-sided on purpose — how much work lands before the cut is
+    // machine-dependent, the cut itself is not (the corpus floors are tens of
+    // milliseconds of syscalls/process spawns against a 1 ms deadline).
+    #[test]
+    fn builtin_search_deadline_cuts_a_scan_in_flight() {
+        let workspace_root = test_workspace("search-deadline-rust-slow");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        for index in 0..10_000 {
+            fs::write(
+                workspace_root.join(format!("file-{index:05}.txt")),
+                format!("needle {index}\n"),
+            )
+            .expect("write search corpus file");
+        }
+
+        let output = search_text_rust_with_deadline(
+            &workspace_root,
+            &workspace_root,
+            deadline_test_options("needle"),
+            "test rust backend".into(),
+            Instant::now() + Duration::from_millis(1),
+        )
+        .expect("search");
+
+        assert!(output.truncated, "1 ms deadline must cut a 10k-file scan");
+        assert!(deadline_note_present(&output.backend_note));
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn grep_search_deadline_cuts_a_scan_in_flight() {
+        if !command_available("grep") {
+            return;
+        }
+
+        let workspace_root = test_workspace("search-deadline-grep-slow");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        for index in 0..200 {
+            fs::write(
+                workspace_root.join(format!("file-{index:03}.txt")),
+                format!("needle {index}\n"),
+            )
+            .expect("write search corpus file");
+        }
+
+        let output = search_text_grep_with_deadline(
+            &workspace_root,
+            &workspace_root,
+            deadline_test_options("needle"),
+            Instant::now() + Duration::from_millis(1),
+        )
+        .unwrap_or_else(|e| panic!("search: {e:?}"));
+
+        assert!(output.truncated, "1 ms deadline must cut a 200-grep scan");
+        assert!(deadline_note_present(&output.backend_note));
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_watchdog_cell_kills_the_child_in_flight() {
+        let mut child = ProcessCommand::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = Arc::new(AtomicU32::new(child.id()));
+        let finished = Arc::new(AtomicBool::new(false));
+        let killed = spawn_deadline_watchdog_cell(
+            Arc::clone(&pid),
+            Instant::now() + Duration::from_millis(100),
+            Arc::clone(&finished),
+        );
+
+        for _ in 0..100 {
+            if killed.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(killed.load(Ordering::SeqCst), "watchdog never fired");
+        let status = child.wait().expect("wait for killed child");
+        assert!(
+            status.code().is_none(),
+            "child exited on its own: {status:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_watchdog_cell_never_kills_the_process_group_at_zero() {
+        let pid = Arc::new(AtomicU32::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let killed = spawn_deadline_watchdog_cell(pid, Instant::now(), finished);
+
+        for _ in 0..100 {
+            if killed.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(killed.load(Ordering::SeqCst), "watchdog never fired");
+        // Reaching this line is the assertion: a kill(0, SIGKILL) would have
+        // taken the whole test process — and every sibling test — down with it.
     }
 
     #[cfg(target_os = "linux")]
