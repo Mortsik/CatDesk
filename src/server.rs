@@ -23,7 +23,7 @@ use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::project_scope;
-use crate::request_workers::{RequestClass, global_request_scheduler};
+use crate::request_workers::{RequestClass, run_timed};
 use crate::session_context::{ProjectStateChange, SessionContextStore};
 use crate::state::{
     AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
@@ -563,7 +563,7 @@ fn request_class(req: &Value) -> RequestClass {
 fn request_deadline(class: RequestClass) -> StdDuration {
     match class {
         // poll_command may legitimately wait up to 30 seconds. Leave headroom
-        // without allowing a stalled control call to retain a slot for minutes.
+        // without allowing a stalled control call to run unbounded.
         RequestClass::Control => StdDuration::from_secs(45),
         RequestClass::Filesystem | RequestClass::Process | RequestClass::Browser => {
             MCP_HTTP_REQUEST_MAX_DURATION
@@ -572,32 +572,11 @@ fn request_deadline(class: RequestClass) -> StdDuration {
     }
 }
 
-fn request_scheduling_key(
-    session: &ClientSession,
-    gate: &InstructionGate,
-) -> crate::fair_queue::SchedulingKey {
-    let project = gate
-        .active_project(session)
-        .map(|path| path.to_string_lossy().into_owned());
-    crate::fair_queue::SchedulingKey::new(
-        session.namespace().unwrap_or(session.flow_id.as_str()),
-        project.as_deref(),
-    )
-}
-
-fn request_failure_event(
-    class: RequestClass,
-    failure: &crate::request_workers::RequestFailure,
-) -> &'static str {
+fn request_failure_event(failure: &crate::request_workers::RequestFailure) -> &'static str {
     use crate::request_workers::RequestFailure;
-    match (class, failure) {
-        (RequestClass::Control, RequestFailure::Busy) => "request_control_busy",
-        (RequestClass::Filesystem, RequestFailure::Busy) => "request_filesystem_busy",
-        (RequestClass::Process, RequestFailure::Busy) => "request_process_busy",
-        (RequestClass::Browser, RequestFailure::Busy) => "request_browser_busy",
-        (RequestClass::General, RequestFailure::Busy) => "request_general_busy",
-        (_, RequestFailure::Deadline) => "request_worker_timeout",
-        (_, RequestFailure::Failed) => "request_worker_failed",
+    match failure {
+        RequestFailure::Deadline => "request_worker_timeout",
+        RequestFailure::Failed => "request_worker_failed",
     }
 }
 
@@ -1667,18 +1646,6 @@ mod tests {
         headers.insert(MCP_SESSION_ID_HEADER, "header-session".parse().unwrap());
         let header_session = ClientSession::from_request(&headers, Some(&body_a));
         assert_eq!(header_session.namespace(), Some("header-session"));
-    }
-
-    #[test]
-    fn scheduling_key_uses_named_session_and_active_project() {
-        let body = tool_call_body("read", json!({ "paths": ["x"] }));
-        let session = ClientSession::from_headers(&modern_mcp_headers_for_session(&body, "session-a"));
-        let gate = InstructionGate::with_anonymous(false);
-        gate.set_active_project(&session, std::path::PathBuf::from("/workspace/project-a"));
-
-        let key = request_scheduling_key(&session, &gate);
-        assert_eq!(key.session, "session-a");
-        assert_eq!(key.project.as_deref(), Some("/workspace/project-a"));
     }
 
     #[test]
@@ -4178,17 +4145,12 @@ async fn post_mcp_http(
         .as_ref()
         .map(request_class)
         .unwrap_or(RequestClass::General);
-    let client_session = ClientSession::from_request(&headers, metadata.as_ref());
-    let scheduling_key = request_scheduling_key(&client_session, &s.catdesk_instruction_called);
     let id = metadata.as_ref().and_then(|v| v.get("id").cloned());
-    match global_request_scheduler()
-        .run_keyed_timed(
-            class,
-            scheduling_key,
-            async move { post_mcp_inner(State(s), body_bytes, &headers, None).await },
-            request_deadline(class),
-        )
-        .await
+    match run_timed(
+        async move { post_mcp_inner(State(s), body_bytes, &headers, None).await },
+        request_deadline(class),
+    )
+    .await
     {
         Ok(result) => {
             let mut response = result.value;
@@ -4205,11 +4167,10 @@ async fn post_mcp_http(
         Err(error) => {
             use crate::request_workers::RequestFailure;
             let status = match &error.failure {
-                RequestFailure::Busy => StatusCode::SERVICE_UNAVAILABLE,
                 RequestFailure::Deadline => StatusCode::GATEWAY_TIMEOUT,
                 RequestFailure::Failed => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            crate::diagnostics::event(request_failure_event(class, &error.failure));
+            crate::diagnostics::event(request_failure_event(&error.failure));
             let payload = mcp::JsonRpcResponse::error(
                 id,
                 -32000,

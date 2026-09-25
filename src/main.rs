@@ -8,7 +8,6 @@ mod search_gate;
 mod job_store;
 mod devtools;
 mod diagnostics;
-mod fair_queue;
 mod handoff;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
@@ -3026,8 +3025,6 @@ mod tests {
             "讓ChatGPTWeb變成程式代理",
             "狀態",
             "即時請求",
-            "執行",
-            "排隊",
             "聊天",
             "工作",
             "工作階段請求",
@@ -3122,8 +3119,6 @@ mod tests {
         let text = terminal_buffer_text(&terminal);
         for expected in [
             "REQ NOW",
-            "RUN 0",
-            "QUEUED 0",
             "CHATS 2",
             "JOBS 3",
             "REQ SESSION",
@@ -5867,16 +5862,6 @@ fn draw_ui(
     } else {
         tracked_daily_usage_cost_usd / tracked_usage_day_count as f64
     };
-    let request_snapshot = request_workers::global_request_scheduler().snapshot();
-    let request_gates = [
-        request_snapshot.control,
-        request_snapshot.filesystem,
-        request_snapshot.process,
-        request_snapshot.browser,
-        request_snapshot.general,
-    ];
-    let active_request_count: usize = request_gates.iter().map(|gate| gate.active).sum();
-    let queued_request_count: usize = request_gates.iter().map(|gate| gate.queued).sum();
     let muted_style = Style::default().fg(palette.muted_fg);
     let value_style = Style::default()
         .fg(palette.secondary_fg)
@@ -5904,11 +5889,7 @@ fn draw_ui(
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
             status_label(ui_language.text("REQ NOW", "即時請求")),
-            Span::styled(format!("{} ", ui_language.text("RUN", "執行")), muted_style),
-            Span::styled(active_request_count.to_string(), value_style),
-            Span::styled(format!("      {} ", ui_language.text("QUEUED", "排隊")), muted_style),
-            Span::styled(queued_request_count.to_string(), value_style),
-            Span::styled(format!("      {} ", ui_language.text("CHATS", "聊天")), muted_style),
+            Span::styled(format!("{} ", ui_language.text("CHATS", "聊天")), muted_style),
             Span::styled(app.connected_chat_count().to_string(), value_style),
             Span::styled(format!("      {} ", ui_language.text("JOBS", "工作")), muted_style),
             Span::styled(active_job_count.to_string(), value_style),
