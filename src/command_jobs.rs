@@ -774,6 +774,20 @@ impl CommandJobManager {
         }
         drop(manager);
 
+        // Shutdown-aware recovery. The registry insertion above happens before
+        // this flag read, so either cancel_all() had not run yet (and its job
+        // collection will see these jobs in the registry and cancel them before
+        // their runner spawns a process) or shutdown already won the race and
+        // the queued records are persisted as Cancelled instead of launching
+        // after shutdown has begun.
+        if self.shutting_down.load(Ordering::Acquire) {
+            for (job, _cancel_rx) in queued {
+                job.finish(CommandJobState::Cancelled, Some(EXIT_CODE_CANCELLED))
+                    .await;
+            }
+            return;
+        }
+
         for (job, cancel_rx) in queued {
             tokio::spawn(run_job_task(job, cancel_rx));
         }
@@ -2057,6 +2071,92 @@ mod tests {
         assert!(
             !sentinel.exists(),
             "a start racing with shutdown escaped manager ownership"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn persisted_queued_record(dir: &std::path::Path, command: &str) -> JobRecord {
+        JobRecord {
+            schema_version: 1,
+            job_id: format!("job-{}", Uuid::new_v4()),
+            command: command.to_string(),
+            cwd: dir.to_string_lossy().into_owned(),
+            workspace_root: dir.to_string_lossy().into_owned(),
+            owner_session: None,
+            timeout_ms: 10_000,
+            started_at_ms: unix_now_ms().saturating_sub(1_000),
+            state: CommandJobState::Queued,
+            exit_code: None,
+            finished_at_ms: None,
+            elapsed_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_after_shutdown_persists_queued_records_cancelled_without_spawning() {
+        let root = workspace("recover-after-shutdown");
+        let sentinel = root.join("recover-sentinel.txt");
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 2; Set-Content recover-sentinel.txt spawned"
+        } else {
+            "sleep 2; printf spawned > recover-sentinel.txt"
+        };
+        let record = persisted_queued_record(&root, command);
+        let manager = CommandJobManager::with_store(root.clone());
+        manager.store.write(&record);
+
+        manager.cancel_all().await;
+        // The first cleanup after shutdown triggers recovery; the persisted
+        // Queued record must come back Cancelled instead of launching.
+        let snapshot = manager
+            .poll(&record.job_id, 0, 0)
+            .await
+            .expect("poll recovered job after shutdown");
+        assert_eq!(snapshot.state, CommandJobState::Cancelled);
+        assert_eq!(snapshot.exit_code, Some(EXIT_CODE_CANCELLED));
+        assert!(
+            !sentinel.exists(),
+            "queued record recovered after shutdown spawned its command"
+        );
+        let records = manager.store.read_all();
+        assert!(
+            records.iter().any(|persisted| {
+                persisted.job_id == record.job_id && persisted.state == CommandJobState::Cancelled
+            }),
+            "recovered queued record must be persisted as Cancelled"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn recovery_racing_shutdown_never_spawns_the_queued_command() {
+        let root = workspace("recover-race-shutdown");
+        let sentinel = root.join("race-sentinel.txt");
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5; Set-Content race-sentinel.txt spawned"
+        } else {
+            "sleep 5; printf spawned > race-sentinel.txt"
+        };
+        let record = persisted_queued_record(&root, command);
+        let manager = CommandJobManager::with_store(root.clone());
+        manager.store.write(&record);
+
+        // First-time recovery races shutdown; whichever side wins, the command
+        // must never spawn and the job must end Cancelled.
+        let recovery_manager = manager.clone();
+        let recovery_job_id = record.job_id.clone();
+        let recovery =
+            tokio::spawn(async move { recovery_manager.poll(&recovery_job_id, 0, 250).await });
+        let shutdown_manager = manager.clone();
+        let shutdown = tokio::spawn(async move { shutdown_manager.cancel_all().await });
+        let _ = recovery.await;
+        shutdown.await.expect("shutdown task");
+
+        let terminal = wait_terminal(&manager, &record.job_id).await;
+        assert_eq!(terminal.state, CommandJobState::Cancelled);
+        assert!(
+            !sentinel.exists(),
+            "queued record recovered against a racing shutdown spawned its command"
         );
         let _ = std::fs::remove_dir_all(root);
     }
