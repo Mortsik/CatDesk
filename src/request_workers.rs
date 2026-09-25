@@ -7,6 +7,10 @@
 //! async reactor and that every request honors its response deadline.
 use std::{
     future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,12 +31,14 @@ impl std::fmt::Display for RequestFailure {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestDeadlineStage {
+    Queue,
     Execution,
 }
 
 impl RequestDeadlineStage {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Queue => "queue",
             Self::Execution => "execution",
         }
     }
@@ -61,6 +67,10 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Sentinel stored in the shared dispatch timestamp until the blocking task
+/// has actually started running.
+const NOT_DISPATCHED: u64 = u64::MAX;
+
 pub(crate) async fn run_timed<F>(
     work: F,
     deadline: Duration,
@@ -74,9 +84,13 @@ where
     // Synchronous tool work must never stall the async reactor, so it runs on
     // the blocking pool. A disconnected client or an expired response deadline
     // cannot safely cancel work that already started; the task always runs to
-    // completion. `queue_wait_ms` is the dispatch latency of the blocking pool.
+    // completion. The dispatch timestamp is shared with the caller so a timed
+    // out join handle can still split blocking-pool dispatch from execution.
+    let dispatch_wait_ms = Arc::new(AtomicU64::new(NOT_DISPATCHED));
+    let observed_dispatch_ms = dispatch_wait_ms.clone();
     let task = tokio::task::spawn_blocking(move || {
         let queue_wait_ms = elapsed_ms(request_started);
+        observed_dispatch_ms.store(queue_wait_ms, Ordering::Release);
         let execution_started = Instant::now();
         let value = runtime.block_on(work);
         (value, queue_wait_ms, elapsed_ms(execution_started))
@@ -90,22 +104,52 @@ where
                 deadline_stage: None,
             },
         }),
-        Ok(Err(_)) => Err(TimedRequestError {
-            failure: RequestFailure::Failed,
-            timing: RequestTiming {
-                queue_wait_ms: elapsed_ms(request_started),
-                execution_ms: 0,
-                deadline_stage: None,
-            },
-        }),
-        Err(_) => Err(TimedRequestError {
-            failure: RequestFailure::Deadline,
-            timing: RequestTiming {
-                queue_wait_ms: elapsed_ms(request_started),
-                execution_ms: 0,
-                deadline_stage: Some(RequestDeadlineStage::Execution),
-            },
-        }),
+        Ok(Err(_)) => {
+            let timing = observed_timing(&request_started, &dispatch_wait_ms, None);
+            Err(TimedRequestError {
+                failure: RequestFailure::Failed,
+                timing,
+            })
+        }
+        Err(_) => {
+            // The join handle timed out, but the blocking task published its
+            // dispatch timestamp when it started, so the timing still splits
+            // blocking-pool dispatch from real execution.
+            let dispatch_ms = dispatch_wait_ms.load(Ordering::Acquire);
+            let deadline_stage = if dispatch_ms == NOT_DISPATCHED {
+                RequestDeadlineStage::Queue
+            } else {
+                RequestDeadlineStage::Execution
+            };
+            let timing = observed_timing(&request_started, &dispatch_wait_ms, Some(deadline_stage));
+            Err(TimedRequestError {
+                failure: RequestFailure::Deadline,
+                timing,
+            })
+        }
+    }
+}
+
+/// Reconstruct timing from the outside when the join result is unavailable:
+/// if the blocking task started, its published dispatch timestamp splits the
+/// elapsed time; otherwise the whole wait was blocking-pool dispatch.
+fn observed_timing(
+    request_started: &Instant,
+    dispatch_wait_ms: &AtomicU64,
+    deadline_stage: Option<RequestDeadlineStage>,
+) -> RequestTiming {
+    let total_ms = elapsed_ms(*request_started);
+    match dispatch_wait_ms.load(Ordering::Acquire) {
+        NOT_DISPATCHED => RequestTiming {
+            queue_wait_ms: total_ms,
+            execution_ms: 0,
+            deadline_stage,
+        },
+        dispatch_ms => RequestTiming {
+            queue_wait_ms: dispatch_ms,
+            execution_ms: total_ms.saturating_sub(dispatch_ms),
+            deadline_stage,
+        },
     }
 }
 
@@ -176,6 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_deadline_expires_while_started_work_runs_to_completion() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release, wait) = std::sync::mpsc::channel();
         let watchdog = release.clone();
         std::thread::spawn(move || {
@@ -184,16 +229,32 @@ mod tests {
         });
         let error = run_timed(
             async move {
+                started_tx
+                    .send(())
+                    .expect("announce that execution started");
                 let _ = wait.recv_timeout(Duration::from_secs(4));
             },
-            Duration::from_millis(20),
+            Duration::from_millis(100),
         )
         .await
         .expect_err("work outliving its deadline must hit the response deadline");
+        started_rx
+            .await
+            .expect("execution must start before the response deadline expires");
         assert_eq!(error.failure, RequestFailure::Deadline);
         assert_eq!(
             error.timing.deadline_stage,
             Some(RequestDeadlineStage::Execution)
+        );
+        assert!(
+            error.timing.execution_ms > 0,
+            "a timeout after execution started must be attributed to execution time, not dispatch: {:?}",
+            error.timing
+        );
+        assert!(
+            error.timing.queue_wait_ms <= 100,
+            "dispatch wait exceeded the whole deadline: {:?}",
+            error.timing
         );
 
         // The already-started work cannot be cancelled; release it so the
