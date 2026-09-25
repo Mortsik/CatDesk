@@ -1,5 +1,4 @@
 use crate::command;
-use crate::search_gate;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use image::imageops::FilterType;
@@ -875,33 +874,11 @@ pub fn search_text(
         no_ignore: options.no_ignore,
     };
 
-    // One in-flight search per query, `MAX_CONCURRENT_SEARCHES` per machine:
-    // duplicate re-issues (agent retry storms) and stacked whole-workspace
-    // walks starved the host on 2026-09-20, so redundancy is rejected, not
-    // queued.
-    let _search_permit = match search_gate::acquire(search_gate::SearchKey {
-        pattern: resolved.pattern.to_string(),
-        path: start.to_string_lossy().into_owned(),
-        glob: resolved.glob.map(str::to_string),
-        fixed_strings: resolved.fixed_strings,
-        case_insensitive: resolved.case_insensitive,
-        include_hidden: resolved.include_hidden,
-        no_ignore: resolved.no_ignore,
-    }) {
-        Ok(permit) => permit,
-        Err(search_gate::SearchGateError::DuplicateInFlight) => {
-            return Err(
-                "An identical search is already running; wait for it to finish or narrow the path instead of re-issuing the same query"
-                    .into(),
-            );
-        }
-        Err(search_gate::SearchGateError::Busy) => {
-            return Err(format!(
-                "{} searches are already running; wait for one to finish or narrow the path",
-                search_gate::MAX_CONCURRENT_SEARCHES
-            ));
-        }
-    };
+    // No admission gate here by operator decision (2026-09-25, catdesk-cft):
+    // overload on 2026-09-20 (retry storms stacking whole-workspace walks) is
+    // answered by the per-request deadline in server.rs (search is a
+    // Filesystem-class call, bounded by MCP_HTTP_REQUEST_MAX_DURATION and
+    // enforced around tokio::spawn_blocking), not by a search count cap.
 
     if command_available("rg") {
         return search_text_rg(&root, &start, resolved).map_err(|e| match e {
