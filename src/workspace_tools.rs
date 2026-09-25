@@ -1983,6 +1983,105 @@ mod tests {
         let _ = fs::remove_dir_all(workspace_root);
     }
 
+    // The 2026-09-20 incident (an agent retry storm stacking whole-workspace
+    // searches) is no longer answered by a count cap: search has no admission
+    // gate, and overload is bounded by the per-request deadline in server.rs
+    // (Filesystem class, enforced around tokio::spawn_blocking). So parallel
+    // — including duplicate — searches must be admitted, never rejected.
+    #[test]
+    fn concurrent_and_duplicate_searches_are_admitted_without_a_cap() {
+        use std::sync::{Arc, Barrier};
+
+        let workspace_root = test_workspace("search-concurrent-admission");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let needles = ["needle-0", "needle-1", "needle-2", "needle-3"];
+        for (index, needle) in needles.iter().enumerate() {
+            fs::write(
+                workspace_root.join(format!("file-{index}.txt")),
+                format!("before {needle}\n{needle}\nafter\n"),
+            )
+            .expect("write search file");
+        }
+        fs::write(
+            workspace_root.join("shared.txt"),
+            "needle-shared\nneedle-shared\n",
+        )
+        .expect("write shared file");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let options = |pattern: &'static str| SearchTextOptions {
+            pattern,
+            path: None,
+            glob: None,
+            fixed_strings: true,
+            case_insensitive: false,
+            context: None,
+            before: None,
+            after: None,
+            max_matches: Some(100),
+            max_matches_per_file: None,
+            include_hidden: false,
+            no_ignore: false,
+        };
+
+        // Distinct queries, more than the retired cap of 2, released through a
+        // barrier so every call is in flight at the same time.
+        let barrier = Arc::new(Barrier::new(needles.len()));
+        let mut handles = Vec::new();
+        for needle in needles {
+            let barrier = Arc::clone(&barrier);
+            let workspace = workspace_root_str.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                search_text(&workspace, options(needle)).unwrap_or_else(|error| {
+                    panic!("concurrent search '{needle}' was not admitted: {error}")
+                })
+            }));
+        }
+        for (index, handle) in handles.into_iter().enumerate() {
+            let output = handle.join().expect("search thread did not panic");
+            assert!(
+                output
+                    .results
+                    .iter()
+                    .any(|entry| entry.text.contains(needles[index])),
+                "search for {} lost its match (backend {})",
+                needles[index],
+                output.backend
+            );
+        }
+
+        // Duplicate queries in flight at once (the retry-storm shape): every
+        // copy must run to completion instead of being refused.
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let barrier = Arc::clone(&barrier);
+            let workspace = workspace_root_str.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                search_text(&workspace, options("needle-shared"))
+                    .unwrap_or_else(|error| panic!("duplicate search was not admitted: {error}"))
+            }));
+        }
+        let match_counts = handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("duplicate search thread did not panic")
+            })
+            .map(|output| output.match_count)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            match_counts.into_iter().collect::<Vec<_>>(),
+            vec![2],
+            "duplicate searches must all complete with identical results"
+        );
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
     #[test]
     fn builtin_search_caps_bytes_read_per_file() {
         use std::io::Write;
