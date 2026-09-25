@@ -1271,8 +1271,6 @@ async fn handle_tools_call_with_session(
                                 req,
                                 workspace_root,
                                 set_catdesk_as_co_author,
-                                command_jobs,
-                                session_namespace,
                                 active_project,
                             )
                             .await
@@ -1741,8 +1739,6 @@ async fn handle_run_command(
     req: &JsonRpcRequest,
     workspace_root: &str,
     set_catdesk_as_co_author: bool,
-    command_jobs: &CommandJobManager,
-    session_namespace: Option<&str>,
     active_project: Option<&Path>,
 ) -> JsonRpcResponse {
     let params = &req.params;
@@ -1839,10 +1835,6 @@ async fn handle_run_command(
         );
     }
 
-    let _process_permit = match command_jobs.acquire_process(session_namespace, &cwd).await {
-        Ok(permit) => permit,
-        Err(error) => return tool_error_response(req, error),
-    };
     let result = command::run_command(
         &effective_command,
         Path::new(workspace_root),
@@ -5364,16 +5356,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_waits_for_shared_process_capacity_instead_of_failing_busy() {
+    async fn foreground_run_command_works_while_many_background_commands_run() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-run-budget-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
-        let command_jobs = CommandJobManager::new_with_process_limit(1);
-        let occupied = command_jobs
-            .acquire_process(Some("holder"), &workspace_root)
-            .await
-            .expect("occupy shared process budget");
+        let command_jobs = CommandJobManager::new();
+        let background = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+        for _ in 0..13 {
+            command_jobs
+                .start(background.to_string(), workspace_root.clone(), 10_000, None)
+                .await
+                .expect("background admission must accept every command");
+        }
+
         let req = tool_call_request("run_command", json!({ "command": "printf budget-test" }));
         let jobs = command_jobs.clone();
         let root = workspace_root_str.clone();
@@ -5391,12 +5391,9 @@ mod tests {
             .await
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!task.is_finished(), "run_command should queue while process capacity is occupied");
-        drop(occupied);
-        let response = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), task)
             .await
-            .expect("queued run_command did not resume")
+            .expect("foreground run_command must not wait on background commands")
             .expect("run_command task panicked");
 
         assert_ne!(
@@ -5416,6 +5413,77 @@ mod tests {
                 .and_then(Value::as_str),
             Some("budget-test")
         );
+        command_jobs.cancel_all().await;
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn twenty_five_concurrent_named_sessions_complete_without_concurrency_rejection() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-sessions-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+
+        const SESSIONS: usize = 25;
+        let mut tasks = Vec::new();
+        for session in 0..SESSIONS {
+            let command = if cfg!(windows) {
+                format!("Write-Output out-{session}")
+            } else {
+                format!("printf out-{session}")
+            };
+            let req = tool_call_request("run_command", json!({ "command": command }));
+            let jobs = command_jobs.clone();
+            let root = workspace_root_str.clone();
+            let session_namespace = format!("session-{session}");
+            tasks.push(tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    handle_tools_call_with_session(
+                        &req,
+                        &root,
+                        1,
+                        Mode::Both,
+                        ToolMode::MultiTools,
+                        false,
+                        &jobs,
+                        &None,
+                        current_show_detail_mode(),
+                        Some(&session_namespace),
+                        None,
+                    ),
+                )
+                .await
+                .expect("named session request must finish")
+            }));
+        }
+
+        for (session, task) in tasks.into_iter().enumerate() {
+            let response = task.await.expect("named session task panicked");
+            assert_ne!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                Some(true),
+                "named session {session} was rejected or failed"
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("structuredContent"))
+                    .and_then(|structured| structured.get("stdout"))
+                    .and_then(Value::as_str),
+                Some(format!("out-{session}").as_str()),
+                "named session {session} produced unexpected output"
+            );
+        }
+
+        command_jobs.cancel_all().await;
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 

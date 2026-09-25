@@ -11,7 +11,6 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use crate::change_tracking::{ChangeSession, FileChange};
-use crate::fair_queue::{FairAcquireError, FairGate, FairPermit, QueueBudget, SchedulingKey};
 use crate::job_store::{JobRecord, JobStore};
 use crate::process_exit::{
     EXIT_CODE_ABANDONED, EXIT_CODE_CANCELLED, EXIT_CODE_INTERNAL_ERROR, EXIT_CODE_TIMEOUT,
@@ -26,9 +25,6 @@ pub const MAX_JOB_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const DEFAULT_ABANDON_AFTER_MS: u64 = 30 * 60 * 1_000;
 pub const MAX_POLL_WAIT_MS: u64 = 30_000;
 pub const DEFAULT_POLL_WAIT_MS: u64 = 10_000;
-const MAX_LIVE_JOBS: usize = 4_096;
-const MAX_ACTIVE_PROCESSES: usize = 12;
-const PROCESS_QUEUE_BUDGET: usize = 4_096;
 const MAX_RETAINED_JOBS: usize = 64;
 const TERMINAL_JOB_TTL: StdDuration = StdDuration::from_secs(60 * 60);
 const IDEMPOTENCY_WINDOW: StdDuration = StdDuration::from_secs(30);
@@ -400,16 +396,13 @@ struct ManagerState {
 #[derive(Clone)]
 pub struct CommandJobManager {
     inner: Arc<RwLock<ManagerState>>,
-    // Starting a job performs a dedupe lookup, active-job capacity check, and
-    // registry insertion. Serialize that short critical section so concurrent
-    // MCP requests cannot both pass the checks and create duplicate/overflow jobs.
+    // Starting a job performs a dedupe lookup and registry insertion. Serialize
+    // that short critical section so concurrent MCP requests cannot both pass
+    // the checks and create duplicate jobs.
     start_lock: Arc<Mutex<()>>,
     // App shutdown is terminal for this manager. Once set, no new background
     // command may be created even if an MCP request races with shutdown.
     shutting_down: Arc<AtomicBool>,
-    // Foreground run_command and background start_command share one fair gate.
-    // The physical process-tree limit stays fixed while temporary saturation queues.
-    process_gate: FairGate,
     abandon_after_ms: u64,
     store: JobStore,
     // Recovery is shared across clones and awaited by every concurrent first
@@ -420,7 +413,14 @@ pub struct CommandJobManager {
 
 impl Default for CommandJobManager {
     fn default() -> Self {
-        Self::with_process_limit(MAX_ACTIVE_PROCESSES)
+        Self {
+            inner: Arc::new(RwLock::new(ManagerState::default())),
+            start_lock: Arc::new(Mutex::new(())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            abandon_after_ms: DEFAULT_ABANDON_AFTER_MS,
+            store: JobStore::disabled(),
+            recovery: Arc::new(OnceCell::new()),
+        }
     }
 }
 
@@ -432,19 +432,7 @@ impl CommandJobManager {
     pub fn with_store(dir: PathBuf) -> Self {
         Self {
             store: JobStore::open(dir),
-            ..Self::with_process_limit(MAX_ACTIVE_PROCESSES)
-        }
-    }
-
-    fn with_process_limit(limit: usize) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(ManagerState::default())),
-            start_lock: Arc::new(Mutex::new(())),
-            shutting_down: Arc::new(AtomicBool::new(false)),
-            process_gate: FairGate::new(limit.max(1), QueueBudget::new(PROCESS_QUEUE_BUDGET)),
-            abandon_after_ms: DEFAULT_ABANDON_AFTER_MS,
-            store: JobStore::disabled(),
-            recovery: Arc::new(OnceCell::new()),
+            ..Self::default()
         }
     }
 
@@ -452,34 +440,6 @@ impl CommandJobManager {
     pub(crate) fn with_abandon_after_ms(mut self, ms: u64) -> Self {
         self.abandon_after_ms = ms;
         self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_process_limit(limit: usize) -> Self {
-        Self::with_process_limit(limit)
-    }
-
-    pub(crate) async fn acquire_process(
-        &self,
-        owner_session: Option<&str>,
-        project: &std::path::Path,
-    ) -> Result<FairPermit, String> {
-        let project = project.to_string_lossy().into_owned();
-        let key = SchedulingKey::new(owner_session.unwrap_or("anonymous"), Some(project.as_str()));
-        self.process_gate
-            .acquire_unbounded(key)
-            .await
-            .map_err(|error| match error {
-                FairAcquireError::Overloaded => {
-                    "command process wait queue reached its emergency safety ceiling".to_string()
-                }
-                FairAcquireError::Closed => {
-                    "command process scheduler is shutting down".to_string()
-                }
-                FairAcquireError::Deadline => {
-                    "command process scheduling deadline expired".to_string()
-                }
-            })
     }
 
     pub async fn active_job_count(&self) -> usize {
@@ -577,25 +537,6 @@ impl CommandJobManager {
             }
         }
 
-        let live_count = {
-            let jobs = {
-                let manager = self.inner.read().await;
-                manager.jobs.values().cloned().collect::<Vec<_>>()
-            };
-            let mut live = 0usize;
-            for job in jobs {
-                if !job.runtime.lock().await.state.is_terminal() {
-                    live += 1;
-                }
-            }
-            live
-        };
-        if live_count >= MAX_LIVE_JOBS {
-            return Err(format!(
-                "command job admission reached the emergency safety ceiling of {MAX_LIVE_JOBS} live jobs"
-            ));
-        }
-
         let (job, cancel_rx) = CommandJob::new_with_change_session(
             command,
             workspace_root,
@@ -619,17 +560,7 @@ impl CommandJobManager {
 
         job.persist().await;
         let snapshot = job.snapshot(0).await;
-        let process_gate = self.process_gate.clone();
-        let scheduling_key = SchedulingKey::new(
-            owner_session.unwrap_or("anonymous"),
-            Some(job.cwd.to_string_lossy().as_ref()),
-        );
-        tokio::spawn(queue_and_run_job(
-            job.clone(),
-            cancel_rx,
-            process_gate,
-            scheduling_key,
-        ));
+        tokio::spawn(run_job_task(job.clone(), cancel_rx));
         Ok(StartCommandResult {
             snapshot,
             deduplicated: false,
@@ -790,7 +721,6 @@ impl CommandJobManager {
             let manager = self.inner.read().await;
             manager.jobs.values().cloned().collect::<Vec<_>>()
         };
-        self.process_gate.close();
         for job in &jobs {
             if !job.runtime.lock().await.state.is_terminal() {
                 let _ = job.cancel_tx.send(true);
@@ -845,16 +775,7 @@ impl CommandJobManager {
         drop(manager);
 
         for (job, cancel_rx) in queued {
-            let key = SchedulingKey::new(
-                job.owner_session.as_deref().unwrap_or("anonymous"),
-                Some(job.cwd.to_string_lossy().as_ref()),
-            );
-            tokio::spawn(queue_and_run_job(
-                job,
-                cancel_rx,
-                self.process_gate.clone(),
-                key,
-            ));
+            tokio::spawn(run_job_task(job, cancel_rx));
         }
     }
 
@@ -1022,59 +943,17 @@ where
     }
 }
 
-async fn queue_and_run_job(
-    job: Arc<CommandJob>,
-    mut cancel_rx: watch::Receiver<bool>,
-    process_gate: FairGate,
-    key: SchedulingKey,
-) {
-    let acquire = process_gate.acquire_unbounded(key);
-    tokio::pin!(acquire);
-    let permit = tokio::select! {
-        biased;
-        changed = cancel_rx.changed() => {
-            if changed.is_ok() && *cancel_rx.borrow() {
-                job.finish(CommandJobState::Cancelled, Some(EXIT_CODE_CANCELLED)).await;
-            } else {
-                job.finish(CommandJobState::Interrupted, Some(EXIT_CODE_INTERNAL_ERROR)).await;
-            }
-            return;
-        }
-        result = &mut acquire => match result {
-            Ok(permit) => permit,
-            Err(FairAcquireError::Closed) => {
-                job.finish(CommandJobState::Cancelled, Some(EXIT_CODE_CANCELLED)).await;
-                return;
-            }
-            Err(error) => {
-                job.append_output(
-                    "stderr",
-                    format!("CatDesk could not schedule this command: {error:?}\n").as_bytes(),
-                )
-                .await;
-                job.finish(CommandJobState::Failed, Some(EXIT_CODE_INTERNAL_ERROR)).await;
-                return;
-            }
-        },
-    };
-
-    if *cancel_rx.borrow() {
-        drop(permit);
-        job.finish(CommandJobState::Cancelled, Some(EXIT_CODE_CANCELLED))
-            .await;
-        return;
-    }
+/// Launch one registered job immediately. Process concurrency is scheduled by
+/// the host OS, so the only CatDesk-owned steps left are the queued→running
+/// state transition and the cancellation-before-spawn handling inside `run_job`.
+async fn run_job_task(job: Arc<CommandJob>, cancel_rx: watch::Receiver<bool>) {
     if !job.mark_running().await {
         return;
     }
-    run_job(job, cancel_rx, Some(permit)).await;
+    run_job(job, cancel_rx).await;
 }
 
-async fn run_job(
-    job: Arc<CommandJob>,
-    mut cancel_rx: watch::Receiver<bool>,
-    _process_permit: Option<FairPermit>,
-) {
+async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
     let cancelled_before_spawn = *cancel_rx.borrow();
     if cancelled_before_spawn {
         job.finish(CommandJobState::Cancelled, Some(EXIT_CODE_CANCELLED))
@@ -1740,7 +1619,7 @@ mod tests {
         let (job, cancel_rx) = CommandJob::new(command.to_string(), root.clone(), 10_000);
 
         let _ = job.cancel_tx.send(true);
-        run_job(job.clone(), cancel_rx, None).await;
+        run_job(job.clone(), cancel_rx).await;
 
         let snapshot = job.snapshot(0).await;
         assert_eq!(snapshot.state, CommandJobState::Cancelled);
@@ -2302,44 +2181,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_process_budget_is_held_by_background_jobs_until_termination() {
-        let root = workspace("process-budget");
-        let manager = CommandJobManager::with_process_limit(1);
+    async fn more_than_twelve_background_commands_are_admitted_and_run_concurrently() {
+        let root = workspace("concurrent-background");
+        let manager = CommandJobManager::new();
         let command = if cfg!(windows) {
             "Start-Sleep -Seconds 5"
         } else {
             "sleep 5"
         };
-        let started = manager
-            .start(command.to_string(), root.clone(), 10_000, None)
-            .await
-            .expect("start background command");
+        const COUNT: usize = 15;
+        let mut ids = Vec::new();
+        for _ in 0..COUNT {
+            let started = manager
+                .start(command.to_string(), root.clone(), 10_000, None)
+                .await
+                .expect("background admission must accept every command");
+            ids.push(started.snapshot.job_id);
+        }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let blocked = tokio::time::timeout(
-            StdDuration::from_millis(100),
-            manager.acquire_process(Some("probe"), &root),
-        )
-        .await;
+        // Every command sleeps, so far more than the old 12-process ceiling
+        // must be Running at the same time with no CatDesk admission step.
+        let mut running = 0usize;
+        for _ in 0..100 {
+            running = 0;
+            for id in &ids {
+                if manager
+                    .poll(id, 0, 0)
+                    .await
+                    .expect("poll admitted job")
+                    .state
+                    == CommandJobState::Running
+                {
+                    running += 1;
+                }
+            }
+            if running > 12 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
-            blocked.is_err(),
-            "background job must hold shared process capacity while running"
+            running > 12,
+            "only {running} of {COUNT} background commands ran concurrently"
         );
 
-        manager
-            .cancel(&started.snapshot.job_id)
-            .await
-            .expect("cancel background command");
-        let _ = wait_terminal(&manager, &started.snapshot.job_id).await;
-
-        let permit = tokio::time::timeout(
-            StdDuration::from_secs(2),
-            manager.acquire_process(Some("probe"), &root),
-        )
-        .await
-        .expect("process capacity did not recover")
-        .expect("acquire recovered process capacity");
-        drop(permit);
+        manager.cancel_all().await;
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2364,102 +2250,6 @@ mod tests {
         assert_eq!(terminal.state, CommandJobState::Succeeded);
         assert_eq!(manager.active_job_count().await, 0);
 
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn more_than_eight_jobs_are_admitted_and_queue_for_process_capacity() {
-        let root = workspace("queued-capacity");
-        let manager = CommandJobManager::new_with_process_limit(1);
-        let command = if cfg!(windows) {
-            "Start-Sleep -Seconds 5"
-        } else {
-            "sleep 5"
-        };
-        let mut ids = Vec::new();
-        for _ in 0..10 {
-            let started = manager
-                .start(command.to_string(), root.clone(), 10_000, None)
-                .await
-                .expect("queued admission must not reject the ninth job");
-            ids.push(started.snapshot.job_id);
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let mut running = 0usize;
-        let mut queued = 0usize;
-        for id in &ids {
-            match manager
-                .poll(id, 0, 0)
-                .await
-                .expect("poll admitted job")
-                .state
-            {
-                CommandJobState::Running => running += 1,
-                CommandJobState::Queued => queued += 1,
-                state => panic!("unexpected nonterminal state: {state:?}"),
-            }
-        }
-        assert_eq!(running, 1, "the physical process limit must remain fixed");
-        assert_eq!(
-            queued, 9,
-            "extra jobs should wait instead of failing admission"
-        );
-
-        manager.cancel_all().await;
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn cancelling_a_queued_job_prevents_it_from_spawning_later() {
-        let root = workspace("cancel-queued");
-        let sentinel = root.join("queued-sentinel.txt");
-        let manager = CommandJobManager::new_with_process_limit(1);
-        let blocker = if cfg!(windows) {
-            "Start-Sleep -Seconds 5"
-        } else {
-            "sleep 5"
-        };
-        let queued_command = if cfg!(windows) {
-            "Set-Content queued-sentinel.txt should-not-exist"
-        } else {
-            "printf should-not-exist > queued-sentinel.txt"
-        };
-
-        let first = manager
-            .start(blocker.to_string(), root.clone(), 10_000, None)
-            .await
-            .expect("start blocker");
-        let second = manager
-            .start(queued_command.to_string(), root.clone(), 10_000, None)
-            .await
-            .expect("queue second job");
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            manager
-                .poll(&second.snapshot.job_id, 0, 0)
-                .await
-                .expect("poll queued job")
-                .state,
-            CommandJobState::Queued
-        );
-        let cancelled = manager
-            .cancel(&second.snapshot.job_id)
-            .await
-            .expect("cancel queued job");
-        assert_eq!(cancelled.state, CommandJobState::Cancelled);
-        manager
-            .cancel(&first.snapshot.job_id)
-            .await
-            .expect("cancel blocker");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !sentinel.exists(),
-            "a cancelled queued job executed after capacity freed"
-        );
-
-        manager.cancel_all().await;
         let _ = std::fs::remove_dir_all(root);
     }
 
