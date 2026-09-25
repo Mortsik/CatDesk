@@ -2009,7 +2009,10 @@ fn draw_tui_header(f: &mut Frame, area: Rect, palette: &theme::Palette, title: &
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let version = format!("v{} ", env!("CARGO_PKG_VERSION"));
+    let version = format!(
+        "{} ",
+        build_info::version_label(build_info::VERSION, build_info::GIT_SHA)
+    );
     let version_width = terminal_cell_width(&version) as u16;
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -2850,6 +2853,7 @@ mod tests {
         redraw_due, terminal_cell_width, text_input_key_is_cancel, trim_line, wrap_log_message,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::build_info;
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -3756,7 +3760,7 @@ mod tests {
         let row = (0..60)
             .map(|column| buffer[(column, 1)].symbol())
             .collect::<String>();
-        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let version = build_info::version_label(build_info::VERSION, build_info::GIT_SHA);
 
         assert!(row.contains("CatDesk"));
         assert!(row.ends_with(&format!("{version} │")));

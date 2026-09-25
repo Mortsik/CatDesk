@@ -745,7 +745,7 @@ fn mascot_fill_depths(occupancy: &[Vec<bool>]) -> (Vec<Vec<Option<usize>>>, usiz
 }
 
 fn version_label() -> String {
-    format!("v{}", env!("CARGO_PKG_VERSION"))
+    crate::build_info::version_label(crate::build_info::VERSION, crate::build_info::GIT_SHA)
 }
 
 fn draw_skip_hint(frame: &mut Frame, area: Rect, palette: &theme::Palette) {
