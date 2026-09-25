@@ -323,6 +323,10 @@ pub(crate) struct ClassSnapshot {
     pub execution_p95_ms: Option<u32>,
 }
 
+/// Read API for the fixed tool counters. The dashboard shows class-level
+/// aggregates; tool snapshots are consumed by tests and diagnostics queries,
+/// hence the explicit dead-code allowance on non-test builds.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ToolSnapshot {
     pub name: &'static str,
@@ -797,9 +801,10 @@ fn format_byte_rate(bytes: u64, window_ms: u64) -> String {
     }
     let per_second = bytes.saturating_mul(1000) / window_ms;
     if per_second >= 1024 * 1024 {
-        format!("{}MB/s", (per_second + 512) / (1024 * 1024))
+        // Round up: never understate a measured rate.
+        format!("{}MB/s", (per_second + 1024 * 1024 - 1) / (1024 * 1024))
     } else if per_second >= 1024 {
-        format!("{}KB/s", (per_second + 512) / 1024)
+        format!("{}KB/s", (per_second + 1023) / 1024)
     } else {
         format!("{per_second}B/s")
     }
@@ -1086,6 +1091,67 @@ mod tests {
         let status = "Name:\tcatdesk\nVmRSS:\t    185344 kB\nVmSize:\t 999999 kB\n";
         assert_eq!(parse_proc_status_rss_kb(status), Some(185_344));
         assert_eq!(parse_proc_status_rss_kb("Name:\tcatdesk\n"), None);
+    }
+
+    #[test]
+    fn format_perf_line_shows_percentiles_depth_and_rate() {
+        let mut perf = PerfSnapshot::default();
+        perf.window_ms = WINDOW_MS;
+        perf.aggregate = ClassSnapshot {
+            count: 3,
+            deadlines: 1,
+            bytes: 37_800_000, // 42 KB/s across the 15-minute window
+            p50_ms: Some(12),
+            p95_ms: Some(180),
+            p99_ms: Some(640),
+            ..ClassSnapshot::default()
+        };
+        perf.in_flight = 2;
+        assert_eq!(
+            format_perf_line(&perf),
+            "p50 12ms p95 180ms p99 640ms ACT 2 DL 1 42KB/s"
+        );
+
+        // An idle process shows em-dashes instead of fake latencies.
+        assert_eq!(
+            format_perf_line(&PerfSnapshot::default()),
+            "p50 — p95 — p99 — ACT 0 DL 0 0B/s"
+        );
+    }
+
+    #[test]
+    fn format_system_line_shows_cpu_rss_cache_and_scan() {
+        let mut perf = PerfSnapshot::default();
+        perf.cpu_bp = Some(300); // 3% of one core
+        perf.rss_kb = Some(185_344);
+        perf.cache_hits = [96, 0, 0];
+        perf.cache_misses = [4, 0, 0];
+        perf.classes[CLASS_SCAN].p95_ms = Some(40);
+        assert_eq!(
+            format_system_line(&perf),
+            "cpu 3% rss 181MB CACHE 96% SCAN p95 40ms"
+        );
+
+        // Unsampled or empty sources degrade to em-dashes.
+        assert_eq!(
+            format_system_line(&PerfSnapshot::default()),
+            "cpu — rss — CACHE — SCAN p95 —"
+        );
+    }
+
+    #[test]
+    fn byte_rate_and_rss_scale_their_units() {
+        // 900 B across a 900 s window is exactly 1 B/s.
+        assert_eq!(format_byte_rate(900, WINDOW_MS), "1B/s");
+        // 1024 B/s over the window needs 921_600 bytes in total.
+        assert_eq!(format_byte_rate(921_600, WINDOW_MS), "1KB/s");
+        assert_eq!(format_byte_rate(943_718_400, WINDOW_MS), "1MB/s");
+        assert_eq!(format_byte_rate(0, WINDOW_MS), "0B/s");
+        assert_eq!(format_byte_rate(1024, 0), "0B/s", "no window means no rate");
+        assert_eq!(format_rss(Some(100)), "0MB");
+        assert_eq!(format_rss(Some(512)), "1MB", "rounds half up");
+        assert_eq!(format_rss(Some(1024 * 2560)), "3GB");
+        assert_eq!(format_rss(None), "—");
     }
 
     #[cfg(unix)]

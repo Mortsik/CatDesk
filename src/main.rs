@@ -3034,6 +3034,7 @@ mod tests {
             "工作",
             "工作階段請求",
             "累計請求",
+            "效能",
             "即時成本",
             "工作階段成本",
             "今日成本",
@@ -3158,6 +3159,12 @@ mod tests {
             assert!(
                 !text.contains(hidden),
                 "normal status should hide low-priority field: {hidden}"
+            );
+        }
+        for expected in ["PERF", "p50", "p95", "p99", "ACT", "DL", "CACHE", "SCAN p95"] {
+            assert!(
+                text.contains(expected),
+                "missing perf dashboard text: {expected}"
             );
         }
         assert!(!text.contains("(tool input, llm output)"));
@@ -5892,6 +5899,8 @@ fn draw_ui(
     } else {
         ("-", Style::default().fg(palette.muted_fg))
     };
+    // One bounded snapshot per redraw: copy under the lock, sort on the stack.
+    let perf = perf_metrics::snapshot();
 
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
@@ -5908,6 +5917,14 @@ fn draw_ui(
         Line::from(vec![
             status_label(ui_language.text("REQ TOTAL", "累計請求")),
             Span::styled(app.total_request_count.to_string(), value_style),
+        ]),
+        Line::from(vec![
+            status_label(ui_language.text("PERF", "效能")),
+            Span::styled(perf_metrics::format_perf_line(&perf), value_style),
+        ]),
+        Line::from(vec![
+            status_label(ui_language.text("SYS", "系統")),
+            Span::styled(perf_metrics::format_system_line(&perf), muted_style),
         ]),
         Line::from(""),
         Line::from(vec![
