@@ -1,5 +1,6 @@
 mod binagotchy_gen;
 mod browser;
+mod build_info;
 mod change_tracking;
 mod command;
 mod command_jobs;
