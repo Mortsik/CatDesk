@@ -24,7 +24,7 @@ use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::project_scope;
 use crate::request_workers::{RequestClass, global_request_scheduler};
-use crate::session_context::{CheckpointRecommendation, ProjectStateChange, SessionContextStore};
+use crate::session_context::{ProjectStateChange, SessionContextStore};
 use crate::state::{
     AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
     TokenStatsLayout, UsageTotals, parse_seed_hex, save_agents_path_mode, save_show_detail_mode,
@@ -166,14 +166,6 @@ impl InstructionGate {
 
     fn active_project(&self, session: &ClientSession) -> Option<std::path::PathBuf> {
         self.contexts.active_project(session.namespace())
-    }
-
-    fn record_tool_call(&self, session: &ClientSession) {
-        self.contexts.record_tool_call(session.namespace());
-    }
-
-    fn claim_checkpoint(&self, session: &ClientSession) -> Option<CheckpointRecommendation> {
-        self.contexts.claim_checkpoint(session.namespace())
     }
 
     fn set_active_project(
@@ -1030,42 +1022,6 @@ async fn health(State(s): State<ServerState>) -> Json<Value> {
         "busy": false,
         "workspace": app.workspace_root,
     }))
-}
-
-const CHECKPOINT_INSTRUCTION: &str = "This CatDesk session has had a long or high-volume uninterrupted tool-call run. Reach a safe boundary before starting more substantive work: preserve the current state with create_handoff, record progress, validation and next steps, then finish the current assistant turn. Do not cancel background jobs that are still needed; they can be resumed or polled in the next turn.";
-
-fn can_attach_checkpoint(req: &JsonRpcRequest, result: Option<&Value>) -> bool {
-    if req.params.get("name").and_then(Value::as_str) == Some("read_image") {
-        return false;
-    }
-    result
-        .and_then(|result| result.get("structuredContent"))
-        .is_some_and(Value::is_object)
-}
-
-fn attach_checkpoint_recommendation(
-    result: &mut Option<Value>,
-    recommendation: CheckpointRecommendation,
-) -> bool {
-    let Some(structured) = result
-        .as_mut()
-        .and_then(Value::as_object_mut)
-        .and_then(|result| result.get_mut("structuredContent"))
-        .and_then(Value::as_object_mut)
-    else {
-        return false;
-    };
-    structured.insert("checkpointRecommended".into(), Value::Bool(true));
-    structured.insert(
-        "checkpointInstruction".into(),
-        Value::String(CHECKPOINT_INSTRUCTION.into()),
-    );
-    structured.insert("checkpointAgeMs".into(), json!(recommendation.age_ms));
-    structured.insert(
-        "checkpointToolCalls".into(),
-        json!(recommendation.tool_calls),
-    );
-    true
 }
 
 fn attach_catdesk_instruction_actions(
@@ -2720,27 +2676,6 @@ mod tests {
     }
 
     #[test]
-    fn read_image_never_consumes_a_pending_checkpoint() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            id: Some(json!("read-image-checkpoint")),
-            method: "tools/call".into(),
-            params: json!({
-                "name": "read_image",
-                "arguments": {"path": "image.png", "analyze": true}
-            }),
-        };
-        let result = json!({
-            "structuredContent": {
-                "toolName": "read_image",
-                "analysis": {"description": "example"}
-            }
-        });
-
-        assert!(!can_attach_checkpoint(&req, Some(&result)));
-    }
-
-    #[test]
     fn attach_catdesk_instruction_actions_injects_partner_and_urls() {
         let mut result = Some(json!({
             "structuredContent": {
@@ -3139,70 +3074,6 @@ mod tests {
         assert!(session_flow_ids.iter().any(|flow_id| flow_id != STATELESS_FLOW_ID));
         assert!(session_flow_ids.iter().all(|flow_id| !flow_id.contains("client-a-secret-session")));
         assert!(session_flow_ids.iter().all(|flow_id| !flow_id.contains("client-b-secret-session")));
-
-        let _ = std::fs::remove_dir_all(workspace_root);
-        let _ = std::fs::remove_dir_all(config_root);
-    }
-
-    #[tokio::test]
-    async fn named_session_checkpoint_is_attached_to_sixtieth_normal_tool_response() {
-        let workspace_root = unique_temp_path("catdesk-checkpoint-workspace");
-        let config_root = unique_temp_path("catdesk-checkpoint-config");
-        let config_path = config_root.join("config.toml");
-        std::fs::create_dir_all(&workspace_root).expect("create workspace");
-        std::fs::create_dir_all(&config_root).expect("create config dir");
-        std::fs::write(workspace_root.join("hello.txt"), "hello world\n").expect("write file");
-
-        let app = AppState::new_for_test(
-            8787,
-            workspace_root.to_string_lossy().into_owned(),
-            config_path.clone(),
-        )
-        .expect("create app state");
-        let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
-        let gate = InstructionGate::with_anonymous(false);
-        let session_id = "checkpoint-session";
-        let probe = tool_call_body("read", json!({ "paths": ["hello.txt"] }));
-        let session =
-            ClientSession::from_headers(&modern_mcp_headers_for_session(&probe, session_id));
-        gate.mark_called(&session);
-        for _ in 0..59 {
-            gate.contexts.record_tool_call(Some(session_id));
-        }
-        let server_state = ServerState {
-            app: app_state,
-            devtools: None,
-            command_jobs: CommandJobManager::new(),
-            ui_events: ui_tx,
-            catdesk_instruction_called: gate,
-        };
-
-        let response = post_mcp_http(
-            State(server_state),
-            modern_mcp_headers_for_session(&probe, session_id),
-            probe,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let payload: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            payload.pointer("/result/structuredContent/checkpointRecommended"),
-            Some(&Value::Bool(true))
-        );
-        assert_eq!(
-            payload
-                .pointer("/result/structuredContent/checkpointToolCalls")
-                .and_then(Value::as_u64),
-            Some(60)
-        );
-        assert!(
-            payload
-                .pointer("/result/structuredContent/checkpointInstruction")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("handoff"))
-        );
 
         let _ = std::fs::remove_dir_all(workspace_root);
         let _ = std::fs::remove_dir_all(config_root);
@@ -4555,10 +4426,6 @@ async fn post_mcp_inner(
         }
     }
     let project_signal = project_signal_for_request(&req, &workspace_root);
-    if req.method == "tools/call" {
-        s.catdesk_instruction_called
-            .record_tool_call(&client_session);
-    }
     let response = mcp::handle_request_with_session(
         &req,
         &workspace_root,
@@ -4612,17 +4479,6 @@ async fn post_mcp_inner(
                 app.all_time_usage_totals()
             };
             attach_history_usage(&mut resp.result, &usage_totals);
-            if can_attach_checkpoint(&req, resp.result.as_ref())
-                && let Some(recommendation) = s
-                    .catdesk_instruction_called
-                    .claim_checkpoint(&client_session)
-                && attach_checkpoint_recommendation(&mut resp.result, recommendation)
-            {
-                crate::diagnostics::checkpoint_recommended(
-                    recommendation.age_ms,
-                    recommendation.tool_calls,
-                );
-            }
             attach_catdesk_instruction_actions(
                 &mut resp.result,
                 ngrok_url.as_deref(),

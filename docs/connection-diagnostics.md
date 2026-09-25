@@ -84,20 +84,6 @@ Each `http_started`, `http_finished`, and `http_cancelled` record also includes
 requests that are still active, so it can be correlated with client-side stream/resume
 failures without persisting MCP payloads or session secrets.
 
-Named MCP sessions also maintain a soft long-turn checkpoint window. This is a
-heuristic over MCP session activity, not a true ChatGPT assistant-turn identifier,
-and it can only advise the model; CatDesk cannot force the frontend stream to end.
-The window resets after five minutes without a tool call. After ten minutes of continuous
-activity or 60 tool calls, whichever happens first, the next normal structured tool
-response carries `checkpointRecommended: true` plus an instruction to reach a safe
-boundary, preserve state with `create_handoff`, and finish the current assistant
-turn. The hint is delivered at most once per active window and never cancels a
-background command job. Anonymous/stateless requests are not tracked. `read_image`
-keeps its native multimodal result shape and cannot consume the checkpoint; the next
-normal structured response can deliver it instead. A delivered hint emits
-`checkpoint_recommended` with numeric `age_ms` and `tool_calls` only; raw session
-IDs, arguments and result content are not logged.
-
 Check `scheduler_deadline_stage` to see whether it expired in `queue` or during
 `execution`. Once execution starts, the worker continues to own its slot until the
 operation actually ends, including after client disconnection or response timeout.
