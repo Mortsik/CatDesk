@@ -104,9 +104,14 @@ fn normalize_scope_paths(
     mut scope: ChangeScope,
 ) -> ChangeScope {
     for target in &mut scope.targets {
-        if let Ok(relative) = target.path.strip_prefix(original_workspace_root) {
-            target.path = canonical_workspace_root.join(relative);
-        }
+        // Commands can supply a Windows verbatim path even when the snapshot
+        // root uses an ordinary expanded drive path. Normalize both sides.
+        let normalized_target = command::normalize_windows_verbatim_path(target.path.clone());
+        target.path = if let Ok(relative) = normalized_target.strip_prefix(original_workspace_root) {
+            canonical_workspace_root.join(relative)
+        } else {
+            normalized_target
+        };
     }
     scope
 }
@@ -168,6 +173,25 @@ mod tests {
         let session = ChangeSession::begin(
             &root,
             ChangeScope::single(ChangeTarget::explicit(resolved, false)),
+        );
+        fs::write(&file, "after\n").expect("modify file");
+        let changes = session.changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "notes.txt");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_target_stays_relative_to_normalized_workspace_root() {
+        let root = workspace("canonical-target");
+        let file = root.join("notes.txt");
+        fs::write(&file, "before\n").expect("write initial file");
+        // Windows canonicalize returns a verbatim \\?\ path, whereas command
+        // path resolution deliberately removes that prefix.
+        let canonical_target = file.canonicalize().expect("canonical target");
+        let session = ChangeSession::begin(
+            &root,
+            ChangeScope::single(ChangeTarget::explicit(canonical_target, false)),
         );
         fs::write(&file, "after\n").expect("modify file");
         let changes = session.changes();

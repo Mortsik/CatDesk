@@ -3350,11 +3350,15 @@ mod tests {
             .expect("read explicit cwd response");
         let explicit_payload: Value =
             serde_json::from_slice(&explicit_bytes).expect("parse explicit cwd response");
+        let explicit_cwd = explicit_payload
+            .pointer("/result/structuredContent/cwd")
+            .and_then(Value::as_str)
+            .expect("explicit session cwd");
         assert_eq!(
-            explicit_payload
-                .pointer("/result/structuredContent/cwd")
-                .and_then(Value::as_str),
-            Some(project.to_string_lossy().as_ref())
+            std::path::Path::new(explicit_cwd)
+                .canonicalize()
+                .expect("canonical explicit cwd"),
+            project.canonicalize().expect("canonical expected project")
         );
 
         let implicit_body = tool_call_body("run_command", json!({ "command": "pwd" }));

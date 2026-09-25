@@ -1221,7 +1221,10 @@ mod tests {
 
     async fn wait_terminal(manager: &CommandJobManager, job_id: &str) -> CommandJobSnapshot {
         let mut cursor = 0;
-        for _ in 0..30 {
+        // Allow cold PowerShell startup when real subprocess tests share a
+        // Windows CI runner; timeout behavior is covered by separate tests.
+        let polls = if cfg!(windows) { 120 } else { 30 };
+        for _ in 0..polls {
             let snapshot = manager.poll(job_id, cursor, 250).await.expect("poll job");
             cursor = snapshot.next_cursor;
             if snapshot.state.is_terminal() {
@@ -1613,8 +1616,11 @@ mod tests {
             "sleep 0.3; printf 'done\\n'"
         };
         let started = Instant::now();
+        // This test checks eventual success, not the timeout contract. A cold
+        // PowerShell startup can exceed 5s on a busy shared Windows runner.
+        let timeout_ms = if cfg!(windows) { 20_000 } else { 5_000 };
         let started_job = manager
-            .start(command.to_string(), root.clone(), 5_000, None)
+            .start(command.to_string(), root.clone(), timeout_ms, None)
             .await
             .expect("start job");
         assert!(started.elapsed() < StdDuration::from_millis(250));
@@ -2346,8 +2352,9 @@ mod tests {
         } else {
             "sleep 0.5"
         };
+        let timeout_ms = if cfg!(windows) { 20_000 } else { 5_000 };
         let started = manager
-            .start(command.to_string(), root.clone(), 5_000, None)
+            .start(command.to_string(), root.clone(), timeout_ms, None)
             .await
             .expect("start active-count job");
 
