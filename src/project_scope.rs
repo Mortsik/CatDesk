@@ -49,12 +49,20 @@ pub(crate) fn infer_project_root(
     } else {
         lexical_normalize(&workspace_lexical.join(candidate))
     };
-    let candidate_in_canonical_namespace =
-        if let Ok(relative) = candidate_lexical.strip_prefix(&workspace_lexical) {
-            workspace.join(relative)
-        } else {
-            candidate_lexical.clone()
-        };
+    // On Windows, the workspace may arrive via an 8.3 path while resolved
+    // tool paths use the expanded spelling without the verbatim prefix.
+    // Translate either spelling into the same canonical namespace before
+    // enforcing the workspace boundary and locating the nearest project.
+    let normalized_workspace = crate::command::normalize_windows_verbatim_path(workspace.clone());
+    let candidate_in_canonical_namespace = if let Ok(relative) =
+        candidate_lexical.strip_prefix(&workspace_lexical)
+    {
+        workspace.join(relative)
+    } else if let Ok(relative) = candidate_lexical.strip_prefix(&normalized_workspace) {
+        workspace.join(relative)
+    } else {
+        candidate_lexical.clone()
+    };
     if !candidate_in_canonical_namespace.starts_with(&workspace) {
         return Err(path_escape_error(candidate));
     }
@@ -215,6 +223,25 @@ mod tests {
 
         assert_eq!(project, canonical(&repo_a));
         assert_ne!(project, canonical(&repo_b));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolved_tool_path_selects_the_same_project_as_its_workspace_alias() {
+        let root = workspace("resolved-path-alias");
+        let repo = root.join("repo-a");
+        fs::create_dir_all(repo.join(".git")).expect("create git marker");
+        fs::write(repo.join("notes.txt"), "hello\n").expect("write file");
+        let resolved = crate::command::resolve_workspace_path(
+            root.to_str().expect("workspace UTF-8"),
+            Some("repo-a/notes.txt"),
+        )
+        .expect("resolve tool path");
+
+        assert_eq!(
+            infer_project_root(&root, &resolved).expect("infer tool project"),
+            canonical(&repo)
+        );
         let _ = fs::remove_dir_all(root);
     }
 

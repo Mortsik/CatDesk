@@ -691,7 +691,8 @@ struct LogWriter {
 
 fn private_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    // Windows File::try_lock requires read or write access, not append-only.
+    options.create(true).read(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

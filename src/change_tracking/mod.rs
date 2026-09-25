@@ -4,6 +4,8 @@ mod snapshot;
 
 use std::path::{Path, PathBuf};
 
+use crate::command;
+
 pub(crate) use diff::FileChange;
 
 const MAX_DIFF_FILES: usize = 16;
@@ -73,6 +75,7 @@ impl ChangeSession {
         let original_workspace_root = workspace_root.to_path_buf();
         let workspace_root = workspace_root
             .canonicalize()
+            .map(command::normalize_windows_verbatim_path)
             .unwrap_or_else(|_| original_workspace_root.clone());
         let scope = normalize_scope_paths(&original_workspace_root, &workspace_root, scope);
         let before = snapshot::collect_snapshot(&workspace_root, &scope.targets);
@@ -101,9 +104,14 @@ fn normalize_scope_paths(
     mut scope: ChangeScope,
 ) -> ChangeScope {
     for target in &mut scope.targets {
-        if let Ok(relative) = target.path.strip_prefix(original_workspace_root) {
-            target.path = canonical_workspace_root.join(relative);
-        }
+        // Commands can supply a Windows verbatim path even when the snapshot
+        // root uses an ordinary expanded drive path. Normalize both sides.
+        let normalized_target = command::normalize_windows_verbatim_path(target.path.clone());
+        target.path = if let Ok(relative) = normalized_target.strip_prefix(original_workspace_root) {
+            canonical_workspace_root.join(relative)
+        } else {
+            normalized_target
+        };
     }
     scope
 }
@@ -149,6 +157,46 @@ mod tests {
         assert!(paths.contains(&".github/workflows/ci.yml"));
         assert!(paths.iter().all(|path| !path.starts_with(".git/")));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_resolved_path_stays_relative_to_original_workspace_spelling() {
+        let root = workspace("resolved-tool-path");
+        let file = root.join("notes.txt");
+        fs::write(&file, "before\n").expect("write initial file");
+        let resolved = crate::command::resolve_workspace_path(
+            root.to_str().expect("workspace UTF-8"),
+            Some("notes.txt"),
+        )
+        .expect("resolve tool path");
+        let session = ChangeSession::begin(
+            &root,
+            ChangeScope::single(ChangeTarget::explicit(resolved, false)),
+        );
+        fs::write(&file, "after\n").expect("modify file");
+        let changes = session.changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "notes.txt");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_target_stays_relative_to_normalized_workspace_root() {
+        let root = workspace("canonical-target");
+        let file = root.join("notes.txt");
+        fs::write(&file, "before\n").expect("write initial file");
+        // Windows canonicalize returns a verbatim \\?\ path, whereas command
+        // path resolution deliberately removes that prefix.
+        let canonical_target = file.canonicalize().expect("canonical target");
+        let session = ChangeSession::begin(
+            &root,
+            ChangeScope::single(ChangeTarget::explicit(canonical_target, false)),
+        );
+        fs::write(&file, "after\n").expect("modify file");
+        let changes = session.changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "notes.txt");
         let _ = fs::remove_dir_all(root);
     }
 
