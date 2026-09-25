@@ -4,6 +4,8 @@ mod snapshot;
 
 use std::path::{Path, PathBuf};
 
+use crate::command;
+
 pub(crate) use diff::FileChange;
 
 const MAX_DIFF_FILES: usize = 16;
@@ -73,6 +75,7 @@ impl ChangeSession {
         let original_workspace_root = workspace_root.to_path_buf();
         let workspace_root = workspace_root
             .canonicalize()
+            .map(command::normalize_windows_verbatim_path)
             .unwrap_or_else(|_| original_workspace_root.clone());
         let scope = normalize_scope_paths(&original_workspace_root, &workspace_root, scope);
         let before = snapshot::collect_snapshot(&workspace_root, &scope.targets);
@@ -149,6 +152,27 @@ mod tests {
         assert!(paths.contains(&".github/workflows/ci.yml"));
         assert!(paths.iter().all(|path| !path.starts_with(".git/")));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_resolved_path_stays_relative_to_original_workspace_spelling() {
+        let root = workspace("resolved-tool-path");
+        let file = root.join("notes.txt");
+        fs::write(&file, "before\n").expect("write initial file");
+        let resolved = crate::command::resolve_workspace_path(
+            root.to_str().expect("workspace UTF-8"),
+            Some("notes.txt"),
+        )
+        .expect("resolve tool path");
+        let session = ChangeSession::begin(
+            &root,
+            ChangeScope::single(ChangeTarget::explicit(resolved, false)),
+        );
+        fs::write(&file, "after\n").expect("modify file");
+        let changes = session.changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "notes.txt");
         let _ = fs::remove_dir_all(root);
     }
 

@@ -3370,14 +3370,22 @@ mod tests {
             .expect("read implicit cwd response");
         let implicit_payload: Value =
             serde_json::from_slice(&implicit_bytes).expect("parse implicit cwd response");
+        let implicit_cwd = implicit_payload
+            .pointer("/result/structuredContent/cwd")
+            .and_then(Value::as_str)
+            .expect("implicit session cwd");
         assert_eq!(
-            implicit_payload
-                .pointer("/result/structuredContent/cwd")
-                .and_then(Value::as_str),
-            Some(project.to_string_lossy().as_ref()),
+            std::path::Path::new(implicit_cwd)
+                .canonicalize()
+                .expect("canonical implicit cwd"),
+            project.canonicalize().expect("canonical explicit project"),
             "named session should reuse the project selected by the successful explicit cwd"
         );
-        assert_eq!(gate.active_project(&session), Some(project.clone()));
+        assert_eq!(
+            gate.active_project(&session)
+                .map(|path| path.canonicalize().expect("canonical selected project")),
+            Some(project.canonicalize().expect("canonical expected project"))
+        );
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -3548,11 +3556,15 @@ mod tests {
         let (a, b, c) = tokio::join!(a, b, c);
 
         for (payload, expected) in [(a, &repo_a), (b, &repo_b), (c, &repo_c)] {
+            let cwd = payload
+                .pointer("/result/structuredContent/cwd")
+                .and_then(Value::as_str)
+                .expect("session cwd");
             assert_eq!(
-                payload
-                    .pointer("/result/structuredContent/cwd")
-                    .and_then(Value::as_str),
-                Some(expected.to_string_lossy().as_ref())
+                std::path::Path::new(cwd)
+                    .canonicalize()
+                    .expect("canonical session cwd"),
+                expected.canonicalize().expect("canonical expected project")
             );
         }
 
