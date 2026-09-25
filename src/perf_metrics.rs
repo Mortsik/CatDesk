@@ -14,6 +14,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// Name under which non-MCP HTTP traffic (health, binagotchy, plain GETs and
+/// early MCP replies without scheduler timing) is observed.
+pub(crate) const HTTP_CLASS_NAME: &str = "http";
+
 /// Request classes. MCP calls carry theirs via `SchedulerTiming::class`; plain
 /// HTTP traffic aggregates under "http" and workspace change scans under "scan".
 const CLASSES: [&str; CLASS_COUNT] = [
@@ -22,11 +26,13 @@ const CLASSES: [&str; CLASS_COUNT] = [
     "process",
     "browser",
     "general",
-    "http",
+    HTTP_CLASS_NAME,
     SCAN_CLASS_NAME,
 ];
 const CLASS_COUNT: usize = 7;
+pub(crate) const CLASS_CONTROL: usize = 0;
 const CLASS_FILESYSTEM: usize = 1;
+const CLASS_BROWSER: usize = 3;
 const CLASS_GENERAL: usize = 4;
 /// The scan class reports its own timing; latency aggregates cover the rest.
 pub(crate) const CLASS_SCAN: usize = CLASS_COUNT - 1;
@@ -504,6 +510,10 @@ pub(crate) fn snapshot_at(now_ms: u64) -> PerfSnapshot {
                 &mut aggregate_dispatch,
                 &mut aggregate_execution,
             );
+            snapshot.aggregate.count += snapshot.classes[class].count;
+            snapshot.aggregate.deadlines += snapshot.classes[class].deadlines;
+            snapshot.aggregate.failures += snapshot.classes[class].failures;
+            snapshot.aggregate.bytes += snapshot.classes[class].bytes;
         }
     }
     snapshot.aggregate = ClassSnapshot {
@@ -795,6 +805,18 @@ fn format_byte_rate(bytes: u64, window_ms: u64) -> String {
 mod tests {
     use super::*;
 
+    /// Serializes tests that assert exact window contents: the registry is
+    /// process-global, so parallel window writes would race the snapshots.
+    /// (Real-time writers — middleware, scans — only touch classes these
+    /// tests never use, and their assertions are monotonic deltas instead.)
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn lock_window_tests() -> MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn observation(class: &'static str, elapsed_ms: u64) -> Observation {
         Observation {
             class,
@@ -821,6 +843,7 @@ mod tests {
 
     #[test]
     fn observations_expire_after_fifteen_buckets() {
+        let _guard = lock_window_tests();
         let now = 1_700_000_000_000u64;
         observe_at(
             now,
@@ -851,6 +874,7 @@ mod tests {
 
     #[test]
     fn reservoirs_stay_bounded_under_saturation() {
+        let _guard = lock_window_tests();
         let now = 1_700_000_000_000u64;
         for elapsed in 0..10_000u64 {
             observe_at(now, &observation("general", elapsed % 1000));
@@ -875,6 +899,7 @@ mod tests {
 
     #[test]
     fn deadline_failure_and_bytes_are_counted_per_class() {
+        let _guard = lock_window_tests();
         let now = 1_700_000_000_000u64;
         observe_at(
             now,
@@ -895,6 +920,38 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_mirrors_http_class_counters() {
+        let _guard = lock_window_tests();
+        // One hour past the other window tests: buckets stay disjoint even
+        // though browser/filesystem are shared with clock-step and expiry.
+        let now = 1_700_000_000_000u64 + 3_600_000;
+        observe_at(now, &observation(CLASSES[CLASS_BROWSER], 1));
+        observe_at(
+            now,
+            &Observation {
+                bytes: 256,
+                ..observation(CLASSES[CLASS_FILESYSTEM], 2)
+            },
+        );
+        let snapshot = snapshot_at(now);
+        let browser = &snapshot.classes[CLASS_BROWSER];
+        let filesystem = &snapshot.classes[CLASS_FILESYSTEM];
+        assert!(browser.count >= 1, "browser observation must be counted");
+        assert!(
+            filesystem.count >= 1 && filesystem.bytes >= 256,
+            "filesystem observation must carry its bytes"
+        );
+        assert!(
+            snapshot.aggregate.count >= browser.count + filesystem.count,
+            "aggregate must pool every http-class count"
+        );
+        assert!(
+            snapshot.aggregate.bytes >= browser.bytes + filesystem.bytes,
+            "aggregate must pool response bytes"
+        );
+    }
+
+    #[test]
     fn unknown_classes_are_ignored() {
         // Routing rejects unknown names outright, so nothing lands anywhere
         // (the global registry is shared with tests running in parallel).
@@ -907,15 +964,22 @@ mod tests {
 
     #[test]
     fn clock_step_backwards_resets_the_window() {
+        let _guard = lock_window_tests();
         let now = 1_700_000_000_000u64;
-        observe_at(now, &observation("http", 1));
-        assert_eq!(snapshot_at(now).classes[5].count, 1);
+        observe_at(now, &observation(CLASSES[CLASS_BROWSER], 1));
+        assert_eq!(snapshot_at(now).classes[CLASS_BROWSER].count, 1);
         // A much older timestamp must not resurrect the stale bucket.
-        assert_eq!(snapshot_at(now - 10 * BUCKET_MS).classes[5].count, 0);
-        observe_at(now - 10 * BUCKET_MS, &observation("http", 2));
+        assert_eq!(
+            snapshot_at(now - 10 * BUCKET_MS).classes[CLASS_BROWSER].count,
+            0
+        );
+        observe_at(
+            now - 10 * BUCKET_MS,
+            &observation(CLASSES[CLASS_BROWSER], 2),
+        );
         let reset = snapshot_at(now - 10 * BUCKET_MS);
-        assert_eq!(reset.classes[5].count, 1);
-        assert_eq!(reset.classes[5].p50_ms, Some(2));
+        assert_eq!(reset.classes[CLASS_BROWSER].count, 1);
+        assert_eq!(reset.classes[CLASS_BROWSER].p50_ms, Some(2));
     }
 
     #[test]

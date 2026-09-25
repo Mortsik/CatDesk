@@ -383,10 +383,99 @@ mod tests {
         assert_eq!(log.active.load(Ordering::Relaxed), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn perf_metrics_observe_http_requests_end_to_end() {
+        use crate::{command_jobs::CommandJobManager, perf_metrics, state::AppState};
+        use tokio::sync::{Mutex, mpsc::channel};
+        let root = std::env::temp_dir().join(format!("catdesk-perf-http-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (log, guard) = Diagnostics::start(&root.join("logs")).unwrap();
+        let state = AppState::new_for_test(
+            0,
+            root.to_string_lossy().into_owned(),
+            root.join("config.toml"),
+        )
+        .unwrap();
+        let (events, _receiver) = channel(crate::state::UI_EVENT_CAPACITY);
+        let app = crate::server::router(
+            Arc::new(Mutex::new(state)),
+            None,
+            CommandJobManager::new(),
+            "/secret-slug/mcp".into(),
+            events,
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            Some(log.clone()),
+            http_request,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let post = |method: &'static str, tool: Option<&'static str>| {
+            client
+                .post(format!("{base}/secret-slug/mcp"))
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", method)
+                .header("Mcp-Name", tool.unwrap_or(""))
+                .json(&json!({"jsonrpc": "2.0", "id": "perf-id", "method": method,
+                    "params": {"name": tool, "arguments": {}, "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}}}}))
+                .send()
+        };
+        let before = perf_metrics::snapshot();
+
+        // ping answers early (no scheduler timing) -> plain "http" class.
+        let ping = post("ping", None).await.unwrap();
+        assert_eq!(ping.status(), 200);
+        // tools/call is classified "control" via SchedulerTiming and keyed to
+        // the whitelisted tool counter through rpc_request.
+        let instruction = post("tools/call", Some("catdesk_instruction"))
+            .await
+            .unwrap();
+        assert_eq!(instruction.status(), 200);
+
+        server.abort();
+        let _ = server.await;
+        drop(guard);
+
+        let after = perf_metrics::snapshot();
+        assert!(
+            after.aggregate.count >= before.aggregate.count + 2,
+            "both requests must land in the latency aggregate"
+        );
+        assert!(
+            after.aggregate.bytes > before.aggregate.bytes,
+            "buffered JSON bodies must report their response bytes"
+        );
+        // In-flight max is monotonic; our two requests must have raised it.
+        // (Exact depth assertions would race with tests running in parallel.)
+        assert!(
+            after.in_flight_max >= before.in_flight_max + 1,
+            "middleware must track in-flight depth (before {before:?}, after {after:?})"
+        );
+        let control_before = before.classes[perf_metrics::CLASS_CONTROL].count;
+        assert!(
+            after.classes[perf_metrics::CLASS_CONTROL].count > control_before,
+            "MCP tools/call must observe the control class"
+        );
+        let tool = perf_metrics::tool_index(Some("catdesk_instruction"));
+        assert!(
+            after.tools[tool].count > before.tools[tool].count,
+            "rpc_request must key the tool counter from the whitelist"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 use axum::{
+    body::HttpBody,
     extract::{MatchedPath, Request, State},
+    http::StatusCode,
     middleware::Next,
     response::Response,
 };
@@ -398,7 +487,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -635,6 +724,16 @@ pub(crate) fn rpc_request(body: &Value) {
         metadata["event"] = json!("mcp_request");
         metadata["request_id"] = json!(request.id);
         request.log.record(metadata);
+        // Key the perf tool counter from the same whitelist; stored as
+        // index + 1 so 0 means "not a tools/call request".
+        if body.get("method").and_then(Value::as_str) == Some("tools/call") {
+            let tool = body
+                .get("params")
+                .and_then(|params| params.get("name"))
+                .and_then(Value::as_str);
+            let index = crate::perf_metrics::tool_index(tool);
+            request.tool.store(index as u8 + 1, Ordering::Relaxed);
+        }
     });
 }
 
@@ -661,6 +760,8 @@ struct RequestLog {
     id: String,
     started: Instant,
     complete: AtomicBool,
+    /// Perf tool-counter key (`tool_index + 1`); 0 until rpc_request runs.
+    tool: AtomicU8,
 }
 
 impl Drop for RequestLog {
@@ -681,8 +782,17 @@ pub(crate) async fn http_request(
     request: Request,
     next: Next,
 ) -> Response {
+    // Depth accounting survives cancellations: the guard decrements on drop.
+    let _in_flight = crate::perf_metrics::InFlightGuard::new();
+    let started = Instant::now();
     let Some(log) = log else {
-        return next.run(request).await;
+        let response = next.run(request).await;
+        crate::perf_metrics::observe(perf_observation(
+            &response,
+            started.elapsed().as_millis(),
+            None,
+        ));
+        return response;
     };
     let method = match request.method().as_str() {
         m @ ("GET" | "POST" | "DELETE" | "OPTIONS" | "HEAD" | "PUT" | "PATCH") => m,
@@ -691,8 +801,9 @@ pub(crate) async fn http_request(
     let trace = RequestLog {
         log,
         id: uuid::Uuid::new_v4().to_string(),
-        started: Instant::now(),
+        started,
         complete: AtomicBool::new(false),
+        tool: AtomicU8::new(0),
     };
     let active = trace.log.begin_request(&trace.id, trace.started);
     trace.log.record(
@@ -707,6 +818,18 @@ pub(crate) async fn http_request(
             let scheduler = response.extensions().get::<SchedulerTiming>().copied();
             let active = trace.log.finish_request(&trace.id);
             trace.complete.store(true, Ordering::Relaxed);
+            let elapsed_ms = trace.started.elapsed().as_millis();
+            let observation = perf_observation(&response, elapsed_ms, scheduler);
+            crate::perf_metrics::observe(observation);
+            let tool = trace.tool.load(Ordering::Relaxed);
+            if tool != 0 {
+                crate::perf_metrics::observe_tool(
+                    usize::from(tool - 1),
+                    observation.bytes,
+                    observation.deadline,
+                    observation.failed,
+                );
+            }
             trace.log.record(json!({"event": "http_finished", "request_id": trace.id,
                 "status": response.status().as_u16(), "rpc_error_code": response.extensions().get::<RpcError>().map(|e| e.0),
                 "tool_error": response.extensions().get::<ToolResult>().and_then(|r| r.is_error),
@@ -715,12 +838,35 @@ pub(crate) async fn http_request(
                 "scheduler_queue_wait_ms": scheduler.map(|timing| timing.queue_wait_ms),
                 "scheduler_execution_ms": scheduler.map(|timing| timing.execution_ms),
                 "scheduler_deadline_stage": scheduler.and_then(|timing| timing.deadline_stage),
-                "elapsed_ms": trace.started.elapsed().as_millis(),
+                "elapsed_ms": elapsed_ms,
                 "active_requests": active.active_requests,
                 "oldest_active_request_ms": active.oldest_active_request_ms}));
         });
         response
     }).await
+}
+
+/// Map a finished response onto one bounded perf observation. MCP calls carry
+/// their request class via `SchedulerTiming`; everything else is plain "http".
+fn perf_observation(
+    response: &Response,
+    elapsed_ms: u128,
+    scheduler: Option<SchedulerTiming>,
+) -> crate::perf_metrics::Observation {
+    let status = response.status();
+    crate::perf_metrics::Observation {
+        class: scheduler
+            .map(|timing| timing.class)
+            .unwrap_or(crate::perf_metrics::HTTP_CLASS_NAME),
+        elapsed_ms: u64::try_from(elapsed_ms).unwrap_or(u64::MAX),
+        dispatch_ms: scheduler.map(|timing| timing.queue_wait_ms),
+        execution_ms: scheduler.map(|timing| timing.execution_ms),
+        deadline: scheduler.is_some_and(|timing| timing.deadline_stage.is_some())
+            || status == StatusCode::GATEWAY_TIMEOUT,
+        failed: status.is_client_error() || status.is_server_error(),
+        // Buffered JSON bodies know their size; unknown/streaming sizes stay 0.
+        bytes: response.body().size_hint().exact().unwrap_or(0),
+    }
 }
 
 struct LogWriter {
