@@ -1479,7 +1479,7 @@ where
 fn command_job_output_text(snapshot: &CommandJobSnapshot) -> String {
     if snapshot.events.is_empty() {
         return match snapshot.state {
-            CommandJobState::Queued => "(no new output; command is queued for process capacity)".to_string(),
+            CommandJobState::Queued => "(no new output; command is starting)".to_string(),
             CommandJobState::Running => "(no new output; command is still running)".to_string(),
             CommandJobState::Interrupted => {
                 "(command interrupted: CatDesk exited before the command finished; output was not retained)"
@@ -4378,6 +4378,32 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_job_output_text_is_neutral_about_scheduling() {
+        let snapshot = CommandJobSnapshot {
+            job_id: "job-under-test".into(),
+            command: "true".into(),
+            cwd: "/tmp".into(),
+            state: CommandJobState::Queued,
+            elapsed_ms: 0,
+            exit_code: None,
+            events: Vec::new(),
+            next_cursor: 0,
+            has_more_output: false,
+            output_truncated: false,
+            timeout_ms: 1_000,
+        };
+        let text = command_job_output_text(&snapshot);
+        assert!(
+            text.contains("command is starting"),
+            "queued-state text must describe the start state: {text}"
+        );
+        assert!(
+            !text.contains("process capacity"),
+            "queued-state text must not advertise a concurrency queue: {text}"
+        );
+    }
 
     #[test]
     fn static_widget_image_encoding_is_reused() {
