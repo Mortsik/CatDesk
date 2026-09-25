@@ -3,10 +3,6 @@
 //! Display formatting lives here so it stays pure and testable; consumers
 //! (TUI header, splash, health, process-started diagnostics) only call it.
 
-// Consumers land across the build-identity commits; until then this module's
-// surface is exercised by its tests only.
-#![allow(dead_code)]
-
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const GIT_SHA: &str = env!("CATDESK_GIT_SHA");
 pub(crate) const GIT_BRANCH: &str = env!("CATDESK_GIT_BRANCH");
@@ -32,18 +28,21 @@ pub(crate) fn version_label(version: &str, git_sha: &str) -> String {
     format!("v{}", version_with_sha(version, git_sha))
 }
 
+/// Machine-facing form for JSON payloads: `0.9.2+g1a2b3c4`, no display `v`.
+pub(crate) fn version_identity(version: &str, git_sha: &str) -> String {
+    version_with_sha(version, git_sha)
+}
+
 fn build_date(build_timestamp: &str) -> Option<&str> {
     if build_timestamp == "unknown" || build_timestamp.len() < 10 {
         return None;
     }
-    let date = &build_timestamp[..10];
     // RFC3339 dates are ASCII; refuse to slice if an override strayed into
     // multibyte territory, so the date boundary always exists.
-    if date.is_char_boundary(date.len()) {
-        Some(date)
-    } else {
-        None
+    if !build_timestamp.is_char_boundary(10) {
+        return None;
     }
+    Some(&build_timestamp[..10])
 }
 
 pub(crate) fn identity_line(
@@ -128,6 +127,16 @@ mod tests {
     fn identity_line_omits_too_short_timestamp() {
         assert_eq!(
             identity_line("0.9.2", "unknown", "unknown", "2026-9"),
+            "0.9.2"
+        );
+    }
+
+    #[test]
+    fn identity_line_refuses_multibyte_timestamp_boundary() {
+        // Byte 10 lands inside the two-byte 'é'; the date must be dropped,
+        // never sliced mid-character.
+        assert_eq!(
+            identity_line("0.9.2", "unknown", "unknown", "2026-09-2é9:00:00+02:00"),
             "0.9.2"
         );
     }

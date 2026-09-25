@@ -1002,7 +1002,7 @@ async fn health(State(s): State<ServerState>) -> Json<Value> {
         "tool_mode": app.tool_mode.label(),
         "busy": false,
         "workspace": app.workspace_root,
-        "version": build_info::version_label(build_info::VERSION, build_info::GIT_SHA),
+        "version": build_info::version_identity(build_info::VERSION, build_info::GIT_SHA),
         "git_sha": build_info::GIT_SHA,
         "git_branch": build_info::GIT_BRANCH,
         "build_time": build_info::BUILD_TIMESTAMP,
@@ -2236,8 +2236,8 @@ mod tests {
         }
         let version = result.0.get("version").and_then(Value::as_str).unwrap();
         assert!(
-            version.starts_with(&format!("v{}", crate::build_info::VERSION)),
-            "version must be the labeled package version, got {version}"
+            version.starts_with(crate::build_info::VERSION) && !version.starts_with('v'),
+            "health version must be machine-parseable semver identity, got {version}"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
