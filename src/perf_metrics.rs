@@ -30,9 +30,13 @@ const CLASSES: [&str; CLASS_COUNT] = [
     SCAN_CLASS_NAME,
 ];
 const CLASS_COUNT: usize = 7;
+#[cfg(test)]
 pub(crate) const CLASS_CONTROL: usize = 0;
+#[cfg(test)]
 const CLASS_FILESYSTEM: usize = 1;
+#[cfg(test)]
 const CLASS_BROWSER: usize = 3;
+#[cfg(test)]
 const CLASS_GENERAL: usize = 4;
 /// The scan class reports its own timing; latency aggregates cover the rest.
 pub(crate) const CLASS_SCAN: usize = CLASS_COUNT - 1;
@@ -1082,5 +1086,28 @@ mod tests {
         let status = "Name:\tcatdesk\nVmRSS:\t    185344 kB\nVmSize:\t 999999 kB\n";
         assert_eq!(parse_proc_status_rss_kb(status), Some(185_344));
         assert_eq!(parse_proc_status_rss_kb("Name:\tcatdesk\n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sampler_publishes_real_process_stats() {
+        let mut previous = None;
+        sample_once(&mut previous);
+        assert!(previous.is_some(), "/proc must expose process cpu ticks");
+        assert_ne!(
+            global().rss_kb.load(Ordering::Relaxed),
+            RSS_UNKNOWN,
+            "first sample must publish resident memory"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        sample_once(&mut previous);
+        assert_ne!(
+            global().cpu_bp.load(Ordering::Relaxed),
+            CPU_UNKNOWN,
+            "second sample must publish cpu basis points"
+        );
+        // Sampling twice in a row never panics or blocks; state stays valid.
+        sample_once(&mut previous);
+        assert!(previous.is_some());
     }
 }

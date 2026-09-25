@@ -5264,6 +5264,8 @@ async fn start_services(
         mcp_path,
         ui_events,
     );
+    // Feed the dashboard SYS line; the sampler only ever writes atomics.
+    perf_metrics::spawn_system_sampler();
     let handle = tokio::spawn(async move {
         diagnostics::event("server_started");
         match axum::serve(listener, router).await {
