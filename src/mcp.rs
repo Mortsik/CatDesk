@@ -18,6 +18,7 @@ use crate::command_jobs::{
 use crate::devtools::DevtoolsBridge;
 use crate::handoff;
 use crate::mascot;
+use crate::perf_metrics::{self, CacheKind};
 use crate::project_scope;
 use crate::state::{
     AgentsPathMode, AppConfig, Mode, ShowDetailMode, TokenStatsLayout, ToolMode, WidgetCornerStyle,
@@ -417,14 +418,20 @@ fn initial_tool_name_from_resource_uri(resource_uri: &str) -> &str {
 }
 
 fn cached_data_uri<'a>(cache: &'a OnceLock<String>, bytes: &[u8]) -> &'a str {
-    cache
-        .get_or_init(|| {
-            format!(
-                "data:image/png;base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            )
-        })
-        .as_str()
+    let mut missed = false;
+    let uri = cache.get_or_init(|| {
+        missed = true;
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    });
+    if missed {
+        perf_metrics::record_cache_miss(CacheKind::DataUri);
+    } else {
+        perf_metrics::record_cache_hit(CacheKind::DataUri);
+    }
+    uri.as_str()
 }
 
 fn render_widget_html(resource_uri: &str, mascot_seed: u64) -> String {
@@ -2241,23 +2248,29 @@ struct CachedFileValue<T> {
 const MAX_METADATA_CACHE_ENTRIES: usize = 128;
 
 fn cached_file_value<T: Clone>(
+    kind: CacheKind,
     cache: &StdMutex<HashMap<PathBuf, CachedFileValue<T>>>,
     path: &Path,
     load: impl FnOnce() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     let stamp = match file_stamp(path) {
         Ok(stamp) => stamp,
-        Err(_) => return load(),
+        Err(_) => {
+            perf_metrics::record_cache_miss(kind);
+            return load();
+        }
     };
     {
         let guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(entry) = guard.get(path).filter(|entry| entry.stamp == stamp) {
+            perf_metrics::record_cache_hit(kind);
             return Ok(entry.value.clone());
         }
     }
 
+    perf_metrics::record_cache_miss(kind);
     let value = load()?;
     let mut guard = cache
         .lock()
@@ -2283,7 +2296,7 @@ static AGENTS_TEXT_CACHE: OnceLock<StdMutex<HashMap<PathBuf, CachedFileValue<Opt
 fn cached_app_config() -> std::io::Result<AppConfig> {
     let path = app_config_path()?;
     let cache = APP_CONFIG_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
-    cached_file_value(cache, &path, load_app_config)
+    cached_file_value(CacheKind::AppConfig, cache, &path, load_app_config)
 }
 
 #[derive(Clone)]
@@ -2398,9 +2411,11 @@ fn read_agents_text_result(path: &Path) -> std::io::Result<Option<String>> {
 
 fn cached_agents_text(path: &Path) -> Option<String> {
     let cache = AGENTS_TEXT_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
-    cached_file_value(cache, path, || read_agents_text_result(path))
-        .ok()
-        .flatten()
+    cached_file_value(CacheKind::AgentsText, cache, path, || {
+        read_agents_text_result(path)
+    })
+    .ok()
+    .flatten()
 }
 
 fn display_path_with_tilde(path: &Path) -> String {
@@ -4431,16 +4446,57 @@ mod tests {
             std::fs::read_to_string(&path)
         };
 
-        assert_eq!(cached_file_value(&cache, &path, load).unwrap(), "one");
-        assert_eq!(cached_file_value(&cache, &path, load).unwrap(), "one");
+        assert_eq!(
+            cached_file_value(CacheKind::AppConfig, &cache, &path, load).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            cached_file_value(CacheKind::AppConfig, &cache, &path, load).unwrap(),
+            "one"
+        );
         assert_eq!(loads.get(), 1, "unchanged file should reuse cached value");
 
         std::fs::write(&path, "three-three").expect("rewrite cached value");
         assert_eq!(
-            cached_file_value(&cache, &path, load).unwrap(),
+            cached_file_value(CacheKind::AppConfig, &cache, &path, load).unwrap(),
             "three-three"
         );
         assert_eq!(loads.get(), 2, "metadata change must invalidate cache");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_cache_counts_hits_and_misses_for_perf_metrics() {
+        use crate::perf_metrics;
+
+        let root =
+            std::env::temp_dir().join(format!("catdesk-mcp-cache-counters-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create cache test root");
+        let path = root.join("value.txt");
+        std::fs::write(&path, "one").expect("write first value");
+        let cache = std::sync::Mutex::new(HashMap::new());
+        let load = || std::fs::read_to_string(&path);
+        let kind = CacheKind::AgentsText;
+        let hits_slot = kind as usize;
+        let before = perf_metrics::snapshot();
+
+        assert_eq!(
+            cached_file_value(kind, &cache, &path, load).unwrap(),
+            "one",
+            "first lookup is a miss that loads"
+        );
+        assert_eq!(
+            cached_file_value(kind, &cache, &path, load).unwrap(),
+            "one",
+            "second lookup hits the cached value"
+        );
+        let after = perf_metrics::snapshot();
+        assert_eq!(
+            after.cache_misses[hits_slot],
+            before.cache_misses[hits_slot] + 1
+        );
+        assert_eq!(after.cache_hits[hits_slot], before.cache_hits[hits_slot] + 1);
 
         let _ = std::fs::remove_dir_all(root);
     }

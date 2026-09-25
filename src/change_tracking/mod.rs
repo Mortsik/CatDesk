@@ -78,7 +78,7 @@ impl ChangeSession {
             .map(command::normalize_windows_verbatim_path)
             .unwrap_or_else(|_| original_workspace_root.clone());
         let scope = normalize_scope_paths(&original_workspace_root, &workspace_root, scope);
-        let before = snapshot::collect_snapshot(&workspace_root, &scope.targets);
+        let before = timed_snapshot(&workspace_root, &scope.targets);
         Self {
             workspace_root,
             scope,
@@ -90,9 +90,22 @@ impl ChangeSession {
         if self.scope.is_empty() {
             return Vec::new();
         }
-        let after = snapshot::collect_snapshot(&self.workspace_root, &self.scope.targets);
+        let after = timed_snapshot(&self.workspace_root, &self.scope.targets);
         diff::diff_snapshots(&self.before, &after)
     }
+}
+
+/// Collect a workspace snapshot and record how long it took under the "scan"
+/// class, so the dashboard can show change-scan timing without new call sites.
+fn timed_snapshot(workspace_root: &Path, targets: &[ChangeTarget]) -> snapshot::WorkspaceSnapshot {
+    let started = std::time::Instant::now();
+    let snapshot = snapshot::collect_snapshot(workspace_root, targets);
+    crate::perf_metrics::observe(crate::perf_metrics::Observation {
+        class: crate::perf_metrics::SCAN_CLASS_NAME,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        ..crate::perf_metrics::Observation::default()
+    });
+    snapshot
 }
 
 // Canonicalizing a workspace can change the root spelling (for example
@@ -127,6 +140,28 @@ mod tests {
             std::env::temp_dir().join(format!("catdesk-change-tracking-{name}-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("create workspace");
         root
+    }
+
+    #[test]
+    fn change_scans_report_timing_to_perf_metrics() {
+        let root = workspace("scan-timing");
+        fs::write(root.join("tracked.txt"), "before").expect("write file");
+        let scan = crate::perf_metrics::CLASS_SCAN;
+        let before = crate::perf_metrics::snapshot().classes[scan].count;
+
+        let session = ChangeSession::begin(
+            &root,
+            ChangeScope::single(ChangeTarget::explicit(root.join("tracked.txt"), false)),
+        );
+        fs::write(root.join("tracked.txt"), "after").expect("change file");
+        let _ = session.changes();
+
+        let after = crate::perf_metrics::snapshot().classes[scan].count;
+        assert!(
+            after >= before + 2,
+            "begin and changes each time one scan (before {before}, after {after})"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

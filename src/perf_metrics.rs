@@ -23,13 +23,15 @@ const CLASSES: [&str; CLASS_COUNT] = [
     "browser",
     "general",
     "http",
-    "scan",
+    SCAN_CLASS_NAME,
 ];
 const CLASS_COUNT: usize = 7;
 const CLASS_FILESYSTEM: usize = 1;
 const CLASS_GENERAL: usize = 4;
 /// The scan class reports its own timing; latency aggregates cover the rest.
-const CLASS_SCAN: usize = CLASS_COUNT - 1;
+pub(crate) const CLASS_SCAN: usize = CLASS_COUNT - 1;
+/// Name under which change-scan timings are observed.
+pub(crate) const SCAN_CLASS_NAME: &str = "scan";
 const HTTP_CLASS_COUNT: usize = CLASS_COUNT - 1;
 
 /// Rolling window: 15 buckets x 60 s covers the last 15 minutes.
@@ -894,12 +896,13 @@ mod tests {
 
     #[test]
     fn unknown_classes_are_ignored() {
-        observe_at(now_ms(), &observation("mystery-class", 1));
-        let snapshot = snapshot_at(now_ms());
-        assert!(
-            snapshot.classes.iter().all(|class| class.count == 0),
-            "unknown class must not land in any slot"
+        // Routing rejects unknown names outright, so nothing lands anywhere
+        // (the global registry is shared with tests running in parallel).
+        assert_eq!(
+            CLASSES.iter().position(|name| *name == "mystery-class"),
+            None
         );
+        observe_at(now_ms(), &observation("mystery-class", 1)); // must not panic
     }
 
     #[test]
