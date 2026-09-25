@@ -775,11 +775,12 @@ impl CommandJobManager {
         drop(manager);
 
         // Shutdown-aware recovery. The registry insertion above happens before
-        // this flag read, so either cancel_all() had not run yet (and its job
-        // collection will see these jobs in the registry and cancel them before
-        // their runner spawns a process) or shutdown already won the race and
-        // the queued records are persisted as Cancelled instead of launching
-        // after shutdown has begun.
+        // this flag read, so either cancel_all() had not run yet (its registry
+        // collection is then guaranteed to include these jobs, and the runner's
+        // cancellation path cancels them and tears down the process tree, so a
+        // job cannot escape) or shutdown already won the race and the queued
+        // records are persisted as Cancelled instead of launching after
+        // shutdown has begun.
         if self.shutting_down.load(Ordering::Acquire) {
             for (job, _cancel_rx) in queued {
                 job.finish(CommandJobState::Cancelled, Some(EXIT_CODE_CANCELLED))

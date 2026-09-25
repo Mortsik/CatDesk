@@ -68,28 +68,29 @@ header at the time of failure. Never publish the secret connector URL.
 Use `tail -n 100 ~/.catdesk/logs/connections.jsonl` to inspect recent activity.
 New logging starts only after restarting CatDesk with the updated binary.
 
-## Stalls, busy responses and memory
+## Stalls and deadlines
 
-Synchronous tool and filesystem operations run outside the async network
-workers. Capacity is isolated by request class (control, filesystem, process,
-browser and general), while temporary saturation queues fairly by session/project
-instead of immediately failing. Queue safety budgets remain bounded; exhausting a
-budget returns 503 with a class-specific `request_*_busy` event. Response deadlines
-are 45 seconds for control, 60 seconds for general, and 120 seconds for filesystem,
-process and browser work, so every scheduled MCP request has a hard 120-second
-response ceiling. A deadline returns 504 with `request_worker_timeout`.
+Synchronous tool and filesystem operations run on the blocking pool outside the
+async network workers. CatDesk enforces no admission control: concurrent work is
+bounded only by the host OS and the Tokio runtime, and a saturated search or
+command pipeline waits rather than fails with a busy error. Response deadlines
+are 45 seconds for control, 60 seconds for general, and 120 seconds for
+filesystem, process and browser work, so every scheduled MCP request has a hard
+120-second response ceiling. A deadline returns 504 with
+`request_worker_timeout`.
 
 Each `http_started`, `http_finished`, and `http_cancelled` record also includes
 `active_requests` and `oldest_active_request_ms`. The latter is recomputed from the
 requests that are still active, so it can be correlated with client-side stream/resume
 failures without persisting MCP payloads or session secrets.
 
-Check `scheduler_deadline_stage` to see whether it expired in `queue` or during
-`execution`. Once execution starts, the worker continues to own its slot until the
-operation actually ends, including after client disconnection or response timeout.
+Check `scheduler_deadline_stage` to see whether the deadline expired before the
+blocking task started (`queue`) or during `execution`. Work that already started
+continues to completion, including after client disconnection or response
+timeout.
 **A timeout does not prove that a command or write stopped.** Inspect the result
 or poll an existing command job before retrying. MCP `ping` stays independent of
-this scheduler and of the shared application-state lock, with normal MCP validation.
+this pipeline and of the shared application-state lock, with normal MCP validation.
 
 Browser calls wait at most two seconds for the serialized DevTools bridge.
 Writing to its stdin is limited to ten seconds; a request has a 120-second total

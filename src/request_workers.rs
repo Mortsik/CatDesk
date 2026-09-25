@@ -105,7 +105,8 @@ where
             },
         }),
         Ok(Err(_)) => {
-            let timing = observed_timing(&request_started, &dispatch_wait_ms, None);
+            let timing =
+                observed_timing(&request_started, dispatch_wait_ms.load(Ordering::Acquire), None);
             Err(TimedRequestError {
                 failure: RequestFailure::Failed,
                 timing,
@@ -114,14 +115,15 @@ where
         Err(_) => {
             // The join handle timed out, but the blocking task published its
             // dispatch timestamp when it started, so the timing still splits
-            // blocking-pool dispatch from real execution.
+            // blocking-pool dispatch from real execution. A single load decides
+            // both the stage and the split so they cannot disagree.
             let dispatch_ms = dispatch_wait_ms.load(Ordering::Acquire);
             let deadline_stage = if dispatch_ms == NOT_DISPATCHED {
                 RequestDeadlineStage::Queue
             } else {
                 RequestDeadlineStage::Execution
             };
-            let timing = observed_timing(&request_started, &dispatch_wait_ms, Some(deadline_stage));
+            let timing = observed_timing(&request_started, dispatch_ms, Some(deadline_stage));
             Err(TimedRequestError {
                 failure: RequestFailure::Deadline,
                 timing,
@@ -135,11 +137,11 @@ where
 /// elapsed time; otherwise the whole wait was blocking-pool dispatch.
 fn observed_timing(
     request_started: &Instant,
-    dispatch_wait_ms: &AtomicU64,
+    dispatch_ms: u64,
     deadline_stage: Option<RequestDeadlineStage>,
 ) -> RequestTiming {
     let total_ms = elapsed_ms(*request_started);
-    match dispatch_wait_ms.load(Ordering::Acquire) {
+    match dispatch_ms {
         NOT_DISPATCHED => RequestTiming {
             queue_wait_ms: total_ms,
             execution_ms: 0,
