@@ -16,6 +16,7 @@ mod mascot;
 mod mcp;
 mod request_workers;
 mod ngrok;
+mod perf_metrics;
 mod process_exit;
 mod process_runner;
 mod project_scope;
