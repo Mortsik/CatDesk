@@ -1,8 +1,18 @@
     use super::*;
+    use super::resources::{
+        CATDESK_WIDGET_HTML, INITIAL_MASCOT_OUTLINE_PLACEHOLDER,
+        INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER, INITIAL_TOOL_NAME_PLACEHOLDER,
+        REFRESH_CATDESK_IMAGE_PLACEHOLDER, REMOVE_CATDESK_IMAGE_PLACEHOLDER,
+        REENABLE_WIDGET_IMAGE_PLACEHOLDER, UI_TEMPLATE_URI, cached_data_uri,
+        current_widget_resource_uri_for_tool, handle_resources_read,
+        handle_resources_list_with_show_detail_mode, handle_resources_read_with_show_detail_mode,
+        handle_server_discover,
+    };
     use std::collections::HashMap;
-    use std::time::SystemTime;
+    use std::sync::OnceLock;
 
-    use crate::state::AppConfig;
+    use crate::perf_metrics;
+    use crate::perf_metrics::CacheKind;
     use super::token_usage::sanitize_result_for_turn_token_count;
     use super::agents_state::cached_file_value;
 
@@ -91,7 +101,7 @@
 
     #[test]
     fn metadata_cache_counts_hits_and_misses_for_perf_metrics() {
-        use crate::perf_metrics;
+        use crate::perf_metrics::CacheKind;
 
         let root =
             std::env::temp_dir().join(format!("catdesk-mcp-cache-counters-{}", Uuid::new_v4()));
