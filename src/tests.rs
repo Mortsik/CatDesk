@@ -1,6 +1,6 @@
-    use super::state::{AppState, ToolMode, UiLanguage};
+    use super::state::{AppState, ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle};
     use super::{
-        draw_mode_select, draw_settings,
+        draw_mode_select,
         draw_tui_header, draw_ui, format_session_duration,
         normalize_ngrok_authtoken_input, pad_right_to_cell_width, parse_terminal_profile_choice,
         redraw_due, trim_line,
@@ -8,6 +8,7 @@
     use crate::state::FlowDirection;
     use crate::tui::text::terminal_cell_width;
     use crate::tui::connector_notice::draw_chatgpt_connector_refresh_notice;
+    use crate::tui::settings::draw_settings;
     use crate::tui::flow::flow_phase_lines;
     use crate::tui::logs::{
         LogView, export_logs_to_dir, format_log_export_filename, localize_log_message,
@@ -105,13 +106,13 @@
                     frame,
                     &theme,
                     ToolMode::MultiTools,
-                    super::ShowDetailMode::Expanded,
-                    super::WidgetCornerStyle::Rounded,
+                    crate::state::ShowDetailMode::Expanded,
+                    WidgetCornerStyle::Rounded,
                     UiLanguage::TraditionalChinese,
                     false,
                     "test-slug",
                     None,
-                    &super::UsageTotals::default(),
+                    &UsageTotals::default(),
                     0,
                     false,
                 )
@@ -1027,7 +1028,7 @@
 
         let disabled = flow_phase_lines(
             None,
-            super::ShowDetailMode::Disable,
+            crate::state::ShowDetailMode::Disable,
             &palette,
             status_style,
             UiLanguage::English,
@@ -1035,7 +1036,7 @@
         );
         let expanded = flow_phase_lines(
             None,
-            super::ShowDetailMode::Expanded,
+            crate::state::ShowDetailMode::Expanded,
             &palette,
             status_style,
             UiLanguage::English,
@@ -1043,7 +1044,7 @@
         );
         let collapsed = flow_phase_lines(
             None,
-            super::ShowDetailMode::Collapsed,
+            crate::state::ShowDetailMode::Collapsed,
             &palette,
             status_style,
             UiLanguage::English,
@@ -1060,7 +1061,7 @@
         let palette = super::theme::all()[0].palette;
         let lines = flow_phase_lines(
             None,
-            super::ShowDetailMode::Expanded,
+            crate::state::ShowDetailMode::Expanded,
             &palette,
             ratatui::style::Style::default(),
             UiLanguage::TraditionalChinese,

@@ -4,6 +4,7 @@ pub(crate) mod ngrok_setup;
 pub(crate) mod clipboard;
 pub(crate) mod flow;
 pub(crate) mod logs;
+pub(crate) mod settings;
 pub(crate) mod text;
 
 pub(crate) use connector_notice::{run_chatgpt_connector_refresh_notice};
@@ -26,6 +27,7 @@ pub(crate) use logs::{
     post_mcp_path,
     secret_log_copy_value, wrap_log_message,
 };
+pub(crate) use settings::run_settings;
 pub(crate) use text::{
     format_average_usage_cost_usd, format_cost_estimate_usd, format_session_duration,
     format_token_compact, format_usd_compact, mcp_url_reveal_bar_segments,
