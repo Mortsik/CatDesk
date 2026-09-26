@@ -9,13 +9,18 @@
         handle_server_discover,
     };
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::OnceLock;
 
     use crate::mascot;
+    use crate::command_jobs::{CommandJobSnapshot, CommandJobState};
     use crate::perf_metrics;
     use crate::perf_metrics::CacheKind;
     use super::token_usage::sanitize_result_for_turn_token_count;
     use super::agents_state::cached_file_value;
+    use super::commands::{
+        change_scope_for_request, command_job_output_text, handle_poll_command,
+    };
     use super::instruction::{
         CATDESK_INSTRUCTION_REQUIRED_CODE, CATDESK_INSTRUCTION_REQUIRED_MESSAGE,
         CATDESK_INSTRUCTION_REQUIRED_WIDGET_MESSAGE, catdesk_instruction_required_response_with_show_detail_mode,
