@@ -1,6 +1,6 @@
     use super::state::{AppState, ToolMode, UiLanguage};
     use super::{
-        draw_chatgpt_connector_refresh_notice, draw_mode_select, draw_settings,
+        draw_mode_select, draw_settings,
         draw_tui_header, draw_ui, format_session_duration,
         key_is_clipboard_paste,
         normalize_ngrok_authtoken_input, pad_right_to_cell_width, parse_terminal_profile_choice,
@@ -8,6 +8,7 @@
     };
     use crate::state::FlowDirection;
     use crate::tui::text::terminal_cell_width;
+    use crate::tui::connector_notice::draw_chatgpt_connector_refresh_notice;
     use crate::tui::flow::flow_phase_lines;
     use crate::tui::logs::{
         LogView, export_logs_to_dir, format_log_export_filename, localize_log_message,
