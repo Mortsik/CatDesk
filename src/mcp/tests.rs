@@ -8,6 +8,7 @@
         handle_resources_list_with_show_detail_mode, handle_resources_read_with_show_detail_mode,
         handle_server_discover,
     };
+    use base64::Engine as _;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -18,6 +19,7 @@
     use crate::perf_metrics::CacheKind;
     use super::token_usage::sanitize_result_for_turn_token_count;
     use super::agents_state::cached_file_value;
+    use super::file_tools::handle_create_handoff_for_project;
     use super::commands::{
         change_scope_for_request, command_job_output_text, handle_poll_command,
     };

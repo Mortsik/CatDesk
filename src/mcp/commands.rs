@@ -21,10 +21,8 @@ use crate::mcp::jsonrpc::{
     tool_error_response_with_structured, tool_name_from_request,
     tool_success_response_with_structured,
 };
-use crate::mcp::{
-    optional_string_argument, read_only_blocked_response, required_string_argument,
-    tool_is_read_only,
-};
+use crate::mcp::file_tools::{optional_string_argument, required_string_argument};
+use crate::mcp::{read_only_blocked_response, tool_is_read_only};
 
 pub(crate) async fn forward_to_devtools(
     req: &JsonRpcRequest,
