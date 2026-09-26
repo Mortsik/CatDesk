@@ -38,8 +38,10 @@
 這就是 CatDesk 的核心概念！它讓 ChatGPT Web 擁有 `write`、`run_command` 等工具，可以直接修改你電腦上的檔案。
 
 <p align="center">
-  <img src="docs/images/thinking_usage_limits.png" alt="ChatGPT reasoning usage limits for GPT-5.5 and GPT-5.6" width="900"><br>
-  <em>GPT-5.5：<a href="https://web.archive.org/web/20260519111010/https://help.openai.com/en/articles/11909943-gpt-55-in-chatgpt">每週 3,000 則訊息</a>，GPT-5.6：<a href="https://help.openai.com/en/articles/20001354-gpt-56-in-chatgpt">未知</a>，但我們從來沒有撞到上限</em>
+  <img src="docs/images/thinking_usage_limits.png" alt="ChatGPT reasoning usage limits for GPT-5.5, GPT-5.6 and GPT-6" width="900"><br>
+  <em>GPT-5.5：<a href="https://web.archive.org/web/20260519111010/https://help.openai.com/en/articles/11909943-gpt-55-in-chatgpt">每週 3,000 則訊息</a><br>
+  GPT-5.6：<a href="https://web.archive.org/web/20260710134918/https://help.openai.com/en/articles/20001354-gpt-56-in-chatgpt">「現有 ChatGPT 額度限制」</a>，實際上限不明，但我們從來沒有撞到上限<br>
+  GPT-6 Astra：<a href="https://web.archive.org/web/20260916192117/https://help.openai.com/en/articles/20001354-gpt-56-and-gpt-6-pro-in-chatgpt">Plus 使用者目前無法在 Chat mode 使用</a></em>
 </p>
 
 # 原理是什麼？
@@ -101,7 +103,7 @@ ChatGPT Web + CatDesk
 1. 用 npm 全域安裝 CatDesk。
 
    ```bash
-   npm install -g catdesk
+   npm i -g catdesk --allow-scripts=catdesk
    ```
 
 2. 在任意終端機目錄執行 CatDesk。

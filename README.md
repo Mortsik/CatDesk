@@ -38,8 +38,10 @@ Here's the solution: most people with a Plus subscription do not use even 10% of
 That's the idea behind CatDesk! It gives ChatGPT Web tools like `write` and `run_command` to edit files on your computer.
 
 <p align="center">
-  <img src="docs/images/thinking_usage_limits.png" alt="ChatGPT reasoning usage limits for GPT-5.5 and GPT-5.6" width="900"><br>
-  <em>GPT-5.5: <a href="https://web.archive.org/web/20260519111010/https://help.openai.com/en/articles/11909943-gpt-55-in-chatgpt">3,000 messages/week</a>, GPT-5.6: <a href="https://help.openai.com/en/articles/20001354-gpt-56-in-chatgpt">unknown</a> but we have never hit the limit</em>
+  <img src="docs/images/thinking_usage_limits.png" alt="ChatGPT reasoning usage limits for GPT-5.5, GPT-5.6 and GPT-6" width="900"><br>
+  <em>GPT-5.5: <a href="https://web.archive.org/web/20260519111010/https://help.openai.com/en/articles/11909943-gpt-55-in-chatgpt">3,000 messages/week</a><br>
+  GPT-5.6: <a href="https://web.archive.org/web/20260710134918/https://help.openai.com/en/articles/20001354-gpt-56-in-chatgpt">"existing ChatGPT limits"</a>, unclear but we have never hit the limit<br>
+  GPT-6 Astra: <a href="https://web.archive.org/web/20260916192117/https://help.openai.com/en/articles/20001354-gpt-56-and-gpt-6-pro-in-chatgpt">not available for Plus in Chat mode</a></em>
 </p>
 
 # How does this work?
@@ -104,7 +106,7 @@ If you don't want to use CatDesk, here are some similar projects you can try:
 1. Install CatDesk globally with npm.
 
    ```bash
-   npm install -g catdesk
+   npm i -g catdesk --allow-scripts=catdesk
    ```
 
 2. Run CatDesk from any terminal directory.
