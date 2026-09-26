@@ -9,6 +9,10 @@
         handle_server_discover,
     };
     use base64::Engine as _;
+
+    use crate::command;
+    use crate::handoff;
+    use crate::workspace_tools;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -20,6 +24,7 @@
     use super::token_usage::{TokenUsage, sanitize_result_for_turn_token_count};
     use super::agents_state::cached_file_value;
     use super::file_tools::handle_create_handoff_for_project;
+    use super::tool_catalog::handle_tools_list;
     use super::widget::{
         attach_tool_call_count, attach_turn_token_usage, base_widget_payload_with_show_detail_mode,
         build_command_job_widget_payload, build_list_files_widget_payload_from_structured,
