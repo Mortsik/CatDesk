@@ -1,3 +1,4 @@
+pub(crate) mod browser_select;
 pub(crate) mod chrome;
 pub(crate) mod connector_notice;
 pub(crate) mod ngrok_setup;
@@ -9,6 +10,10 @@ pub(crate) mod text;
 
 pub(crate) use connector_notice::{run_chatgpt_connector_refresh_notice};
 pub(crate) use ngrok_setup::{run_ngrok_auth_setup, run_ngrok_domain_setup};
+pub(crate) use browser_select::{
+    draw_browser_select, find_available_remote_debug_port, mode_is_browser_enabled,
+    run_browser_select, sanitize_for_filename,
+};
 pub(crate) use chrome::{
     centered_rect, draw_mode_select, draw_tui_header, render_toast,
 };

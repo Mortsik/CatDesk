@@ -10,7 +10,7 @@ use crate::state::{
     save_ngrok_authtoken, save_ngrok_domain,
 };
 use crate::theme;
-use crate::selected_supported_browser_idx;
+use crate::tui::browser_select::selected_supported_browser_idx;
 use crate::normalize_ngrok_authtoken_input;
 use crate::tui::clipboard::{clipboard_paste, key_is_clipboard_paste, text_input_key_is_cancel};
 use crate::draw_browser_select;
