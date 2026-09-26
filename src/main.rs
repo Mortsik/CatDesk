@@ -25,6 +25,8 @@ mod session_context;
 mod startup;
 mod state;
 mod theme;
+mod tui;
+
 mod usage_persistence;
 mod usage_pricing;
 mod vision;
@@ -52,6 +54,13 @@ use state::{
     local_now, save_macos_terminal_profile, save_ngrok_authtoken, save_ngrok_domain,
     save_widget_corner_style, user_home_dir,
 };
+use unicode_width::UnicodeWidthChar;
+use tui::{
+    format_average_usage_cost_usd, format_cost_estimate_usd, format_session_duration,
+    format_token_compact, format_usd_compact, mcp_url_reveal_bar_segments,
+    mcp_url_reveal_seconds, pad_right_to_cell_width, session_cost_rates, terminal_cell_width,
+    trim_line,
+};
 use std::collections::HashMap;
 use std::io::{Write, stdout};
 use std::sync::Arc;
@@ -60,7 +69,6 @@ use tokio::sync::{
     Mutex,
     mpsc::{Receiver, Sender, channel},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
 const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
@@ -78,10 +86,8 @@ const MCP_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓�
 const MCP_PATH_MASK: &str = "/▓▓▓▓▓▓▓▓/mcp";
 const NGROK_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓";
 const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
-const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
 const STATUS_LABEL_WIDTH: usize = 13;
-const PRICE_DISPLAY_DECIMALS: usize = 6;
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
 const CHATGPT_CONNECTOR_SETTINGS_URL: &str = "https://chatgpt.com/apps#settings/Connectors";
 const CHATGPT_PLUGIN_SETTINGS_URL: &str = "https://chatgpt.com/#settings/Plugins";
@@ -268,119 +274,6 @@ fn flow_lane_spans(
     }
     spans.push(Span::raw(" "));
     spans
-}
-
-fn terminal_cell_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
-}
-
-fn pad_right_to_cell_width(text: &str, width: usize) -> String {
-    format!(
-        "{text}{}",
-        " ".repeat(width.saturating_sub(terminal_cell_width(text)))
-    )
-}
-
-fn trim_line(text: &str, max_cells: usize) -> String {
-    if terminal_cell_width(text) <= max_cells {
-        return text.to_string();
-    }
-    if max_cells <= 3 {
-        return ".".repeat(max_cells);
-    }
-
-    let target_width = max_cells - 3;
-    let mut kept = String::new();
-    let mut width = 0usize;
-    for ch in text.chars() {
-        let ch_width = ch.width().unwrap_or(0);
-        if width.saturating_add(ch_width) > target_width {
-            break;
-        }
-        kept.push(ch);
-        width = width.saturating_add(ch_width);
-    }
-    format!("{kept}...")
-}
-
-fn format_session_duration(duration: Duration) -> String {
-    let total_seconds = duration.as_secs();
-    if total_seconds < 60 {
-        return format!("{total_seconds}s");
-    }
-
-    let minutes = total_seconds / 60;
-    if minutes < 60 {
-        return format!("{}m {}s", minutes, total_seconds % 60);
-    }
-
-    format!("{}h {}m", minutes / 60, minutes % 60)
-}
-
-fn format_token_compact(value: u64) -> String {
-    if value < 1_000 {
-        return value.to_string();
-    }
-
-    let (unit, suffix) = if value >= 1_000_000_000 {
-        (1_000_000_000.0, "B")
-    } else if value >= 1_000_000 {
-        (1_000_000.0, "M")
-    } else {
-        (1_000.0, "K")
-    };
-    let scaled = value as f64 / unit;
-    let decimals = if scaled >= 100.0 { 0 } else { 1 };
-    let formatted = format!("{scaled:.prec$}", prec = decimals);
-    format!("{}{}", formatted.trim_end_matches(".0"), suffix)
-}
-
-/// Renders usage cost with an explicit unpriced tail: `$X` when every bucket is
-/// priced, `$X +N/A` when some buckets have no registry entry, `N/A` when nothing
-/// could be priced, and `$0` when no usage was recorded at all. Chosen over a bare
-/// `$X*` marker because the status panel has no legend line to explain it.
-fn format_cost_estimate_usd(estimate: usage_pricing::CostEstimate) -> String {
-    if estimate.priced_usd > 0.0 {
-        if estimate.unpriced_tokens == 0 {
-            format!("${}", format_usd_compact(estimate.priced_usd))
-        } else {
-            format!("${} +N/A", format_usd_compact(estimate.priced_usd))
-        }
-    } else if estimate.is_unpriced() {
-        "N/A".to_string()
-    } else {
-        "$0".to_string()
-    }
-}
-
-/// Average cost per call or per day, priced over `count` units of the matching
-/// metric. Averages only cover the priced part; the unpriced tail (if any) keeps
-/// the `+N/A` marker so a partially priced map never reads as fully billed.
-fn format_average_usage_cost_usd(estimate: usage_pricing::CostEstimate, count: u64) -> String {
-    if count == 0 {
-        return "$0".to_string();
-    }
-    format_cost_estimate_usd(usage_pricing::CostEstimate {
-        priced_usd: estimate.priced_usd / count as f64,
-        unpriced_tokens: u64::from(estimate.unpriced_tokens > 0),
-    })
-}
-
-fn format_usd_compact(usd: f64) -> String {
-    let formatted = format!("{usd:.prec$}", prec = PRICE_DISPLAY_DECIMALS);
-    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() {
-        "0".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn mcp_url_reveal_seconds(remaining: Duration) -> u64 {
-    remaining
-        .as_millis()
-        .div_ceil(1_000)
-        .min(MCP_URL_REVEAL_DURATION.as_secs() as u128) as u64
 }
 
 fn post_mcp_path(message: &str) -> Option<&str> {
@@ -721,27 +614,6 @@ fn export_logs_to_dir(
 
 fn export_logs(logs: &[LogEntry]) -> std::io::Result<std::path::PathBuf> {
     export_logs_to_dir(logs, &user_home_dir()?.join(".catdesk").join("logs"))
-}
-
-fn mcp_url_reveal_bar_segments(remaining: Duration) -> (String, String) {
-    let total_millis = MCP_URL_REVEAL_DURATION.as_millis();
-    let remaining_millis = remaining.as_millis().min(total_millis);
-    let lit = remaining_millis
-        .saturating_mul(MCP_URL_REVEAL_BAR_CELLS as u128)
-        .div_ceil(total_millis) as usize;
-    (
-        "━".repeat(lit.min(MCP_URL_REVEAL_BAR_CELLS)),
-        "─".repeat(MCP_URL_REVEAL_BAR_CELLS.saturating_sub(lit)),
-    )
-}
-
-fn session_cost_rates(cost_usd: f64, elapsed: Duration) -> (f64, f64) {
-    let elapsed_secs = elapsed.as_secs_f64();
-    if elapsed_secs <= 0.0 {
-        return (0.0, 0.0);
-    }
-    let cost_per_min_usd = cost_usd * 60.0 / elapsed_secs;
-    (cost_per_min_usd, cost_per_min_usd * 60.0)
 }
 
 fn flow_lane_left_label(ui_language: UiLanguage) -> &'static str {
