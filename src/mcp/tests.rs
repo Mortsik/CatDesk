@@ -11,10 +11,17 @@
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
+    use crate::mascot;
     use crate::perf_metrics;
     use crate::perf_metrics::CacheKind;
     use super::token_usage::sanitize_result_for_turn_token_count;
     use super::agents_state::cached_file_value;
+    use super::instruction::{
+        CATDESK_INSTRUCTION_REQUIRED_CODE, CATDESK_INSTRUCTION_REQUIRED_MESSAGE,
+        CATDESK_INSTRUCTION_REQUIRED_WIDGET_MESSAGE, catdesk_instruction_required_response_with_show_detail_mode,
+        catdesk_instruction_structured, catdesk_instruction_text, catdesk_instruction_text_for_project,
+        catdesk_instruction_widget_payload_with_cards, handle_catdesk_instruction_with_show_detail_mode,
+    };
 
     /// `git` is resolved through `PATH` at spawn time and `PATH` is
     /// process-global: linux_sandbox tests rewrite it while they run, which
