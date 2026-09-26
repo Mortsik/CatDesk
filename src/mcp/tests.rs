@@ -3283,6 +3283,101 @@
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[tokio::test]
+    async fn read_tool_mixed_batch_stays_a_success_without_text_content() {
+        let workspace_root = read_workspace("mixed-batch");
+        std::fs::write(workspace_root.join("notes.txt"), "hello world\n").expect("write file");
+
+        let req = tool_call_request("read", json!({ "paths": ["notes.txt", "missing.txt"] }));
+        let response = handle_tools_call(
+            &req,
+            &workspace_root.to_string_lossy(),
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+
+        // A partially-successful batch is not a failed call: per-entry errors
+        // belong to structuredContent.files[], not to the call-level error
+        // channel, so no text content is attached.
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_no_text_content(&response);
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+        assert_eq!(
+            structured["files"][0]["text"].as_str(),
+            Some("hello world\n")
+        );
+        assert!(
+            structured["files"][1]["error"].as_str().is_some(),
+            "the failed entry must still report its error: {structured}"
+        );
+
+        let _ = std::fs::remove_file(workspace_root.join("notes.txt"));
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn read_tool_success_batch_keeps_content_empty() {
+        let workspace_root = read_workspace("success-batch");
+        std::fs::write(workspace_root.join("alpha.txt"), "alpha\n").expect("write file");
+        std::fs::write(workspace_root.join("beta.txt"), "beta\n").expect("write file");
+
+        let req = tool_call_request("read", json!({ "paths": ["alpha.txt", "beta.txt"] }));
+        let response = handle_tools_call(
+            &req,
+            &workspace_root.to_string_lossy(),
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_no_text_content(&response);
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+        for (index, expected) in ["alpha\n", "beta\n"].iter().enumerate() {
+            assert_eq!(structured["files"][index]["text"].as_str(), Some(*expected));
+            assert!(
+                structured["files"][index].get("error").is_none()
+                    || structured["files"][index]["error"].is_null(),
+                "successful entries must not carry errors: {structured}"
+            );
+        }
+
+        let _ = std::fs::remove_file(workspace_root.join("alpha.txt"));
+        let _ = std::fs::remove_file(workspace_root.join("beta.txt"));
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     async fn read_batch(workspace_root: &Path, paths: Value) -> Value {
         let req = tool_call_request("read", json!({ "paths": paths }));
         handle_tools_call(
