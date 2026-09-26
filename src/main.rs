@@ -46,11 +46,11 @@ use ratatui::{
 };
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
-    GPT_5_6_AND_EARLIER_USAGE_BUCKET, LIVE_USAGE_WINDOW_MS, LogEntry, Mode, ServerUiEvent,
-    SharedState, ShowDetailMode, ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle,
-    app_config_path, flow_anim_lit_count, load_app_config, load_macos_terminal_profile,
-    load_ngrok_authtoken, load_ngrok_domain, local_now, save_macos_terminal_profile,
-    save_ngrok_authtoken, save_ngrok_domain, save_widget_corner_style, user_home_dir,
+    LIVE_USAGE_WINDOW_MS, LogEntry, Mode, ServerUiEvent, SharedState, ShowDetailMode, ToolMode,
+    UiLanguage, UsageTotals, WidgetCornerStyle, app_config_path, flow_anim_lit_count,
+    load_app_config, load_macos_terminal_profile, load_ngrok_authtoken, load_ngrok_domain,
+    local_now, save_macos_terminal_profile, save_ngrok_authtoken, save_ngrok_domain,
+    save_widget_corner_style, user_home_dir,
 };
 use std::collections::HashMap;
 use std::io::{Write, stdout};
@@ -81,8 +81,6 @@ const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
 const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
 const STATUS_LABEL_WIDTH: usize = 13;
-const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
-const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
 const CHATGPT_CONNECTOR_SETTINGS_URL: &str = "https://chatgpt.com/apps#settings/Connectors";
@@ -337,26 +335,35 @@ fn format_token_compact(value: u64) -> String {
     format!("{}{}", formatted.trim_end_matches(".0"), suffix)
 }
 
-fn estimate_gpt_5_6_and_earlier_usage_cost_usd(usage: &UsageTotals) -> f64 {
-    (usage.tool_input_tokens as f64 * GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M
-        + usage.tool_output_tokens as f64 * GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M)
-        / 1_000_000.0
+/// Renders usage cost with an explicit unpriced tail: `$X` when every bucket is
+/// priced, `$X +N/A` when some buckets have no registry entry, `N/A` when nothing
+/// could be priced, and `$0` when no usage was recorded at all. Chosen over a bare
+/// `$X*` marker because the status panel has no legend line to explain it.
+fn format_cost_estimate_usd(estimate: usage_pricing::CostEstimate) -> String {
+    if estimate.priced_usd > 0.0 {
+        if estimate.unpriced_tokens == 0 {
+            format!("${}", format_usd_compact(estimate.priced_usd))
+        } else {
+            format!("${} +N/A", format_usd_compact(estimate.priced_usd))
+        }
+    } else if estimate.is_unpriced() {
+        "N/A".to_string()
+    } else {
+        "$0".to_string()
+    }
 }
 
-fn estimate_usage_by_model_cost_usd(
-    usage_by_model: &std::collections::BTreeMap<String, UsageTotals>,
-) -> f64 {
-    usage_by_model
-        .iter()
-        .map(|(bucket, usage)| match bucket.as_str() {
-            GPT_5_6_AND_EARLIER_USAGE_BUCKET => estimate_gpt_5_6_and_earlier_usage_cost_usd(usage),
-            _ => panic!("missing pricing for usage bucket `{bucket}`"),
-        })
-        .sum()
-}
-
-fn estimate_all_time_usage_cost_usd(app: &AppState) -> f64 {
-    estimate_usage_by_model_cost_usd(&app.usage_by_model)
+/// Average cost per call or per day, priced over `count` units of the matching
+/// metric. Averages only cover the priced part; the unpriced tail (if any) keeps
+/// the `+N/A` marker so a partially priced map never reads as fully billed.
+fn format_average_usage_cost_usd(estimate: usage_pricing::CostEstimate, count: u64) -> String {
+    if count == 0 {
+        return "$0".to_string();
+    }
+    format_cost_estimate_usd(usage_pricing::CostEstimate {
+        priced_usd: estimate.priced_usd / count as f64,
+        unpriced_tokens: u64::from(estimate.unpriced_tokens > 0),
+    })
 }
 
 fn format_usd_compact(usd: f64) -> String {
@@ -747,7 +754,11 @@ fn flow_call_offset(text: &str, left_label: &str) -> String {
     " ".repeat(terminal_cell_width(left_label) + centered_in_lane)
 }
 
-fn flow_turn_usage_spans(flow: &FlowLane, palette: &theme::Palette) -> Vec<Span<'static>> {
+fn flow_turn_usage_spans(
+    flow: &FlowLane,
+    ui_language: UiLanguage,
+    palette: &theme::Palette,
+) -> Vec<Span<'static>> {
     let label_style = Style::default().fg(palette.muted_fg);
     let value_style = Style::default()
         .fg(palette.secondary_fg)
@@ -755,24 +766,36 @@ fn flow_turn_usage_spans(flow: &FlowLane, palette: &theme::Palette) -> Vec<Span<
     let price_style = Style::default()
         .fg(palette.success_fg)
         .add_modifier(Modifier::BOLD);
+    let request_label = ui_language.text("↓REQ", "↓請求");
+    let response_label = ui_language.text("↑RES", "↑回應");
 
     match flow.turn_usage.as_ref() {
         Some(usage) => {
             let input = format_token_compact(usage.tool_input_tokens);
             let output = format_token_compact(usage.tool_output_tokens);
-            let cost = format_usd_compact(estimate_gpt_5_6_and_earlier_usage_cost_usd(usage));
+            // Flow usage is always freshly recorded turns, priced at the fallback
+            // estimate until per-turn model metadata exists.
+            let cost = format_usd_compact(usage_pricing::estimate_usage_cost_usd(
+                usage,
+                &usage_pricing::FALLBACK_MODEL_PRICING,
+            ));
             vec![
-                Span::styled("↓", label_style),
+                Span::styled(request_label, label_style),
+                Span::raw(" "),
                 Span::styled(input, value_style),
                 Span::raw(" "),
-                Span::styled("↑", label_style),
+                Span::styled(response_label, label_style),
+                Span::raw(" "),
                 Span::styled(output, value_style),
                 Span::raw(" "),
                 Span::styled("$", label_style),
                 Span::styled(cost, price_style),
             ]
         }
-        None => vec![Span::styled("↓-- ↑-- $--", label_style)],
+        None => vec![Span::styled(
+            ui_language.text("↓REQ -- ↑RES -- $--", "↓請求 -- ↑回應 -- $--"),
+            label_style,
+        )],
     }
 }
 
@@ -3149,6 +3172,8 @@ mod tests {
             "DAYS 2",
             "AVG $4/day",
             "TOKENS 60s",
+            "↓REQ",
+            "↑RES",
             "SYSTEM",
         ] {
             assert!(
@@ -3235,6 +3260,166 @@ mod tests {
     }
 
     #[test]
+    fn main_dashboard_renders_unknown_usage_bucket_without_panicking() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-main-unknown-bucket-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let config_path = workspace.join("config.toml");
+        let mut app =
+            AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+                .expect("create app");
+
+        // A model bucket with no registry entry: nothing can be priced, the draw
+        // below must render instead of panicking.
+        app.usage_by_model
+            .entry("model:gpt-9-future".to_string())
+            .or_default()
+            .accumulate(1_000_000, 1_000_000, 2);
+
+        let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
+        let mut log_view = None;
+        let revealed_logs = HashMap::new();
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    &app,
+                    0,
+                    Duration::from_secs(120),
+                    0,
+                    true,
+                    &mut log_view,
+                    None,
+                    None,
+                    &revealed_logs,
+                )
+            })
+            .expect("unknown usage buckets must not panic the dashboard");
+
+        let text = terminal_buffer_text(&terminal);
+        let total_line = text
+            .lines()
+            .find(|line| line.contains("COST TOTAL"))
+            .expect("COST TOTAL line");
+        assert!(total_line.contains("SPENT N/A"), "{total_line}");
+        assert!(!total_line.contains('$'), "{total_line}");
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn main_dashboard_marks_partially_priced_usage_with_unpriced_tail() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-main-mixed-pricing-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let config_path = workspace.join("config.toml");
+        let mut app =
+            AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+                .expect("create app");
+
+        // Legacy history prices at $65; the unknown future model adds unpriced
+        // tokens that must surface as a "+N/A" tail instead of vanishing.
+        app.usage_by_model
+            .entry(super::state::GPT_5_6_AND_EARLIER_USAGE_BUCKET.to_string())
+            .or_default()
+            .accumulate(2_000_000, 1_000_000, 3);
+        app.usage_by_model
+            .entry("model:gpt-9-future".to_string())
+            .or_default()
+            .accumulate(4_000_000, 4_000_000, 2);
+
+        let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
+        let mut log_view = None;
+        let revealed_logs = HashMap::new();
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    &app,
+                    0,
+                    Duration::from_secs(120),
+                    0,
+                    true,
+                    &mut log_view,
+                    None,
+                    None,
+                    &revealed_logs,
+                )
+            })
+            .expect("draw mixed pricing dashboard");
+
+        let text = terminal_buffer_text(&terminal);
+        let total_line = text
+            .lines()
+            .find(|line| line.contains("COST TOTAL"))
+            .expect("COST TOTAL line");
+        assert!(total_line.contains("SPENT $65 +N/A"), "{total_line}");
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn main_dashboard_combines_priced_model_buckets_into_one_total() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-main-combined-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let config_path = workspace.join("config.toml");
+        let mut app =
+            AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+                .expect("create app");
+
+        // Historic legacy usage ($65) plus current unattributed turns ($5): both
+        // buckets are priced, so the total sums them without any N/A tail.
+        app.usage_by_model
+            .entry(super::state::GPT_5_6_AND_EARLIER_USAGE_BUCKET.to_string())
+            .or_default()
+            .accumulate(2_000_000, 1_000_000, 3);
+        app.usage_by_model
+            .entry(super::usage_pricing::FALLBACK_USAGE_BUCKET.to_string())
+            .or_default()
+            .accumulate(0, 1_000_000, 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
+        let mut log_view = None;
+        let revealed_logs = HashMap::new();
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    &app,
+                    0,
+                    Duration::from_secs(120),
+                    0,
+                    true,
+                    &mut log_view,
+                    None,
+                    None,
+                    &revealed_logs,
+                )
+            })
+            .expect("draw combined pricing dashboard");
+
+        let text = terminal_buffer_text(&terminal);
+        let total_line = text
+            .lines()
+            .find(|line| line.contains("COST TOTAL"))
+            .expect("COST TOTAL line");
+        assert!(total_line.contains("SPENT $70"), "{total_line}");
+        assert!(!total_line.contains("N/A"), "{total_line}");
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn main_dashboard_renders_only_latest_active_flow_row() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3297,7 +3482,7 @@ mod tests {
             "normal status must collapse all active flows into one dashboard row: {flow_rows:?}"
         );
         let row = flow_rows[0];
-        for expected in ["ChatGPT Web", "search", "↓12", "↑345"] {
+        for expected in ["ChatGPT Web", "search", "↓REQ 12", "↑RES 345"] {
             assert!(
                 row.contains(expected),
                 "latest flow row missing {expected}: {row}"
@@ -5839,19 +6024,26 @@ fn draw_ui(
     let flow_block_lines = 1;
 
     let rolling_usage_totals = app.rolling_usage_totals(now_millis, LIVE_USAGE_WINDOW_MS);
-    let rolling_usage_cost_usd = estimate_gpt_5_6_and_earlier_usage_cost_usd(&rolling_usage_totals);
+    // Rolling, session, and flow totals only ever hold freshly recorded turns, so
+    // the fallback estimate is the applicable rate for them.
+    let rolling_usage_cost_usd = usage_pricing::estimate_usage_cost_usd(
+        &rolling_usage_totals,
+        &usage_pricing::FALLBACK_MODEL_PRICING,
+    );
     let (live_cost_per_min_usd, live_cost_per_hour_usd) = session_cost_rates(
         rolling_usage_cost_usd,
         Duration::from_millis(LIVE_USAGE_WINDOW_MS as u64),
     );
-    let session_usage_cost_usd =
-        estimate_gpt_5_6_and_earlier_usage_cost_usd(&app.session_usage_totals);
+    let session_usage_cost_usd = usage_pricing::estimate_usage_cost_usd(
+        &app.session_usage_totals,
+        &usage_pricing::FALLBACK_MODEL_PRICING,
+    );
     let (_session_cost_per_min_usd, session_cost_per_hour_usd) =
         session_cost_rates(session_usage_cost_usd, session_elapsed);
-    let all_time_usage_cost_usd = estimate_all_time_usage_cost_usd(app);
+    let all_time_usage_cost = usage_pricing::estimate_usage_by_model_cost(&app.usage_by_model);
     let today_usage_by_model = app.today_usage_by_model();
-    let today_usage_cost_usd = today_usage_by_model
-        .map(estimate_usage_by_model_cost_usd)
+    let today_usage_cost = today_usage_by_model
+        .map(usage_pricing::estimate_usage_by_model_cost)
         .unwrap_or_default();
     let today_tool_call_count = today_usage_by_model
         .map(|usage_by_model| {
@@ -5861,22 +6053,16 @@ fn draw_ui(
                 .sum::<u64>()
         })
         .unwrap_or_default();
-    let today_average_cost_per_call_usd = if today_tool_call_count == 0 {
-        0.0
-    } else {
-        today_usage_cost_usd / today_tool_call_count as f64
-    };
     let tracked_usage_day_count = app.tracked_usage_day_count();
-    let tracked_daily_usage_cost_usd = app
+    let tracked_daily_usage_cost = app
         .daily_usage_by_model
         .values()
-        .map(estimate_usage_by_model_cost_usd)
-        .sum::<f64>();
-    let tracked_average_cost_per_day_usd = if tracked_usage_day_count == 0 {
-        0.0
-    } else {
-        tracked_daily_usage_cost_usd / tracked_usage_day_count as f64
-    };
+        .map(usage_pricing::estimate_usage_by_model_cost)
+        .fold(usage_pricing::CostEstimate::default(), |mut total, day| {
+            total.priced_usd += day.priced_usd;
+            total.unpriced_tokens = total.unpriced_tokens.saturating_add(day.unpriced_tokens);
+            total
+        });
     let muted_style = Style::default().fg(palette.muted_fg);
     let value_style = Style::default()
         .fg(palette.secondary_fg)
@@ -5958,15 +6144,12 @@ fn draw_ui(
         Line::from(vec![
             status_label(ui_language.text("COST TODAY", "今日成本")),
             Span::styled(ui_language.text("SPENT ", "已花費 "), muted_style),
-            Span::styled(
-                format!("${}", format_usd_compact(today_usage_cost_usd)),
-                cost_style,
-            ),
+            Span::styled(format_cost_estimate_usd(today_usage_cost), cost_style),
             Span::styled(ui_language.text("      AVG ", "      平均 "), muted_style),
             Span::styled(
                 format!(
-                    "${}{}",
-                    format_usd_compact(today_average_cost_per_call_usd),
+                    "{}{}",
+                    format_average_usage_cost_usd(today_usage_cost, today_tool_call_count),
                     ui_language.text("/call", "/次")
                 ),
                 cost_style,
@@ -5977,16 +6160,13 @@ fn draw_ui(
         Line::from(vec![
             status_label(ui_language.text("COST TOTAL", "累計成本")),
             Span::styled(ui_language.text("SPENT ", "已花費 "), muted_style),
-            Span::styled(
-                format!("${}", format_usd_compact(all_time_usage_cost_usd)),
-                cost_style,
-            ),
+            Span::styled(format_cost_estimate_usd(all_time_usage_cost), cost_style),
         ]),
         Line::from(vec![
             status_label(ui_language.text("COST TRACKED", "追蹤成本")),
             Span::styled(ui_language.text("SPENT ", "已花費 "), muted_style),
             Span::styled(
-                format!("${}", format_usd_compact(tracked_daily_usage_cost_usd)),
+                format_cost_estimate_usd(tracked_daily_usage_cost),
                 cost_style,
             ),
             Span::styled(ui_language.text("      DAYS ", "      天數 "), muted_style),
@@ -5994,8 +6174,11 @@ fn draw_ui(
             Span::styled(ui_language.text("      AVG ", "      平均 "), muted_style),
             Span::styled(
                 format!(
-                    "${}{}",
-                    format_usd_compact(tracked_average_cost_per_day_usd),
+                    "{}{}",
+                    format_average_usage_cost_usd(
+                        tracked_daily_usage_cost,
+                        tracked_usage_day_count as u64,
+                    ),
                     ui_language.text("/day", "/天")
                 ),
                 cost_style,
@@ -6003,13 +6186,13 @@ fn draw_ui(
         ]),
         Line::from(vec![
             status_label(ui_language.text("TOKENS 60s", "Token 60秒")),
-            Span::styled("↓", muted_style),
+            Span::styled(ui_language.text("↓REQ", "↓請求"), muted_style),
             Span::styled(
                 format_token_compact(rolling_usage_totals.tool_input_tokens),
                 value_style,
             ),
             Span::raw("      "),
-            Span::styled("↑", muted_style),
+            Span::styled(ui_language.text("↑RES", "↑回應"), muted_style),
             Span::styled(
                 format_token_compact(rolling_usage_totals.tool_output_tokens),
                 value_style,
@@ -6081,7 +6264,7 @@ fn draw_ui(
             row.push(Span::raw("   "));
             row.push(Span::styled(call_text, flow_meta_style));
             row.push(Span::raw("   "));
-            row.extend(flow_turn_usage_spans(flow, &palette));
+            row.extend(flow_turn_usage_spans(flow, ui_language, &palette));
             status_lines.push(Line::from(row));
         }
     }

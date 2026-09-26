@@ -2861,6 +2861,10 @@ fn attach_turn_token_usage(result: &mut Value, usage: &TokenUsage) {
                 "inputTokens": usage.tool_input_tokens,
                 "outputTokens": usage.tool_output_tokens,
                 "totalTokens": usage.total_tokens,
+                // Direction markers: input = tool-call arguments the client sent
+                // (request), output = tool results returned to the client (response).
+                "inputRole": "request",
+                "outputRole": "response",
             }),
         );
     }
@@ -8898,6 +8902,22 @@ hello world"
                 .and_then(|entry| entry.get("totalTokens"))
                 .and_then(Value::as_u64),
             Some(168)
+        );
+        // Direction markers must ride along so clients never confuse the tool
+        // input/output axis with the request/response axis.
+        assert_eq!(
+            widget_payload
+                .get("turnTokenUsage")
+                .and_then(|entry| entry.get("inputRole"))
+                .and_then(Value::as_str),
+            Some("request")
+        );
+        assert_eq!(
+            widget_payload
+                .get("turnTokenUsage")
+                .and_then(|entry| entry.get("outputRole"))
+                .and_then(Value::as_str),
+            Some("response")
         );
         assert_eq!(
             widget_payload.get("toolCallCount").and_then(Value::as_u64),

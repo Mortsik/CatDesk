@@ -970,6 +970,10 @@ fn attach_history_usage(result: &mut Option<Value>, usage_totals: &UsageTotals) 
         "inputTokens": usage_totals.tool_input_tokens,
         "outputTokens": usage_totals.tool_output_tokens,
         "totalTokens": usage_totals.total_tokens,
+        // Direction markers: input = tool-call arguments the client sent
+        // (request), output = tool results returned to the client (response).
+        "inputRole": "request",
+        "outputRole": "response",
     });
     let history_tool_call_count = json!(usage_totals.tool_call_count);
     if let Some(widget_payload) = result_obj
@@ -2689,6 +2693,22 @@ mod tests {
                 .get("historyToolCallCount")
                 .and_then(Value::as_u64),
             Some(7)
+        );
+        // Direction markers must ride along so clients never confuse the tool
+        // input/output axis with the request/response axis.
+        assert_eq!(
+            widget_payload
+                .get("historyTurnTokenUsage")
+                .and_then(|usage| usage.get("inputRole"))
+                .and_then(Value::as_str),
+            Some("request")
+        );
+        assert_eq!(
+            widget_payload
+                .get("historyTurnTokenUsage")
+                .and_then(|usage| usage.get("outputRole"))
+                .and_then(Value::as_str),
+            Some("response")
         );
     }
 
