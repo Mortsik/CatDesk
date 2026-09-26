@@ -1,7 +1,11 @@
+pub(crate) mod clipboard;
 pub(crate) mod flow;
 pub(crate) mod logs;
 pub(crate) mod text;
 
+pub(crate) use clipboard::{
+    clipboard_copy, clipboard_paste, key_is_clipboard_paste, text_input_key_is_cancel,
+};
 pub(crate) use flow::{
     active_bootstrap_status_flow, build_animation_snapshot, flow_bootstrap_status_lines,
     flow_lane_left_label, flow_lane_spans,
