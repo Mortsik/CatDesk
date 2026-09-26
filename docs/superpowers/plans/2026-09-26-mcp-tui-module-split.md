@@ -107,3 +107,42 @@ never merged with others.
 3. `git show --color-moved=dimmed-zebra <sha>` — residuum is only mod/use/visibility.
 
 Commit bodies list the moved symbols and their old line ranges.
+
+## Verification results (2026-09-26, branch tip)
+
+Line counts (move plan -> outcome):
+
+- `src/mcp.rs` 9338 -> 491 (target ~700); + `src/mcp/`: jsonrpc 135, token_usage 77,
+  agents_state 249, resources 275, instruction 382, commands 794, file_tools 614,
+  widget 864, tool_catalog 686, tests 4980.
+- `src/main.rs` 6637 -> 1221 (target ~1400); + `src/tui/`: mod 27, text 142, logs 447,
+  flow 587, clipboard 145, chrome 259, connector_notice 374, ngrok_setup 636,
+  settings 705, browser_select 442, dashboard 718; `src/tests.rs` 1090.
+
+Green gates: `cargo test --offline` 487/487 after every stage; final `cargo test --release`
+487/487 (2.7 s); `cargo build --release` clean except the pre-existing
+`devtools::DevtoolsBridge::from_child` never-used warning (present at base).
+
+Clippy `--all-targets`: 106 lint warnings at base @3ce8af1, 106 at branch tip with an
+identical category distribution (43 collapsed_if, 7 too-many-arguments(8/7), 6 div_ceil,
+4 items_after_test_module, ...). Zero new lints introduced by the split; per plan none
+were fixed.
+
+Import graph: acyclic. mcp edges: jsonrpc<-token_usage<-{instruction,widget,resources},
+agents_state<-instruction, commands->{file_tools->instruction}, widget->commands, and all
+layers <- tool_catalog; root mcp.rs is the only hub (server.rs consumes only the planned
+re-exports: MODERN_MCP_PROTOCOL_VERSION, decorate_modern_result, JsonRpc*, WIDGET_PAYLOAD_
+META_KEY, is_catdesk_widget_resource_uri, handle_request_with_session,
+estimate_turn_token_counts, agents_widget_state_payload). tui edges point strictly
+downward (dashboard->flow/logs/chrome/text; ngrok_setup->browser_select/chrome/clipboard;
+chrome/text are leaves); no A<->B pairs.
+
+Test integrity: diff of `src/mcp/tests.rs` vs 0a (7e75548) and `src/tests.rs` vs 0b
+(411aae6) contains import-path and `super::X` -> `crate::tui::X` re-qualifications only;
+no assertion or test-body edits anywhere. The single planned content exception landed in
+M4: include_str!/include_bytes! paths prefixed `../widget/` inside src/mcp/resources.rs.
+
+Known flake note: one transient 486/487 run occurred during stage T5 verification
+(fully serial `workspace_tools` deadline test under parallel load); 3 consecutive full
+runs passed 487/487 right after, and the release run passed. Pre-existing timing
+sensitivity, unrelated to the move (test bodies unchanged).
