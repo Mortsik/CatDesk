@@ -769,16 +769,15 @@ mod tests {
     /// Serializes tests that read or mutate the process-global env consumed
     /// by `runtime_read_paths` (cargo runs tests in threads, so an env
     /// mutation in one test would otherwise leak into a concurrent reader).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Locks `ENV_LOCK`, tolerating poisoning: a test that fails while
-    /// holding the lock must not cascade into every other env test.
+    /// The lock itself lives in `crate::test_serialization` so tests in other
+    /// modules that resolve child binaries through `PATH` (handoff's git
+    /// commands) can serialize against these env rewrites too.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+        crate::test_serialization::lock_env()
     }
 
     /// Scoped env overrides: sets the given vars for the test body, holds
-    /// `ENV_LOCK` for the whole scope, and restores previous values on drop
+    /// `env_lock()` for the whole scope, and restores previous values on drop
     /// (including on panic). One lock acquisition per scope, so multi-var
     /// tests must go through a single `set_many` call (std Mutex is not
     /// reentrant).
@@ -797,7 +796,7 @@ mod tests {
                 .map(|(name, _)| (*name, std::env::var_os(*name)))
                 .collect();
             for (name, value) in pairs {
-                // SAFETY: ENV_LOCK serializes all in-process env readers and
+                // SAFETY: the env lock serializes all in-process env readers and
                 // writers in this test module; no other thread observes the
                 // swap. Restore happens in Drop while still holding the lock.
                 unsafe { std::env::set_var(*name, *value) };
@@ -1307,6 +1306,9 @@ mod tests {
 
     #[test]
     fn workspace_git_paths_accepts_submodule_name_that_differs_from_path() {
+        // `workspace_git_paths` resolves `git` through PATH (see
+        // `git_config_value`), so this test must not race env rewrites.
+        let _env = env_lock();
         if !Command::new("git")
             .arg("--version")
             .status()
@@ -1382,6 +1384,8 @@ mod tests {
 
     #[test]
     fn workspace_git_paths_accepts_a_sibling_linked_worktree() {
+        // run_git spawns `git` resolved through PATH; serialize with env rewrites.
+        let _env = env_lock();
         if !Command::new("git")
             .arg("--version")
             .status()
@@ -1424,6 +1428,8 @@ mod tests {
 
     #[test]
     fn workspace_git_paths_accepts_a_nested_linked_worktree() {
+        // run_git spawns `git` resolved through PATH; serialize with env rewrites.
+        let _env = env_lock();
         if !Command::new("git")
             .arg("--version")
             .status()

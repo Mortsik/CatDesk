@@ -381,6 +381,15 @@ mod tests {
         root
     }
 
+    /// `git` is resolved through `PATH` at spawn time and `PATH` is
+    /// process-global: linux_sandbox tests rewrite it while they run, which
+    /// breaks git spawns mid-test (ENOENT surfaces as `git.available` false
+    /// or a panic on a git setup `expect`). Every git-spawning test takes
+    /// this guard so it never interleaves with an env rewrite.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_serialization::lock_env()
+    }
+
     #[test]
     fn render_handoff_includes_structured_sections_and_git_context() {
         let input = HandoffInput {
@@ -500,6 +509,7 @@ mod tests {
 
     #[test]
     fn collect_git_context_records_branch_status_and_recent_commits_when_available() {
+        let _env = env_lock();
         if !ProcessCommand::new("git")
             .arg("--version")
             .stdout(Stdio::null())
@@ -537,6 +547,7 @@ mod tests {
 
     #[test]
     fn git_status_is_bounded_while_being_read() {
+        let _env = env_lock();
         if !ProcessCommand::new("git")
             .arg("--version")
             .stdout(Stdio::null())
@@ -576,6 +587,7 @@ mod tests {
     fn git_context_does_not_run_fsmonitor_or_refresh_index() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _env = env_lock();
         if !ProcessCommand::new("git")
             .arg("--version")
             .stdout(Stdio::null())
@@ -632,6 +644,7 @@ mod tests {
 
     #[test]
     fn failed_git_status_is_not_reported_as_clean() {
+        let _env = env_lock();
         if !ProcessCommand::new("git")
             .arg("--version")
             .stdout(Stdio::null())

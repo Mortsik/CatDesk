@@ -2867,6 +2867,35 @@ fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u1
     f.render_widget(toast_widget, toast_area);
 }
 
+/// Cross-module serialization for tests that collide on process-global state.
+///
+/// The test binary runs every module's tests in parallel threads of one
+/// process, so two categories can race each other even though neither can
+/// race within its own module:
+///
+/// * env mutators (linux_sandbox) temporarily rewrite `PATH`/`HOME` of the
+///   whole test process while they hold their guard;
+/// * child-process spawners (handoff git tests) resolve binaries such as
+///   `git` through `PATH` at spawn time.
+///
+/// Interleaving the two breaks spawns with ENOENT mid-test, which surfaces as
+/// `git.available == false` or a panic on a git setup `expect`. One shared
+/// mutex serializes both sides; see `bd catdesk-cqq`.
+#[cfg(test)]
+mod test_serialization {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serialize against every other env-dependent test across modules.
+    /// Poisoning is tolerated: a failed test must not cascade into the rest.
+    pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::state::{AppState, ToolMode, UiLanguage};
