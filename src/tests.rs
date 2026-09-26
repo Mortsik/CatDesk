@@ -2,9 +2,8 @@
     use super::{
         draw_mode_select, draw_settings,
         draw_tui_header, draw_ui, format_session_duration,
-        key_is_clipboard_paste,
         normalize_ngrok_authtoken_input, pad_right_to_cell_width, parse_terminal_profile_choice,
-        redraw_due, text_input_key_is_cancel, trim_line,
+        redraw_due, trim_line,
     };
     use crate::state::FlowDirection;
     use crate::tui::text::terminal_cell_width;
@@ -711,7 +710,7 @@
 
     #[test]
     fn detects_ctrl_v_as_clipboard_paste() {
-        assert!(key_is_clipboard_paste(&KeyEvent::new(
+        assert!(crate::tui::clipboard::key_is_clipboard_paste(&KeyEvent::new(
             KeyCode::Char('v'),
             KeyModifiers::CONTROL
         )));
@@ -719,7 +718,7 @@
 
     #[test]
     fn detects_shift_insert_as_clipboard_paste() {
-        assert!(key_is_clipboard_paste(&KeyEvent::new(
+        assert!(crate::tui::clipboard::key_is_clipboard_paste(&KeyEvent::new(
             KeyCode::Insert,
             KeyModifiers::SHIFT
         )));
@@ -727,9 +726,9 @@
 
     #[test]
     fn q_does_not_cancel_text_input() {
-        assert!(!text_input_key_is_cancel(KeyCode::Char('q')));
-        assert!(!text_input_key_is_cancel(KeyCode::Char('Q')));
-        assert!(text_input_key_is_cancel(KeyCode::Esc));
+        assert!(!crate::tui::clipboard::text_input_key_is_cancel(KeyCode::Char('q')));
+        assert!(!crate::tui::clipboard::text_input_key_is_cancel(KeyCode::Char('Q')));
+        assert!(crate::tui::clipboard::text_input_key_is_cancel(KeyCode::Esc));
     }
 
     #[test]

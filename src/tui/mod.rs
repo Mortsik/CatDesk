@@ -1,16 +1,18 @@
 pub(crate) mod chrome;
 pub(crate) mod connector_notice;
+pub(crate) mod ngrok_setup;
 pub(crate) mod clipboard;
 pub(crate) mod flow;
 pub(crate) mod logs;
 pub(crate) mod text;
 
 pub(crate) use connector_notice::{run_chatgpt_connector_refresh_notice};
+pub(crate) use ngrok_setup::{run_ngrok_auth_setup, run_ngrok_domain_setup};
 pub(crate) use chrome::{
-    centered_rect, draw_mode_select, draw_tui_header, rect_contains, render_toast,
+    centered_rect, draw_mode_select, draw_tui_header, render_toast,
 };
 pub(crate) use clipboard::{
-    clipboard_copy, clipboard_paste, key_is_clipboard_paste, text_input_key_is_cancel,
+    clipboard_copy,
 };
 pub(crate) use flow::{
     active_bootstrap_status_flow, build_animation_snapshot, flow_bootstrap_status_lines,
