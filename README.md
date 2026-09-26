@@ -234,6 +234,15 @@ According to [the blog](<https://help.openai.com/en/articles/11909943-gpt-53-and
 
 # FAQ
 
+## Can I roll back to an older CatDesk build?
+
+Not safely after the new binary has run once. Builds since the model-aware
+usage pricing change record usage under an `"unattributed"` bucket in
+`~/.catdesk/config.toml`; older builds panic on any bucket other than
+`"through-gpt-5.6"` when rendering cost totals. If you must downgrade, first
+remove the `unattributed` key from `usageByModel` and from every day in
+`dailyUsageByModel` in that file, then start the old binary.
+
 ## Can the red CSP button be turned off?
 
 <table align="center">
