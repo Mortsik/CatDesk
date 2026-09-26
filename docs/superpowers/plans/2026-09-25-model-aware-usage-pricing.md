@@ -68,10 +68,13 @@ keeps rendering; tool input/output direction becomes explicit in UI labels and p
 1. `docs: add model-aware usage pricing implementation plan` — this file.
 2. `feat: add model pricing registry module` — usage_pricing.rs + `mod` declaration + unit
    tests (known/legacy/fallback/unknown pricing, direction arithmetic, mixed map split).
-3. `feat: record turn usage into explicit pricing buckets` — state.rs bucket parameter,
-   delete CURRENT_USAGE_BUCKET, server.rs fallback wiring, test call sites.
-4. `feat(tui): render unknown-bucket usage cost without panicking` — dashboard CostEstimate
+3. `feat(tui): render unknown-bucket usage cost without panicking` — dashboard CostEstimate
    rendering, REQ/RES labels, payload roles, doc-comments, new dashboard tests
-   (unknown-only, mixed priced+unpriced, mixed priced buckets) + updated flow/live assertions.
+   (unknown-only, mixed priced+unpriced, mixed priced buckets) + updated flow/live
+   assertions. Landed *before* the write-side switch so every commit stays green: with the
+   old writer still targeting the legacy bucket, the registry prices it unchanged.
+4. `feat: record turn usage into explicit pricing buckets` — state.rs bucket parameter,
+   delete CURRENT_USAGE_BUCKET, server.rs fallback wiring, test call sites. Green because
+   step 3 already prices the fallback bucket.
 5. Full verify: fmt own regions only, `cargo test`, `cargo test --release`,
    `cargo build --release`.
