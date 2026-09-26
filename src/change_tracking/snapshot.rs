@@ -296,6 +296,16 @@ fn capture_file(mut reader: impl Read) -> io::Result<FileSnapshot> {
 mod bounded_tests {
     use super::*;
 
+    /// `unshare`/`mount`/`umount` are resolved through `PATH` at spawn time
+    /// and `PATH` is process-global: linux_sandbox tests rewrite it while
+    /// they run, which breaks these spawns mid-test (ENOENT surfaces as a
+    /// panic on the unwrap'd status/output). The re-exec'd child inherits a
+    /// stable PATH captured at spawn, so locking the parent covers both
+    /// levels.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_serialization::lock_env()
+    }
+
     struct ChunkChecked {
         remaining: usize,
         tail: u8,
@@ -339,6 +349,7 @@ mod bounded_tests {
     #[test]
     fn explicit_recursive_snapshot_does_not_cross_mount_boundary() {
         use std::process::Command;
+        let _env = env_lock();
         if std::env::var_os("CATDESK_EXPLICIT_MOUNT_TEST_CHILD").is_none() {
             let available = Command::new("unshare")
                 .args(["--user", "--map-root-user", "--mount", "true"])
@@ -403,6 +414,7 @@ mod bounded_tests {
     #[test]
     fn automatic_snapshot_does_not_cross_mount_boundary() {
         use std::process::Command;
+        let _env = env_lock();
         if std::env::var_os("CATDESK_MOUNT_TEST_CHILD").is_none() {
             let available = Command::new("unshare")
                 .args(["--user", "--map-root-user", "--mount", "true"])

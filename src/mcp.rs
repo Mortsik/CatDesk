@@ -4398,6 +4398,17 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 mod tests {
     use super::*;
 
+    /// `git` is resolved through `PATH` at spawn time and `PATH` is
+    /// process-global: linux_sandbox tests rewrite it while they run, which
+    /// breaks git spawns mid-test (ENOENT surfaces as a panic on the git
+    /// setup `expect`). Git-spawning tests take this guard so they never
+    /// interleave with an env rewrite. Unrelated to the local ENV_LOCK in
+    /// `read_image_analyze_requires_configured_backend`, which only
+    /// serializes the GEMINI_API_KEY env mutation.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_serialization::lock_env()
+    }
+
     #[test]
     fn queued_job_output_text_is_neutral_about_scheduling() {
         let snapshot = CommandJobSnapshot {
@@ -6659,6 +6670,7 @@ mod tests {
 
     #[test]
     fn project_handoff_uses_active_project_identity_and_git_context() {
+        let _env = env_lock();
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-handoff-project-{}", Uuid::new_v4()));
         let project = workspace_root.join("repo-a");

@@ -1107,6 +1107,15 @@ mod tests {
     use super::*;
     use crate::change_tracking::{ChangeScope, ChangeTarget};
 
+    /// `mkfifo` is resolved through `PATH` at spawn time and `PATH` is
+    /// process-global: linux_sandbox tests rewrite it while they run, which
+    /// breaks the spawn mid-test (ENOENT surfaces as a panic on the mkfifo
+    /// `expect`). Spawn-dependent tests take this guard so they never
+    /// interleave with an env rewrite.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_serialization::lock_env()
+    }
+
     fn workspace(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("catdesk-jobs-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("create test workspace");
@@ -1200,6 +1209,7 @@ mod tests {
     async fn concurrent_first_polls_wait_for_recovery_to_finish() {
         use std::io::Write;
 
+        let _env = env_lock();
         let dir = workspace("recovery-race");
         let job_id = "recovery-race-job".to_string();
         let fifo = dir.join(format!("{job_id}.json"));

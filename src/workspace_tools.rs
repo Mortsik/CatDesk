@@ -2049,6 +2049,18 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    /// Child binaries (`rg`, `grep`, `sleep`, `unshare`, `mount`, `umount`)
+    /// are resolved through `PATH` at spawn time and `PATH` is
+    /// process-global: linux_sandbox tests rewrite it while they run, which
+    /// breaks these spawns mid-test (ENOENT surfaces as a panic on a search
+    /// or watchdog `expect`). Spawn-dependent tests take this guard so they
+    /// never interleave with an env rewrite. The re-exec'd mount child
+    /// inherits a stable PATH captured at spawn, so locking the parent
+    /// covers both levels.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_serialization::lock_env()
+    }
+
     #[test]
     fn named_backend_probe_is_cached_once() {
         let cache = std::sync::OnceLock::new();
@@ -2258,6 +2270,7 @@ mod tests {
 
     #[test]
     fn grep_search_backend_marks_truncated_when_an_extra_match_exists() {
+        let _env = env_lock();
         if !command_available("grep") {
             return;
         }
@@ -2306,6 +2319,7 @@ mod tests {
 
     #[test]
     fn grep_search_backend_does_not_mark_exact_limit_as_truncated() {
+        let _env = env_lock();
         if !command_available("grep") {
             return;
         }
@@ -2419,6 +2433,7 @@ mod tests {
 
     #[test]
     fn grep_search_deadline_surfaces_as_truncation_not_an_error() {
+        let _env = env_lock();
         if !command_available("grep") {
             return;
         }
@@ -2478,6 +2493,7 @@ mod tests {
 
     #[test]
     fn grep_search_deadline_cuts_a_scan_in_flight() {
+        let _env = env_lock();
         if !command_available("grep") {
             return;
         }
@@ -2509,6 +2525,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn deadline_watchdog_cell_kills_the_child_in_flight() {
+        let _env = env_lock();
         let mut child = ProcessCommand::new("sleep")
             .arg("30")
             .spawn()
@@ -2558,6 +2575,7 @@ mod tests {
     fn recursive_listing_and_builtin_search_do_not_cross_mount_boundary() {
         use std::process::Command;
 
+        let _env = env_lock();
         if std::env::var_os("CATDESK_WORKSPACE_MOUNT_TEST_CHILD").is_none() {
             let available = Command::new("unshare")
                 .args(["--user", "--map-root-user", "--mount", "true"])
@@ -2827,6 +2845,7 @@ mod tests {
     #[test]
     fn deadline_watchdog_kills_a_stuck_child() {
         use std::process::{Command, Stdio};
+        let _env = env_lock();
         let mut child = Command::new("sleep")
             .arg("30")
             .stdout(Stdio::null())
@@ -2853,6 +2872,7 @@ mod tests {
 
     #[test]
     fn rg_search_with_tiny_deadline_returns_instead_of_walking() {
+        let _env = env_lock();
         if !command_available("rg") {
             return; // backend guard, same skip style as the fallback chain
         }
