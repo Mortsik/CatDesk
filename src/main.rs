@@ -26,6 +26,7 @@ mod startup;
 mod state;
 mod theme;
 mod usage_persistence;
+mod usage_pricing;
 mod vision;
 mod workspace_tools;
 
