@@ -1,4 +1,5 @@
     use super::*;
+    use super::token_usage::sanitize_result_for_turn_token_count;
 
     /// `git` is resolved through `PATH` at spawn time and `PATH` is
     /// process-global: linux_sandbox tests rewrite it while they run, which

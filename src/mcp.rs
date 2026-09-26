@@ -1,12 +1,10 @@
 use base64::Engine as _;
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::SystemTime;
-use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::Mutex;
 
 use crate::change_tracking::{ChangeScope, ChangeSession, ChangeTarget, FileChange};
@@ -28,12 +26,16 @@ use crate::vision;
 use crate::workspace_tools;
 
 mod jsonrpc;
+mod token_usage;
 
-pub use jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+pub(crate) use token_usage::estimate_turn_token_counts;
+use token_usage::{TokenUsage, estimate_turn_token_usage};
+
+pub use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 use jsonrpc::{
     image_tool_success_response, tool_arguments, tool_error_response,
-    tool_error_response_with_structured, tool_message_structured, tool_response,
-    tool_success_response_with_structured, tool_name_from_request,
+    tool_error_response_with_structured, tool_success_response_with_structured,
+    tool_name_from_request,
 };
 
 const SERVER_NAME: &str = "catdesk";
@@ -66,23 +68,6 @@ const CATDESK_INSTRUCTION_REQUIRED_MESSAGE: &str =
     "Call catdesk_instruction successfully before using any other CatDesk tool.";
 const CATDESK_INSTRUCTION_REQUIRED_WIDGET_MESSAGE: &str = "ChatGPT didn’t call catdesk_instruction. CatDesk is asking it to call it now. You can ignore this message. It will retry automatically.";
 const CATDESK_INSTRUCTION_REQUIRED_CODE: &str = "CATDESK_INSTRUCTION_REQUIRED";
-
-#[derive(Clone, Default)]
-struct TokenUsage {
-    tool_input_tokens: u64,
-    tool_output_tokens: u64,
-    total_tokens: u64,
-}
-
-impl TokenUsage {
-    fn from_counts(tool_input_tokens: u64, tool_output_tokens: u64) -> Self {
-        Self {
-            tool_input_tokens,
-            tool_output_tokens,
-            total_tokens: tool_input_tokens.saturating_add(tool_output_tokens),
-        }
-    }
-}
 
 #[derive(Clone)]
 struct AutoWidgetContext {
@@ -2622,60 +2607,6 @@ fn handle_catdesk_instruction_with_show_detail_mode(
         attach_widget_payload_meta(result, widget_payload);
     }
     response
-}
-
-fn build_turn_token_payload(req: &JsonRpcRequest, tool_name: &str) -> Value {
-    json!({
-        "name": tool_name,
-        "arguments": tool_arguments(req),
-    })
-}
-
-fn estimate_tokens_o200k(text: &str) -> u64 {
-    o200k_base_singleton()
-        .encode_with_special_tokens(text)
-        .len()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
-fn estimate_value_tokens_o200k(value: &Value) -> u64 {
-    match serde_json::to_string(value) {
-        Ok(serialized) => estimate_tokens_o200k(&serialized),
-        Err(_) => 0,
-    }
-}
-
-fn estimate_turn_token_usage(req: &JsonRpcRequest, tool_name: &str, result: &Value) -> TokenUsage {
-    let tool_input_payload = build_turn_token_payload(req, tool_name);
-    let tool_input_tokens = estimate_value_tokens_o200k(&tool_input_payload);
-    let tool_output_payload = sanitize_result_for_turn_token_count(result);
-    let tool_output_tokens = estimate_value_tokens_o200k(&tool_output_payload);
-    TokenUsage::from_counts(tool_input_tokens, tool_output_tokens)
-}
-
-pub(crate) fn estimate_turn_token_counts(req: &JsonRpcRequest, result: &Value) -> (u64, u64) {
-    let tool_name = tool_name_from_request(req);
-    let usage = estimate_turn_token_usage(req, &tool_name, result);
-    (usage.tool_input_tokens, usage.tool_output_tokens)
-}
-
-fn sanitize_result_for_turn_token_count(result: &Value) -> Value {
-    let mut sanitized = result.clone();
-    let Some(obj) = sanitized.as_object_mut() else {
-        return sanitized;
-    };
-    obj.remove("_meta");
-    if let Some(content) = obj.get_mut("content").and_then(Value::as_array_mut) {
-        for entry in content {
-            if entry.get("type").and_then(Value::as_str) == Some("image") {
-                if let Some(entry) = entry.as_object_mut() {
-                    entry.remove("data");
-                }
-            }
-        }
-    }
-    sanitized
 }
 
 fn ensure_output_template_meta(meta_value: &mut Value) {
