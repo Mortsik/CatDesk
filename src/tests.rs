@@ -1,10 +1,8 @@
     use super::state::{AppState, ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle};
-    use super::{
-        draw_mode_select,
-        draw_tui_header, draw_ui, format_session_duration,
-        normalize_ngrok_authtoken_input, pad_right_to_cell_width, parse_terminal_profile_choice,
-        redraw_due, trim_line,
-    };
+    use super::{draw_mode_select, draw_ui, normalize_ngrok_authtoken_input,
+        parse_terminal_profile_choice, redraw_due};
+    use crate::tui::text::{format_session_duration, pad_right_to_cell_width, trim_line};
+    use crate::tui::chrome::draw_tui_header;
     use crate::state::FlowDirection;
     use crate::tui::text::terminal_cell_width;
     use crate::tui::connector_notice::draw_chatgpt_connector_refresh_notice;
@@ -894,7 +892,7 @@
         let path = export_logs_to_dir(&logs, &root).expect("export logs");
         let text = std::fs::read_to_string(&path).expect("read exported logs");
         assert!(text.contains("12:34:56 INFO"));
-        assert!(text.contains(super::MCP_URL_MASK));
+        assert!(text.contains(crate::tui::logs::MCP_URL_MASK));
         assert!(!text.contains("https://example.ngrok.app/secret/mcp"));
 
         let _ = std::fs::remove_dir_all(root);
@@ -939,7 +937,7 @@
         assert!(text.contains("7. Fill in the form:"));
         assert!(text.contains("8. Click I understand and want to continue"));
         assert!(text.contains("9. Click Create"));
-        assert!(text.contains(super::MCP_URL_MASK));
+        assert!(text.contains(crate::tui::logs::MCP_URL_MASK));
         assert!(text.contains("Click to reveal"));
         assert!(!text.contains("https://example.ngrok.app/secret/mcp"));
         assert!(!text.contains("[c]"));

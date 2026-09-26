@@ -6,7 +6,7 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::CHATGPT_CONNECTOR_SETTINGS_URL;
 use crate::CHATGPT_PLUGIN_SETTINGS_URL;
-use crate::MCP_URL_MASK;
+use crate::tui::logs::MCP_URL_MASK;
 use crate::MCP_URL_REVEAL_DURATION;
 use crate::UI_POLL_INTERVAL;
 use crate::state::{ServerUiEvent, SharedState, UiLanguage};

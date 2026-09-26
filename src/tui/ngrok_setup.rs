@@ -13,7 +13,7 @@ use crate::theme;
 use crate::tui::browser_select::selected_supported_browser_idx;
 use crate::normalize_ngrok_authtoken_input;
 use crate::tui::clipboard::{clipboard_paste, key_is_clipboard_paste, text_input_key_is_cancel};
-use crate::draw_browser_select;
+use crate::tui::browser_select::draw_browser_select;
 use crate::tui::chrome::{centered_rect, draw_mode_select, rect_contains, render_toast};
 use crate::tui::clipboard::clipboard_copy;
 
