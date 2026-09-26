@@ -11,7 +11,7 @@ use crate::mcp::jsonrpc::{
     tool_error_response, tool_error_response_with_structured,
     tool_success_response_with_structured,
 };
-use crate::mcp::instruction::instruction_context_root;
+use crate::mcp::agents_state::instruction_context_root;
 
 pub(crate) fn parse_read_paths(arguments: &Value) -> Result<Vec<String>, String> {
     let items = arguments

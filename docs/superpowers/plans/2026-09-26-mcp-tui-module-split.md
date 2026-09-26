@@ -8,7 +8,8 @@ Split the two CatDesk monoliths into focused modules with clear interfaces, pres
 behavior exactly: `src/mcp.rs` (9338 lines) becomes a coordinating root plus `src/mcp/*`
 submodules, `src/main.rs` (6637 lines) becomes a coordinating root plus `src/tui/*`
 submodules. Target: mcp.rs ~700 lines, main.rs ~1400 lines. Zero user-visible change;
-the full suite (487 tests) stays green after every stage; no import cycles.
+the full suite (487 tests) stays green after every stage; no import cycles
+(verified against the full edge listing, see Verification results).
 
 ## Non-goals
 
@@ -123,19 +124,35 @@ Green gates: `cargo test --offline` 487/487 after every stage; final `cargo test
 487/487 (2.7 s); `cargo build --release` clean except the pre-existing
 `devtools::DevtoolsBridge::from_child` never-used warning (present at base).
 
-Clippy `--all-targets`: 106 lint warnings at base @3ce8af1, 106 at branch tip with an
-identical category distribution (43 collapsed_if, 7 too-many-arguments(8/7), 6 div_ceil,
-4 items_after_test_module, ...). Zero new lints introduced by the split; per plan none
-were fixed.
+Clippy `--all-targets` (controlled measure: `cargo clippy --all-targets` output,
+`grep -A2 '^warning:' | grep 'warning:\|-->' | paste`, sorted): 106 real lint warnings
+at base @3ce8af1 and 106 at branch tip with an identical category distribution
+(43 collapsed_if, 7 too-many-arguments(8/7), 6 div_ceil, 4 items_after_test_module, ...).
+Raw `grep -c '^warning:'` reads 107/108 because each run adds one summary line without a
+following `-->`; the 1-line delta seen in earlier raw counts was that artifact, not a new
+lint. Zero new lints introduced by the split; per plan none were fixed.
 
-Import graph: acyclic. mcp edges: jsonrpc<-token_usage<-{instruction,widget,resources},
-agents_state<-instruction, commands->{file_tools->instruction}, widget->commands, and all
-layers <- tool_catalog; root mcp.rs is the only hub (server.rs consumes only the planned
-re-exports: MODERN_MCP_PROTOCOL_VERSION, decorate_modern_result, JsonRpc*, WIDGET_PAYLOAD_
-META_KEY, is_catdesk_widget_resource_uri, handle_request_with_session,
-estimate_turn_token_counts, agents_widget_state_payload). tui edges point strictly
-downward (dashboard->flow/logs/chrome/text; ngrok_setup->browser_select/chrome/clipboard;
-chrome/text are leaves); no A<->B pairs.
+Import graph (post-review-fix r1, verified by full edge listing):
+mcp edges (module -> module): token_usage->jsonrpc; resources->jsonrpc; file_tools->
+{jsonrpc, agents_state}; commands->{jsonrpc, file_tools}; widget->{commands, jsonrpc,
+resources, token_usage}; instruction->{agents_state, jsonrpc, token_usage, widget};
+tool_catalog->{commands, jsonrpc, widget}. Everything else resolves through the root
+mcp.rs hub (config readers, gating helpers, AutoWidgetContext, and the server.rs
+re-exports: MODERN_MCP_PROTOCOL_VERSION, decorate_modern_result, JsonRpc*,
+WIDGET_PAYLOAD_META_KEY, is_catdesk_widget_resource_uri, handle_request_with_session,
+estimate_turn_token_counts, agents_widget_state_payload).
+
+Review note: the first verification pass recorded this section as acyclic while a
+4-module cycle widget->commands->file_tools->instruction->widget existed (root-cause:
+per-edge pairwise checks instead of a whole-graph topological check). Fixed in r1 by
+moving `instruction_context_root` from instruction.rs (L2) to agents_state.rs (L1),
+breaking the file_tools->instruction edge; the sole external consumer was file_tools,
+instruction already imported agents_state, so no upward edge was created. Full edge
+listing (grep `use crate::mcp::` over src/mcp/*.rs, tests excluded) is attached to the
+fix commit message.
+
+tui edges point strictly downward (dashboard->flow/logs/chrome/text;
+ngrok_setup->browser_select/chrome/clipboard; chrome/text are leaves); no A<->B pairs.
 
 Test integrity: diff of `src/mcp/tests.rs` vs 0a (7e75548) and `src/tests.rs` vs 0b
 (411aae6) contains import-path and `super::X` -> `crate::tui::X` re-qualifications only;

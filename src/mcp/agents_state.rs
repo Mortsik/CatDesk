@@ -5,6 +5,7 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::SystemTime;
 
 use crate::perf_metrics::{self, CacheKind};
+use crate::project_scope;
 use crate::state::{
     AgentsPathMode, AppConfig, app_config_path, load_app_config, user_home_dir,
 };
@@ -247,3 +248,8 @@ pub(crate) fn widget_path_strings(path: &Path) -> (String, String) {
     )
 }
 
+pub(crate) fn instruction_context_root(workspace_root: &str, active_project: Option<&Path>) -> PathBuf {
+    project_scope::valid_active_project(Path::new(workspace_root), active_project)
+        .or_else(|| Path::new(workspace_root).canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from(workspace_root))
+}

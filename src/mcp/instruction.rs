@@ -8,7 +8,8 @@ use crate::project_scope;
 use crate::state::{AgentsPathMode, Mode, ShowDetailMode, ToolMode, app_config_path};
 
 use crate::mcp::agents_state::{
-    agents_widget_state, agents_widget_state_payload, cached_agents_text, widget_path_strings,
+    agents_widget_state, agents_widget_state_payload, cached_agents_text,
+    instruction_context_root, widget_path_strings,
 };
 use crate::mcp::jsonrpc::{
     JsonRpcRequest, JsonRpcResponse, tool_error_response, tool_name_from_request,
@@ -76,13 +77,6 @@ pub(crate) fn catdesk_instruction_required_response_with_show_detail_mode(
         }
     }
     response
-}
-
-
-pub(crate) fn instruction_context_root(workspace_root: &str, active_project: Option<&Path>) -> PathBuf {
-    project_scope::valid_active_project(Path::new(workspace_root), active_project)
-        .or_else(|| Path::new(workspace_root).canonicalize().ok())
-        .unwrap_or_else(|| PathBuf::from(workspace_root))
 }
 
 fn instruction_agents_layers(
