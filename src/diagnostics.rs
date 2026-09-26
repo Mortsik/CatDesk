@@ -350,10 +350,12 @@ mod tests {
                 .iter()
                 .any(|r| r["status"] == 400 && r["rpc_error_code"] == -32700)
         );
+        // Tool errors carry exactly one model-readable text content item
+        // (see mcp::jsonrpc::tool_response) alongside the structured payload.
         assert!(
             records
                 .iter()
-                .any(|r| r["status"] == 200 && r["tool_error"] == true && r["content_items"] == 0)
+                .any(|r| r["status"] == 200 && r["tool_error"] == true && r["content_items"] == 1)
         );
         assert!(
             records
@@ -631,7 +633,8 @@ impl Diagnostics {
             self.dropped.fetch_add(dropped + 1, Ordering::Relaxed);
             self.write_failures
                 .fetch_add(write_failures, Ordering::Relaxed);
-            self.write_dropped.fetch_add(write_dropped, Ordering::Relaxed);
+            self.write_dropped
+                .fetch_add(write_dropped, Ordering::Relaxed);
         }
     }
 }

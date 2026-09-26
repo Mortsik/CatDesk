@@ -50,18 +50,98 @@ impl JsonRpcResponse {
     }
 }
 
+/// Best-effort human/model-readable text derived from a tool's structured
+/// payload. Error responses whose raw text is empty (or a placeholder like
+/// "(no output)") fall back to this so the model still sees why the call
+/// failed instead of an empty content array.
+pub(crate) fn structured_content_text(structured: &Value) -> String {
+    let Some(structured) = structured.as_object() else {
+        return String::new();
+    };
+
+    let mut parts = Vec::new();
+    for key in [
+        "message",
+        "text",
+        "instructionText",
+        "stdout",
+        "stderr",
+        "value",
+    ] {
+        if let Some(text) = structured.get(key).and_then(Value::as_str) {
+            let text = text.trim();
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
+        }
+    }
+
+    if let Some(files) = structured.get("files").and_then(Value::as_array) {
+        for file in files {
+            let Some(error) = file.get("error").and_then(Value::as_str) else {
+                continue;
+            };
+            let error = error.trim();
+            if error.is_empty() {
+                continue;
+            }
+            let path = file
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            parts.push(match path {
+                Some(path) => format!("{path}: {error}"),
+                None => error.to_string(),
+            });
+        }
+    }
+
+    if parts.is_empty() && structured.get("timedOut").and_then(Value::as_bool) == Some(true) {
+        parts.push("Command timed out.".to_string());
+    } else if parts.is_empty() && structured.get("success").and_then(Value::as_bool) == Some(false)
+    {
+        if let Some(exit_code) = structured.get("exitCode").and_then(Value::as_i64) {
+            parts.push(format!("Command failed with exit code {exit_code}."));
+        }
+    }
+
+    parts.join("\n")
+}
+
 pub(crate) fn tool_response(
     req: &JsonRpcRequest,
     text: String,
     structured: Option<Value>,
     is_error: bool,
 ) -> JsonRpcResponse {
+    let structured =
+        structured.unwrap_or_else(|| tool_message_structured(req, text.clone(), is_error));
+    let content_text = if is_error {
+        let text = text.trim();
+        if text.is_empty() || text == "(no output)" {
+            let structured_text = structured_content_text(&structured);
+            if structured_text.is_empty() {
+                text.to_string()
+            } else {
+                structured_text
+            }
+        } else {
+            text.to_string()
+        }
+    } else {
+        String::new()
+    };
+    let content = if content_text.is_empty() {
+        json!([])
+    } else {
+        json!([{ "type": "text", "text": content_text }])
+    };
     let mut result = json!({
-        "content": []
+        "content": content,
+        "structuredContent": structured
     });
     if let Some(obj) = result.as_object_mut() {
-        let structured = structured.unwrap_or_else(|| tool_message_structured(req, text, is_error));
-        obj.insert("structuredContent".to_string(), structured);
         if is_error {
             obj.insert("isError".to_string(), Value::Bool(true));
         }

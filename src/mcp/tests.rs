@@ -295,6 +295,22 @@
         );
     }
 
+    fn content_text(response: &JsonRpcResponse) -> &str {
+        response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|content| {
+                content
+                    .iter()
+                    .find(|entry| entry.get("type").and_then(Value::as_str) == Some("text"))
+            })
+            .and_then(|entry| entry.get("text"))
+            .and_then(Value::as_str)
+            .expect("missing text content")
+    }
+
     fn write_test_image(path: &Path, format: image::ImageFormat, width: u32, height: u32) {
         let image = image::RgbImage::from_pixel(width, height, image::Rgb([23, 67, 101]));
         image
@@ -1257,6 +1273,191 @@
             Some(true)
         );
         assert!(result_text(&response).contains("Use start_command"));
+        assert!(content_text(&response).contains("Use start_command"));
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn run_command_failure_returns_error_text_content() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-run-failure-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command = if cfg!(windows) {
+            "Write-Error 'boom'; exit 7"
+        } else {
+            "printf 'boom\\n' >&2; exit 7"
+        };
+        let req = tool_call_request("run_command", json!({ "command": command }));
+        let response = handle_tools_call(
+            &req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+
+        let result = response.result.as_ref().expect("missing result");
+        assert_eq!(result.get("isError").and_then(Value::as_bool), Some(true));
+        let structured = result
+            .get("structuredContent")
+            .expect("missing structured content");
+        assert_eq!(
+            structured.get("success").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(structured.get("exitCode").and_then(Value::as_i64), Some(7));
+        assert!(
+            structured
+                .get("stderr")
+                .and_then(Value::as_str)
+                .is_some_and(|stderr| stderr.contains("boom"))
+        );
+        assert!(content_text(&response).contains("boom"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn run_command_silent_failure_returns_exit_code_content() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-run-silent-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let (command, expected_exit_code) = if cfg!(windows) {
+            ("exit 7", 7)
+        } else {
+            ("false", 1)
+        };
+        let req = tool_call_request("run_command", json!({ "command": command }));
+        let response = handle_tools_call(
+            &req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+
+        let result = response.result.as_ref().expect("missing result");
+        assert_eq!(result.get("isError").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result
+                .get("structuredContent")
+                .and_then(|structured| structured.get("exitCode"))
+                .and_then(Value::as_i64),
+            Some(expected_exit_code)
+        );
+        assert_eq!(
+            content_text(&response),
+            format!("Command failed with exit code {expected_exit_code}.")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn silent_timeout_error_uses_timed_out_metadata_in_content() {
+        let req = tool_call_request("run_command", json!({ "command": "sleep forever" }));
+        let response = tool_error_response_with_structured(
+            &req,
+            "(no output)".to_string(),
+            json!({
+                "toolName": "run_command",
+                "command": "sleep forever",
+                "stdout": "",
+                "stderr": "",
+                "success": false,
+                "exitCode": null,
+                "timedOut": true
+            }),
+        );
+
+        assert_eq!(content_text(&response), "Command timed out.");
+    }
+
+    #[tokio::test]
+    async fn run_command_timeout_with_stdout_keeps_timeout_reason_in_content() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-run-timeout-output-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command = if cfg!(windows) {
+            "Write-Output 'before-timeout'; Start-Sleep -Seconds 1"
+        } else {
+            "printf 'before-timeout\\n'; sleep 1"
+        };
+        let req = tool_call_request("run_command", json!({ "command": command, "timeout": 100 }));
+        let response = handle_tools_call(
+            &req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+
+        let result = response.result.as_ref().expect("missing result");
+        assert_eq!(result.get("isError").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result
+                .get("structuredContent")
+                .and_then(|structured| structured.get("timedOut"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let content = content_text(&response);
+        assert!(
+            content.contains("before-timeout"),
+            "missing command output: {content}"
+        );
+        assert!(
+            content.to_ascii_lowercase().contains("timed out"),
+            "missing timeout reason: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn run_command_success_keeps_content_empty() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-run-success-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let req = tool_call_request("run_command", json!({ "command": "printf noop" }));
+        let response = handle_tools_call(
+            &req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_no_text_content(&response);
+
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
@@ -1821,7 +2022,7 @@
         )
         .await;
 
-        assert_no_text_content(&response);
+        assert_eq!(content_text(&response), result_text(&response));
         assert_eq!(
             response
                 .result
@@ -1864,7 +2065,7 @@
         )
         .await;
 
-        assert_no_text_content(&response);
+        assert_eq!(content_text(&response), result_text(&response));
         assert_eq!(
             response
                 .result
@@ -1907,7 +2108,7 @@
         )
         .await;
 
-        assert_no_text_content(&response);
+        assert_eq!(content_text(&response), result_text(&response));
         assert_eq!(
             response
                 .result
@@ -1940,7 +2141,7 @@
         )
         .await;
 
-        assert_no_text_content(&response);
+        assert_eq!(content_text(&response), result_text(&response));
         assert_eq!(
             response
                 .result
@@ -2639,7 +2840,7 @@
         )
         .await;
 
-        assert_no_text_content(&response);
+        assert_eq!(content_text(&response), result_text(&response));
         assert_eq!(
             response
                 .result
@@ -3893,6 +4094,15 @@
                 .and_then(|result| result.get("isError")),
             Some(&json!(true)),
             "a batch where nothing was read is a failed call"
+        );
+        let content = content_text(&response);
+        assert!(
+            content.contains("a.txt"),
+            "missing first failed path: {content}"
+        );
+        assert!(
+            content.contains("b.txt"),
+            "missing second failed path: {content}"
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);

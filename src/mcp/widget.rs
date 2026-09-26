@@ -4,7 +4,7 @@ use crate::change_tracking::FileChange;
 use crate::state::ShowDetailMode;
 
 use crate::mcp::commands::format_command_output_events;
-use crate::mcp::jsonrpc::{JsonRpcRequest, tool_name_from_request};
+use crate::mcp::jsonrpc::{JsonRpcRequest, structured_content_text, tool_name_from_request};
 use crate::mcp::resources::{
     WIDGET_PAYLOAD_META_KEY, current_widget_resource_uri, current_widget_resource_uri_for_tool,
 };
@@ -163,27 +163,10 @@ fn extract_tool_result_content_text(result: &Value) -> String {
 }
 
 fn extract_tool_result_structured_text(result: &Value) -> String {
-    let Some(structured) = result.get("structuredContent").and_then(Value::as_object) else {
-        return String::new();
-    };
-
-    let mut parts = Vec::new();
-    for key in [
-        "message",
-        "text",
-        "instructionText",
-        "stdout",
-        "stderr",
-        "value",
-    ] {
-        if let Some(text) = structured.get(key).and_then(Value::as_str) {
-            let text = text.trim();
-            if !text.is_empty() {
-                parts.push(text);
-            }
-        }
-    }
-    parts.join("\n")
+    result
+        .get("structuredContent")
+        .map(structured_content_text)
+        .unwrap_or_default()
 }
 
 pub(crate) fn remove_text_content_from_tool_result(req: &JsonRpcRequest, result: &mut Value) {
@@ -191,6 +174,12 @@ pub(crate) fn remove_text_content_from_tool_result(req: &JsonRpcRequest, result:
     let Some(result_obj) = result.as_object_mut() else {
         return;
     };
+
+    // Error results are the model's only readable failure explanation, so
+    // their text content is preserved instead of being stripped.
+    if result_obj.get("isError").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
 
     if !content_text.is_empty() && !result_obj.contains_key("structuredContent") {
         result_obj.insert(

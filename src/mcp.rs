@@ -59,6 +59,8 @@ pub(crate) use token_usage::estimate_turn_token_counts;
 use token_usage::estimate_turn_token_usage;
 
 pub use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
+#[cfg(test)]
+use jsonrpc::tool_error_response_with_structured;
 use jsonrpc::{tool_error_response, tool_name_from_request};
 
 #[derive(Clone)]

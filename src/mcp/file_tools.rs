@@ -60,7 +60,8 @@ pub(crate) fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> J
                 "batchTruncated": output.batch_truncated,
                 "files": output.files,
             });
-            // tool_response drops `text` whenever structured content is given.
+            // Successful reads stay structured-only; failed reads also
+            // expose model-readable error content.
             if output.files.iter().all(|file| file.error.is_some()) {
                 // Per-entry errors are right for a batch, but a batch where
                 // nothing was read is a failed call, not a successful empty one.
