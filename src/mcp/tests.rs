@@ -17,9 +17,15 @@
     use crate::command_jobs::{CommandJobSnapshot, CommandJobState};
     use crate::perf_metrics;
     use crate::perf_metrics::CacheKind;
-    use super::token_usage::sanitize_result_for_turn_token_count;
+    use super::token_usage::{TokenUsage, sanitize_result_for_turn_token_count};
     use super::agents_state::cached_file_value;
     use super::file_tools::handle_create_handoff_for_project;
+    use super::widget::{
+        attach_tool_call_count, attach_turn_token_usage, base_widget_payload_with_show_detail_mode,
+        build_command_job_widget_payload, build_list_files_widget_payload_from_structured,
+        enrich_tool_result, enrich_tool_result_with_show_detail_mode,
+        tool_descriptor_should_attach_widget,
+    };
     use super::commands::{
         change_scope_for_request, command_job_output_text, handle_poll_command,
     };

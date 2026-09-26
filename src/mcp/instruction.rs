@@ -15,7 +15,7 @@ use crate::mcp::jsonrpc::{
     tool_success_response_with_structured,
 };
 use crate::mcp::token_usage::estimate_turn_token_usage;
-use crate::mcp::{
+use crate::mcp::widget::{
     attach_tool_call_count, attach_turn_token_usage, attach_widget_payload_meta,
     base_widget_payload, enrich_tool_result_with_show_detail_mode, widget_payload_meta_mut,
 };
