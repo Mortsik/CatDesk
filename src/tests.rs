@@ -6,7 +6,9 @@
         normalize_ngrok_authtoken_input, pad_right_to_cell_width, parse_terminal_profile_choice,
         redraw_due, terminal_cell_width, text_input_key_is_cancel, trim_line,
     };
-    use crate::tui::{
+    use crate::state::FlowDirection;
+    use crate::tui::flow::flow_phase_lines;
+    use crate::tui::logs::{
         LogView, export_logs_to_dir, format_log_export_filename, localize_log_message,
         mask_mcp_path_in_log, wrap_log_message,
     };
@@ -238,12 +240,12 @@
         app.record_flow(
             "session:a",
             &["tools/call:read".to_string()],
-            super::FlowDirection::Forward,
+            FlowDirection::Forward,
         );
         app.record_flow(
             "session:b",
             &["tools/call:search".to_string()],
-            super::FlowDirection::Forward,
+            FlowDirection::Forward,
         );
         app.usage_by_model
             .entry(super::usage_pricing::FALLBACK_USAGE_BUCKET.to_string())
@@ -569,18 +571,18 @@
         app.record_flow(
             "session:a",
             &["tools/call:run_command › echo dashboard".to_string()],
-            super::FlowDirection::Forward,
+            FlowDirection::Forward,
         );
         app.record_flow_turn_usage("session:a", 45, 2_100);
         app.record_flow(
             "session:b",
             &["tools/call:poll_command › job 123".to_string()],
-            super::FlowDirection::Forward,
+            FlowDirection::Forward,
         );
         app.record_flow(
             "session:c",
             &["tools/call:search › dashboard status".to_string()],
-            super::FlowDirection::Forward,
+            FlowDirection::Forward,
         );
         app.record_flow_turn_usage("session:c", 12, 345);
 
@@ -1022,7 +1024,7 @@
         let palette = super::theme::all()[0].palette;
         let status_style = ratatui::style::Style::default();
 
-        let disabled = super::flow_phase_lines(
+        let disabled = flow_phase_lines(
             None,
             super::ShowDetailMode::Disable,
             &palette,
@@ -1030,7 +1032,7 @@
             UiLanguage::English,
             0,
         );
-        let expanded = super::flow_phase_lines(
+        let expanded = flow_phase_lines(
             None,
             super::ShowDetailMode::Expanded,
             &palette,
@@ -1038,7 +1040,7 @@
             UiLanguage::English,
             0,
         );
-        let collapsed = super::flow_phase_lines(
+        let collapsed = flow_phase_lines(
             None,
             super::ShowDetailMode::Collapsed,
             &palette,
@@ -1055,7 +1057,7 @@
     #[test]
     fn bootstrap_phase_lines_render_traditional_chinese() {
         let palette = super::theme::all()[0].palette;
-        let lines = super::flow_phase_lines(
+        let lines = flow_phase_lines(
             None,
             super::ShowDetailMode::Expanded,
             &palette,
