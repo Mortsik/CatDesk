@@ -1,0 +1,4 @@
+# Deliberately settings-free: rustfmt defaults (max_width = 100; style_edition
+# 2024 follows `edition = "2024"` in Cargo.toml) are the project style. Keep
+# this file so that choice is explicit. Change a setting only with a dedicated,
+# separately committed style pass.

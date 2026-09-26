@@ -1,0 +1,7 @@
+# Pinned toolchain so `cargo fmt` (and builds) are deterministic for every
+# contributor and agent. rustfmt behavior changed at style_edition 2024 and has
+# been byte-identical across 1.85 through current nightly; pin the exact stable
+# that the canonical format pass was produced with.
+# Bump only with a dedicated style pass: run `cargo fmt`, commit it separately.
+[toolchain]
+channel = "1.93.0"

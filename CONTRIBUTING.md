@@ -10,13 +10,25 @@ Write issues and PRs in whatever language you're comfortable with. It's 2026. We
 2. Create a new branch with `git switch -c feat/your-feature`.
 3. Make your changes.
 4. Run `cargo fmt`.
-5. Run `cargo test --release`.
-6. Run `cargo build --release`.
-7. Open a pull request.
+5. Run `cargo fmt --check` (must pass with zero diffs).
+6. Run `cargo test --release`.
+7. Run `cargo build --release`.
+8. Open a pull request.
 
 ## Code Style
 
-Please follow the existing code style and run `cargo fmt` before committing.
+Formatting is rustfmt defaults, pinned for determinism:
+
+- `rust-toolchain.toml` pins the exact toolchain (currently `1.93.0`), so plain
+  `cargo fmt` / `cargo fmt --check` resolve to the same rustfmt for everyone
+  (rustup installs the pinned toolchain on first use). Do not format with a
+  different rustfmt — output differs between versions and styles.
+- `rustfmt.toml` intentionally contains no settings; don't add any as part of
+  another change. If a setting must change, run the resulting `cargo fmt` as a
+  dedicated `style:` commit that contains nothing else.
+
+Never mix reformatting into functional commits — keep `cargo fmt` output in its
+own commit so diffs stay reviewable.
 
 ## Commits
 
