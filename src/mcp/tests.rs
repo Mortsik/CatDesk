@@ -2687,6 +2687,101 @@
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[test]
+    fn catdesk_instruction_describes_offline_sandbox_and_connector_error_reporting() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "catdesk-mcp-instruction-sandbox-offline-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let instruction =
+            catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
+                .expect("build instruction");
+        assert!(
+            instruction.contains("which does not provide an internet connection"),
+            "sandbox must be described as offline: {instruction}"
+        );
+        assert!(instruction.contains("use Workspace first"));
+        assert!(
+            instruction.contains("explicitly report the raw error to the user"),
+            "connector errors must be reported to the user: {instruction}"
+        );
+        assert!(instruction.contains("Do NOT fall back to the sandbox container"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn catdesk_instruction_tells_agents_not_to_write_catdesk_trailers() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "catdesk-mcp-instruction-co-author-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let instruction =
+            catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
+                .expect("build instruction");
+        assert!(instruction.contains("Do not manually add CatDesk co-author attribution"));
+        assert!(instruction.contains("CatDesk manages that automatically"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn catdesk_instruction_drops_link_segment_guidance_without_code_support() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "catdesk-mcp-instruction-no-link-segment-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let instruction =
+            catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
+                .expect("build instruction");
+        assert!(
+            !instruction.contains("link_"),
+            "link_ segment guidance must stay removed: no code path produces such tool paths: {instruction}"
+        );
+        assert!(!instruction.contains("api_tool returns"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn catdesk_instruction_keeps_richer_divergent_content() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "catdesk-mcp-instruction-rich-guard-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::write(workspace_root.join("AGENTS.md"), "workspace-layer-guard-rule\n")
+            .expect("write workspace agents");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let instruction =
+            catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
+                .expect("build instruction");
+        // AGENTS.md layering (upstream catdesk_instruction_text has no layers).
+        // The exact label depends on agents_path_mode (an existing workspace
+        // AGENTS.md is reported as "Configured AGENTS.md instructions:"),
+        // so assert the label family and the layered content itself.
+        assert!(instruction.contains("AGENTS.md instructions:"));
+        assert!(instruction.contains("workspace-layer-guard-rule"));
+        // read_image vision guidance.
+        assert!(instruction.contains("read_image"));
+        assert!(instruction.contains("native image content"));
+        // Handoff Library search.
+        assert!(instruction.contains("files.search"));
+        assert!(instruction.contains("persistent ChatGPT Library"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     #[tokio::test]
     async fn edit_file_applies_atomic_batch_and_reports_changed_file() {
         let workspace_root =
