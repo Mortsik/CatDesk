@@ -36,6 +36,43 @@ fn insert_env_path(paths: &mut BTreeSet<PathBuf>, variable: &str) {
     }
 }
 
+fn insert_nvm_lib_path(paths: &mut BTreeSet<PathBuf>, nvm_bin: &Path, nvm_dir: &Path) {
+    let Ok(nvm_bin) = nvm_bin.canonicalize() else {
+        return;
+    };
+    let Ok(nvm_dir) = nvm_dir.canonicalize() else {
+        return;
+    };
+    if nvm_bin.file_name() != Some(std::ffi::OsStr::new("bin")) {
+        return;
+    }
+    let Some(version_root) = nvm_bin.parent() else {
+        return;
+    };
+    let Ok(node_versions) = nvm_dir.join("versions/node").canonicalize() else {
+        return;
+    };
+    if version_root.parent() != Some(node_versions.as_path()) {
+        return;
+    }
+    let Some(lib) = real_dir(&version_root.join("lib")) else {
+        return;
+    };
+    if lib.parent() != Some(version_root) {
+        return;
+    }
+
+    paths.insert(lib);
+}
+
+fn insert_nvm_read_paths(paths: &mut BTreeSet<PathBuf>) {
+    let (Some(nvm_bin), Some(nvm_dir)) = (std::env::var_os("NVM_BIN"), std::env::var_os("NVM_DIR"))
+    else {
+        return;
+    };
+    insert_nvm_lib_path(paths, Path::new(&nvm_bin), Path::new(&nvm_dir));
+}
+
 fn insert_ssh_read_paths(paths: &mut BTreeSet<PathBuf>, home: &Path) {
     let ssh_dir = home.join(".ssh");
     for name in ["config", "known_hosts", "known_hosts2"] {
@@ -77,6 +114,10 @@ fn runtime_read_paths() -> BTreeSet<PathBuf> {
     // Executables installed outside the standard system prefixes must remain
     // executable when their directory is explicitly present in PATH.
     insert_env_path_list(&mut paths, "PATH");
+
+    // NVM's npm/npx launchers in NVM_BIN are symlinks into the sibling lib
+    // directory. Expose only that current version's lib tree, read-only.
+    insert_nvm_read_paths(&mut paths);
 
     // Rust toolchains are commonly installed under the user's home directory.
     // Expose only executable/cache trees from Cargo so registry credentials
@@ -844,6 +885,293 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn nvm_read_paths_include_only_current_version_lib() {
+        let tree = TempTree::new();
+        let nvm_dir = tree.path().join(".nvm");
+        let version_root = nvm_dir.join("versions/node/v26.8.1");
+        let bin = version_root.join("bin");
+        let lib = version_root.join("lib");
+        std::fs::create_dir_all(&bin).expect("create NVM bin");
+        std::fs::create_dir_all(&lib).expect("create NVM lib");
+
+        let mut paths = BTreeSet::new();
+        insert_nvm_lib_path(&mut paths, &bin, &nvm_dir);
+
+        assert!(paths.contains(&lib.canonicalize().expect("canonical NVM lib")));
+        assert!(!paths.contains(&version_root.canonicalize().expect("canonical version root")));
+        assert!(!paths.contains(&nvm_dir.canonicalize().expect("canonical NVM dir")));
+    }
+
+    #[test]
+    fn nvm_read_paths_reject_symlinked_lib_escaping_version_root() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new();
+        let nvm_dir = tree.path().join(".nvm");
+        let version_root = nvm_dir.join("versions/node/v26.8.1");
+        let bin = version_root.join("bin");
+        let outside = tree.path().join("outside");
+        std::fs::create_dir_all(&bin).expect("create NVM bin");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        symlink(&outside, version_root.join("lib")).expect("symlink NVM lib");
+
+        let mut paths = BTreeSet::new();
+        insert_nvm_lib_path(&mut paths, &bin, &nvm_dir);
+
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn nvm_read_paths_reject_nonstandard_path_inside_nvm_dir() {
+        let tree = TempTree::new();
+        let nvm_dir = tree.path().join(".nvm");
+        let version_root = nvm_dir.join("foo");
+        let bin = version_root.join("bin");
+        let lib = version_root.join("lib");
+        std::fs::create_dir_all(nvm_dir.join("versions/node")).expect("create NVM versions");
+        std::fs::create_dir_all(&bin).expect("create nonstandard bin");
+        std::fs::create_dir_all(&lib).expect("create nonstandard lib");
+
+        let mut paths = BTreeSet::new();
+        insert_nvm_lib_path(&mut paths, &bin, &nvm_dir);
+
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn nvm_read_paths_reject_bin_outside_nvm_dir() {
+        let tree = TempTree::new();
+        let nvm_dir = tree.path().join(".nvm");
+        let outside_root = tree.path().join("outside/node");
+        let bin = outside_root.join("bin");
+        let lib = outside_root.join("lib");
+        std::fs::create_dir_all(&nvm_dir).expect("create NVM dir");
+        std::fs::create_dir_all(&bin).expect("create outside bin");
+        std::fs::create_dir_all(&lib).expect("create outside lib");
+
+        let mut paths = BTreeSet::new();
+        insert_nvm_lib_path(&mut paths, &bin, &nvm_dir);
+
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn runtime_read_paths_include_current_nvm_lib_from_env() {
+        // Environment propagation: NVM_BIN + NVM_DIR must surface exactly the
+        // active version's lib tree in the sandbox read set — nothing wider.
+        let tree = TempTree::new();
+        let nvm_dir = tree.path().join(".nvm");
+        let version_root = nvm_dir.join("versions/node/v26.8.1");
+        let bin = version_root.join("bin");
+        let lib = version_root.join("lib");
+        std::fs::create_dir_all(&bin).expect("create NVM bin");
+        std::fs::create_dir_all(&lib).expect("create NVM lib");
+
+        let _env = EnvGuards::set_many(&[("NVM_BIN", &bin), ("NVM_DIR", &nvm_dir)]);
+
+        let paths = runtime_read_paths();
+        assert!(paths.contains(&lib.canonicalize().expect("canonical NVM lib")));
+        assert!(
+            !paths.contains(&version_root.canonicalize().expect("canonical version root")),
+            "version root must not be granted as a whole"
+        );
+        assert!(
+            !paths.contains(&nvm_dir.canonicalize().expect("canonical NVM dir")),
+            "NVM_DIR itself must stay outside the sandbox"
+        );
+    }
+
+    #[test]
+    fn runtime_read_paths_grant_nothing_under_a_canary_nvm_bin() {
+        // A planted NVM_BIN outside $NVM_DIR/versions/node must not bind any
+        // path under the pointed-at tree, read-only or otherwise.
+        let tree = TempTree::new();
+        let nvm_dir = tree.path().join(".nvm");
+        let outside = tree.path().join("outside/node");
+        let bin = outside.join("bin");
+        std::fs::create_dir_all(&nvm_dir).expect("create NVM dir");
+        std::fs::create_dir_all(&bin).expect("create outside bin");
+        std::fs::create_dir_all(outside.join("lib")).expect("create outside lib");
+
+        let _env = EnvGuards::set_many(&[("NVM_BIN", &bin), ("NVM_DIR", &nvm_dir)]);
+
+        let paths = runtime_read_paths();
+        let outside = outside.canonicalize().expect("canonical outside root");
+        assert!(
+            paths.iter().all(|path| !path.starts_with(&outside)),
+            "canary leaked into the read set: {:?}",
+            paths
+                .iter()
+                .filter(|p| p.starts_with(&outside))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sandboxed_npm_runs_through_nvm_lib_symlink() {
+        // End-to-end through the real sandbox (bwrap): an NVM-style bin/npm
+        // symlink into the sibling lib tree must resolve and execute inside
+        // the namespace. Shell-script shims stand in for node/npm, so the
+        // fixture is deterministic on any host; without bwrap there is no
+        // sandbox to exercise and the test skips.
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = EnvGuards::read();
+        if bubblewrap_executable(Path::new(".")).is_none() {
+            return;
+        }
+
+        let tree = TempTree::new();
+        let workspace = tree.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+
+        let nvm_dir = tree.path().join(".nvm");
+        let version_root = nvm_dir.join("versions/node/v26.8.1");
+        let bin = version_root.join("bin");
+        let cli = version_root.join("lib/node_modules/npm/bin/npm-cli.js");
+        std::fs::create_dir_all(&bin).expect("create NVM bin");
+        std::fs::create_dir_all(cli.parent().expect("npm cli dir")).expect("create npm lib");
+        // Real NVM installs mark the launcher targets executable; without the
+        // execute bit bash skips the PATH candidate entirely.
+        std::fs::write(&cli, b"#!/bin/sh\necho npm-from-lib\n").expect("write npm cli shim");
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod npm cli shim");
+        let node = bin.join("node");
+        std::fs::write(&node, b"#!/bin/sh\necho node-shim\n").expect("write node shim");
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod node shim");
+        std::os::unix::fs::symlink("../lib/node_modules/npm/bin/npm-cli.js", bin.join("npm"))
+            .expect("symlink npm");
+
+        // A shell loads nvm by exporting NVM_BIN/NVM_DIR and putting the
+        // version's bin first on PATH; replicate that. Plain bwrap
+        // (CATDESK_SANDBOX_MEMORY=off): the memory scope needs a user systemd
+        // manager, which is orthogonal to NVM resolution. One lock scope for
+        // the whole test — a nested EnvGuards would re-acquire the
+        // non-reentrant env lock, so the overrides are set and restored
+        // manually while `_env` holds it.
+        let prev: Vec<(&'static str, Option<OsString>)> =
+            ["NVM_BIN", "NVM_DIR", "PATH", "CATDESK_SANDBOX_MEMORY"]
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+        let mut joined = OsString::from(bin.as_os_str());
+        joined.push(":");
+        joined.push(std::env::var_os("PATH").unwrap_or_default());
+        // SAFETY: `_env` holds the env lock for the rest of the test; the
+        // restore below runs before it is released.
+        unsafe {
+            std::env::set_var("NVM_BIN", &bin);
+            std::env::set_var("NVM_DIR", &nvm_dir);
+            std::env::set_var("PATH", &joined);
+            std::env::set_var("CATDESK_SANDBOX_MEMORY", "off");
+        }
+
+        // Probe: environments with bwrap installed but user namespaces
+        // blocked (container seccomp profiles) cannot run the sandbox at
+        // all — skip rather than fail there.
+        let (mut probe, probe_scratch) =
+            helper_command("true", &workspace, &workspace).expect("prepare probe command");
+        let probe_ok = probe.output().is_ok_and(|status| status.status.success());
+        let _ = std::fs::remove_dir_all(probe_scratch);
+        if !probe_ok {
+            for (name, value) in prev {
+                // SAFETY: still under the same lock.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+            return;
+        }
+
+        let (mut command, scratch) = helper_command("npm --version", &workspace, &workspace)
+            .expect("prepare sandbox command");
+        let output = command.output().expect("run sandboxed npm");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let _ = std::fs::remove_dir_all(scratch);
+
+        for (name, value) in prev {
+            // SAFETY: still under the same lock.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        assert!(
+            output.status.success(),
+            "sandboxed npm failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_eq!(stdout.trim(), "npm-from-lib");
+    }
+
+    #[test]
+    fn runtime_read_paths_bind_real_nvm_lib_when_present() {
+        // Realistic host layout (real npm/npx symlinks into lib/node_modules):
+        // runs only when an NVM-managed version actually exists — on this
+        // host that is ~/.nvm/versions/node/* — and is a no-op otherwise, so
+        // CI without NVM stays deterministic. One lock scope for the whole
+        // test: a nested EnvGuards::set_many would re-acquire the
+        // non-reentrant env lock, so the overrides are set and restored
+        // manually while `env` holds it.
+        let _env = EnvGuards::read();
+        let nvm_dir = match std::env::var_os("NVM_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(".nvm"),
+                None => return,
+            },
+        };
+        let versions = nvm_dir.join("versions/node");
+        let Ok(entries) = std::fs::read_dir(&versions) else {
+            return;
+        };
+        let Some(version_root) = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.join("bin/npm").exists() && path.join("lib").is_dir())
+        else {
+            return;
+        };
+        let bin = version_root.join("bin");
+
+        let prev: Vec<(&'static str, Option<OsString>)> = ["NVM_BIN", "NVM_DIR"]
+            .map(|name| (name, std::env::var_os(name)))
+            .to_vec();
+        // SAFETY: `_env` holds the env lock for the rest of the test; the
+        // restore below runs before it is released.
+        unsafe {
+            std::env::set_var("NVM_BIN", &bin);
+            std::env::set_var("NVM_DIR", &nvm_dir);
+        }
+        let contains = runtime_read_paths().contains(
+            &version_root
+                .join("lib")
+                .canonicalize()
+                .expect("canonical real NVM lib"),
+        );
+        for (name, value) in prev {
+            // SAFETY: still under the same lock.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        assert!(
+            contains,
+            "real NVM lib must be readable in the sandbox read set"
+        );
     }
 
     #[test]
