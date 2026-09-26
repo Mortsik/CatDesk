@@ -1,10 +1,14 @@
     use super::state::{AppState, ToolMode, UiLanguage};
     use super::{
-        LogView, draw_chatgpt_connector_refresh_notice, draw_mode_select, draw_settings,
-        draw_tui_header, draw_ui, export_logs_to_dir, format_session_duration,
-        key_is_clipboard_paste, localize_log_message, mask_mcp_path_in_log,
+        draw_chatgpt_connector_refresh_notice, draw_mode_select, draw_settings,
+        draw_tui_header, draw_ui, format_session_duration,
+        key_is_clipboard_paste,
         normalize_ngrok_authtoken_input, pad_right_to_cell_width, parse_terminal_profile_choice,
-        redraw_due, terminal_cell_width, text_input_key_is_cancel, trim_line, wrap_log_message,
+        redraw_due, terminal_cell_width, text_input_key_is_cancel, trim_line,
+    };
+    use crate::tui::{
+        LogView, export_logs_to_dir, format_log_export_filename, localize_log_message,
+        mask_mcp_path_in_log, wrap_log_message,
     };
     use crate::build_info;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -856,13 +860,13 @@
     fn exported_log_filename_includes_utc_offset() {
         let utc = time::OffsetDateTime::from_unix_timestamp(0).expect("unix epoch");
         assert_eq!(
-            super::format_log_export_filename(utc).expect("format UTC filename"),
+            format_log_export_filename(utc).expect("format UTC filename"),
             "catdesk-19700101-000000-000Z.log"
         );
 
         let seoul = utc.to_offset(time::UtcOffset::from_hms(9, 0, 0).expect("UTC+09"));
         assert_eq!(
-            super::format_log_export_filename(seoul).expect("format local filename"),
+            format_log_export_filename(seoul).expect("format local filename"),
             "catdesk-19700101-090000-000+0900.log"
         );
     }
