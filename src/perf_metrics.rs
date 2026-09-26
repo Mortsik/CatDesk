@@ -647,6 +647,11 @@ fn clk_tck() -> u64 {
     })
 }
 
+#[cfg(windows)]
+fn clk_tck() -> u64 {
+    10_000_000 // GetProcessTimes FILETIME ticks: 100 ns units
+}
+
 /// Total user+system CPU ticks from `/proc/self/stat` (fields 14 and 15).
 #[cfg(unix)]
 fn read_process_cpu_ticks() -> Option<u64> {
