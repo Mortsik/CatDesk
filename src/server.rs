@@ -32,6 +32,7 @@ use crate::state::{
     TokenStatsLayout, UsageTotals, parse_seed_hex, save_agents_path_mode, save_show_detail_mode,
     save_token_stats_layout,
 };
+use crate::usage_pricing;
 
 const STATELESS_FLOW_ID: &str = "stateless";
 const MCP_HTTP_REQUEST_MAX_DURATION: StdDuration = StdDuration::from_secs(120);
@@ -4515,7 +4516,11 @@ async fn post_mcp_inner(
             let usage_totals = {
                 let mut app = s.app.lock().await;
                 if let Some((tool_input_tokens, tool_output_tokens)) = turn_token_usage {
-                    app.record_turn_usage(tool_input_tokens, tool_output_tokens);
+                    // Responses carry no model metadata yet; until it lands every turn
+                    // is attributed to the unattributed bucket, priced at the legacy
+                    // rate as an estimate.
+                    let usage_bucket = usage_pricing::bucket_for_model(None);
+                    app.record_turn_usage(&usage_bucket, tool_input_tokens, tool_output_tokens);
                     app.schedule_usage_persistence();
                     let _ = s.ui_events.try_send(ServerUiEvent::RecordTurnUsage {
                         flow_id: flow_id.clone(),

@@ -75,11 +75,20 @@ impl FlowBootstrapProgress {
 
 const APP_CONFIG_DIR_NAME: &str = ".catdesk";
 const APP_CONFIG_FILE_NAME: &str = "config.toml";
-pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
-pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
+/// Re-exported so existing `state::` import paths keep resolving after the pricing
+/// registry moved the canonical definition to `usage_pricing`.
+pub use crate::usage_pricing::GPT_5_6_AND_EARLIER_USAGE_BUCKET;
+
 /// Bump only when an existing ChatGPT connector must be removed and added again.
 pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 8;
 
+/// Token totals for one usage bucket.
+///
+/// The axis is the tool-call boundary, not the LLM I/O boundary:
+/// `tool_input_tokens` are tool call arguments — text the LLM *produced*, charged
+/// at the LLM output rate — while `tool_output_tokens` are tool results — text
+/// the LLM *consumed*, charged at the LLM input rate. Pricing lives in
+/// [`crate::usage_pricing`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageTotals {
@@ -1243,8 +1252,18 @@ impl AppState {
         self.daily_usage_by_model.clear();
     }
 
-    pub fn record_turn_usage(&mut self, tool_input_tokens: u64, tool_output_tokens: u64) {
-        self.record_turn_usage_at(tool_input_tokens, tool_output_tokens, now_unix_millis());
+    pub fn record_turn_usage(
+        &mut self,
+        bucket: &str,
+        tool_input_tokens: u64,
+        tool_output_tokens: u64,
+    ) {
+        self.record_turn_usage_at(
+            bucket,
+            tool_input_tokens,
+            tool_output_tokens,
+            now_unix_millis(),
+        );
     }
 
     pub fn schedule_usage_persistence(&self) {
@@ -1257,29 +1276,37 @@ impl AppState {
 
     fn record_turn_usage_at(
         &mut self,
+        bucket: &str,
         tool_input_tokens: u64,
         tool_output_tokens: u64,
         now_ms: u128,
     ) {
         let day_key = local_usage_day_key(local_now());
-        self.record_turn_usage_at_day(tool_input_tokens, tool_output_tokens, now_ms, &day_key);
+        self.record_turn_usage_at_day(
+            bucket,
+            tool_input_tokens,
+            tool_output_tokens,
+            now_ms,
+            &day_key,
+        );
     }
 
     fn record_turn_usage_at_day(
         &mut self,
+        bucket: &str,
         tool_input_tokens: u64,
         tool_output_tokens: u64,
         now_ms: u128,
         day_key: &str,
     ) {
         self.usage_by_model
-            .entry(CURRENT_USAGE_BUCKET.to_string())
+            .entry(bucket.to_string())
             .or_default()
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
         self.daily_usage_by_model
             .entry(day_key.to_string())
             .or_default()
-            .entry(CURRENT_USAGE_BUCKET.to_string())
+            .entry(bucket.to_string())
             .or_default()
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
         self.session_usage_totals
@@ -1588,6 +1615,7 @@ fn generate_mcp_slug() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage_pricing::FALLBACK_USAGE_BUCKET;
 
     const LEGACY_CONFIG_FIXTURE: &str = include_str!("../tests/fixtures/legacy_config.toml");
 
@@ -1983,7 +2011,7 @@ toolCallCount = 1
         app.mode = Mode::Computer;
         app.tool_mode = ToolMode::ReadOnly;
         app.usage_by_model
-            .entry(CURRENT_USAGE_BUCKET.to_string())
+            .entry(FALLBACK_USAGE_BUCKET.to_string())
             .or_default()
             .accumulate(12, 8, 3);
         app.session_usage_totals.accumulate(100, 200, 1);
@@ -1995,7 +2023,7 @@ toolCallCount = 1
         assert!(matches!(saved.tool_mode, ToolMode::ReadOnly));
         let saved_usage = saved
             .usage_by_model
-            .get(CURRENT_USAGE_BUCKET)
+            .get(FALLBACK_USAGE_BUCKET)
             .expect("saved current usage bucket");
         assert_eq!(saved_usage.tool_input_tokens, 12);
         assert_eq!(saved_usage.tool_output_tokens, 8);
@@ -2334,8 +2362,8 @@ toolCallCount = 0
     #[test]
     fn record_turn_usage_persists_one_daily_usage_bucket() {
         let (mut app, workspace, config_path) = test_app("catdesk-daily-usage");
-        app.record_turn_usage(10, 2);
-        app.record_turn_usage(15, 3);
+        app.record_turn_usage(FALLBACK_USAGE_BUCKET, 10, 2);
+        app.record_turn_usage(FALLBACK_USAGE_BUCKET, 15, 3);
         app.persist_state().expect("persist daily usage");
 
         let saved_text = std::fs::read_to_string(&config_path).expect("read daily usage config");
@@ -2351,7 +2379,7 @@ toolCallCount = 0
             .and_then(toml::Value::as_table)
             .expect("daily usage day must contain model buckets");
         let usage = models
-            .get(CURRENT_USAGE_BUCKET)
+            .get(FALLBACK_USAGE_BUCKET)
             .and_then(toml::Value::as_table)
             .expect("daily current-model usage must be persisted");
         assert_eq!(
@@ -2383,20 +2411,20 @@ toolCallCount = 0
     #[test]
     fn record_turn_usage_tracks_distinct_calendar_days() {
         let (mut app, workspace, config_path) = test_app("catdesk-daily-distinct-days");
-        app.record_turn_usage_at_day(10, 2, 1_000, "2026-09-22");
-        app.record_turn_usage_at_day(20, 3, 2_000, "2026-09-23");
-        app.record_turn_usage_at_day(5, 1, 3_000, "2026-09-23");
+        app.record_turn_usage_at_day(FALLBACK_USAGE_BUCKET, 10, 2, 1_000, "2026-09-22");
+        app.record_turn_usage_at_day(FALLBACK_USAGE_BUCKET, 20, 3, 2_000, "2026-09-23");
+        app.record_turn_usage_at_day(FALLBACK_USAGE_BUCKET, 5, 1, 3_000, "2026-09-23");
 
         assert_eq!(app.tracked_usage_day_count(), 2);
         assert_eq!(app.daily_usage_by_model.len(), 2);
         let first = app.daily_usage_by_model["2026-09-22"]
-            .get(CURRENT_USAGE_BUCKET)
+            .get(FALLBACK_USAGE_BUCKET)
             .expect("first day usage");
         assert_eq!(first.tool_input_tokens, 10);
         assert_eq!(first.tool_output_tokens, 2);
         assert_eq!(first.tool_call_count, 1);
         let second = app.daily_usage_by_model["2026-09-23"]
-            .get(CURRENT_USAGE_BUCKET)
+            .get(FALLBACK_USAGE_BUCKET)
             .expect("second day usage");
         assert_eq!(second.tool_input_tokens, 25);
         assert_eq!(second.tool_output_tokens, 4);
@@ -2421,7 +2449,7 @@ toolCallCount = 0
     #[test]
     fn reset_usage_billing_clears_all_time_and_daily_history() {
         let (mut app, workspace, config_path) = test_app("catdesk-daily-reset");
-        app.record_turn_usage_at_day(10, 2, 1_000, "2026-09-22");
+        app.record_turn_usage_at_day(FALLBACK_USAGE_BUCKET, 10, 2, 1_000, "2026-09-22");
         assert!(!app.usage_by_model.is_empty());
         assert!(!app.daily_usage_by_model.is_empty());
 
@@ -2478,7 +2506,7 @@ toolCallCount = 0
         app.persist_state().expect("seed config");
 
         for _ in 0..8 {
-            app.record_turn_usage(10, 2);
+            app.record_turn_usage(FALLBACK_USAGE_BUCKET, 10, 2);
             app.schedule_usage_persistence();
         }
         update_app_config_at_path(&config_path, |config| {
@@ -2491,7 +2519,7 @@ toolCallCount = 0
             let saved = AppConfig::load_from_path(&config_path).expect("load coalesced config");
             if saved
                 .usage_by_model
-                .get(CURRENT_USAGE_BUCKET)
+                .get(FALLBACK_USAGE_BUCKET)
                 .is_some_and(|usage| usage.tool_call_count == 8)
             {
                 break saved;
@@ -2505,7 +2533,7 @@ toolCallCount = 0
         assert!(matches!(saved.agents_path_mode, AgentsPathMode::Codex));
         let usage = saved
             .usage_by_model
-            .get(CURRENT_USAGE_BUCKET)
+            .get(FALLBACK_USAGE_BUCKET)
             .expect("missing deferred usage bucket after persistence deadline");
         assert_eq!(usage.tool_input_tokens, 80);
         assert_eq!(usage.tool_output_tokens, 16);
@@ -2515,7 +2543,7 @@ toolCallCount = 0
             .daily_usage_by_model
             .values()
             .next()
-            .and_then(|usage_by_model| usage_by_model.get(CURRENT_USAGE_BUCKET))
+            .and_then(|usage_by_model| usage_by_model.get(FALLBACK_USAGE_BUCKET))
             .expect("missing deferred daily usage bucket after persistence deadline");
         assert_eq!(daily_usage.tool_input_tokens, 80);
         assert_eq!(daily_usage.tool_output_tokens, 16);
@@ -2529,7 +2557,7 @@ toolCallCount = 0
     #[test]
     fn full_state_persist_supersedes_older_pending_usage_snapshot() {
         let (mut app, workspace, config_path) = test_app("catdesk-usage-full-persist-ordering");
-        app.record_turn_usage(100, 25);
+        app.record_turn_usage(FALLBACK_USAGE_BUCKET, 100, 25);
         app.schedule_usage_persistence();
 
         app.reset_usage_billing();
@@ -2555,7 +2583,7 @@ toolCallCount = 0
     #[test]
     fn failed_full_state_persist_requeues_latest_usage_for_shutdown_flush() {
         let (mut app, workspace, config_path) = test_app("catdesk-usage-full-persist-retry");
-        app.record_turn_usage(77, 11);
+        app.record_turn_usage(FALLBACK_USAGE_BUCKET, 77, 11);
         app.schedule_usage_persistence();
         std::fs::write(&config_path, "this is not valid = [toml").expect("write invalid config");
 
@@ -2587,7 +2615,7 @@ toolCallCount = 0
     #[test]
     fn usage_persistence_flushes_pending_snapshot_on_app_state_drop() {
         let (mut app, workspace, config_path) = test_app("catdesk-usage-drop-flush");
-        app.record_turn_usage(100, 25);
+        app.record_turn_usage(FALLBACK_USAGE_BUCKET, 100, 25);
         app.schedule_usage_persistence();
 
         drop(app);
@@ -2615,9 +2643,9 @@ toolCallCount = 0
     #[test]
     fn rolling_usage_totals_only_include_the_requested_window() {
         let (mut app, workspace, config_path) = test_app("catdesk-rolling-usage");
-        app.record_turn_usage_at(100, 10, 1_000);
-        app.record_turn_usage_at(200, 20, 30_000);
-        app.record_turn_usage_at(300, 30, 61_001);
+        app.record_turn_usage_at(FALLBACK_USAGE_BUCKET, 100, 10, 1_000);
+        app.record_turn_usage_at(FALLBACK_USAGE_BUCKET, 200, 20, 30_000);
+        app.record_turn_usage_at(FALLBACK_USAGE_BUCKET, 300, 30, 61_001);
 
         let rolling = app.rolling_usage_totals(61_001, 60_000);
         assert_eq!(rolling.tool_input_tokens, 500);
@@ -2639,8 +2667,8 @@ toolCallCount = 0
     #[test]
     fn rolling_usage_samples_are_pruned_to_the_live_window() {
         let (mut app, workspace, config_path) = test_app("catdesk-rolling-usage-prune");
-        app.record_turn_usage_at(10, 1, 1_000);
-        app.record_turn_usage_at(20, 2, 61_001);
+        app.record_turn_usage_at(FALLBACK_USAGE_BUCKET, 10, 1, 1_000);
+        app.record_turn_usage_at(FALLBACK_USAGE_BUCKET, 20, 2, 61_001);
 
         assert_eq!(app.usage_rate_samples.len(), 1);
         let rolling = app.rolling_usage_totals(61_001, LIVE_USAGE_WINDOW_MS);

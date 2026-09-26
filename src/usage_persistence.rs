@@ -154,7 +154,8 @@ fn flush_pending(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AppState, CURRENT_USAGE_BUCKET};
+    use crate::state::AppState;
+    use crate::usage_pricing::FALLBACK_USAGE_BUCKET;
     use std::fs;
     use uuid::Uuid;
 
@@ -178,7 +179,7 @@ mod tests {
         let mut usage = UsageSnapshot::new();
         let mut totals = UsageTotals::default();
         totals.accumulate(55, 7, 1);
-        usage.insert(CURRENT_USAGE_BUCKET.to_string(), totals);
+        usage.insert(FALLBACK_USAGE_BUCKET.to_string(), totals);
         let pending = Mutex::new(Some(PendingUsage {
             generation: 1,
             snapshot: usage,
@@ -228,7 +229,7 @@ mod tests {
         let all_usage = saved.all_time_usage_totals();
         let usage = saved
             .usage_by_model
-            .get(CURRENT_USAGE_BUCKET)
+            .get(FALLBACK_USAGE_BUCKET)
             .expect("missing usage after retry");
         assert_eq!(usage.tool_input_tokens, 55);
         assert_eq!(usage.tool_output_tokens, 7);

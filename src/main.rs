@@ -3113,14 +3113,14 @@ mod tests {
             super::FlowDirection::Forward,
         );
         app.usage_by_model
-            .entry(super::state::CURRENT_USAGE_BUCKET.to_string())
+            .entry(super::usage_pricing::FALLBACK_USAGE_BUCKET.to_string())
             .or_default()
             .accumulate(0, 1_600_000, 20);
-        app.record_turn_usage(0, 1_000_000);
+        app.record_turn_usage(super::usage_pricing::FALLBACK_USAGE_BUCKET, 0, 1_000_000);
         app.daily_usage_by_model
             .entry("1900-01-01".to_string())
             .or_default()
-            .entry(super::state::CURRENT_USAGE_BUCKET.to_string())
+            .entry(super::usage_pricing::FALLBACK_USAGE_BUCKET.to_string())
             .or_default()
             .accumulate(0, 600_000, 3);
         app.request_count = 42;
@@ -3213,11 +3213,11 @@ mod tests {
 
         // $1,924.70 of legacy usage has no trustworthy per-day history.
         app.usage_by_model
-            .entry(super::state::CURRENT_USAGE_BUCKET.to_string())
+            .entry(super::state::GPT_5_6_AND_EARLIER_USAGE_BUCKET.to_string())
             .or_default()
             .accumulate(0, 384_940_000, 1_000);
         // The new daily tracker knows only about this $0.30 call today.
-        app.record_turn_usage(0, 60_000);
+        app.record_turn_usage(super::usage_pricing::FALLBACK_USAGE_BUCKET, 0, 60_000);
 
         let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
         let mut log_view = None;
