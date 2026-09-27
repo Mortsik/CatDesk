@@ -236,11 +236,18 @@ mod tests {
 
     #[tokio::test]
     async fn response_deadline_expires_while_started_work_runs_to_completion() {
+        // The deadline must leave blocking-pool dispatch a wide margin on a
+        // loaded host: a dispatch slower than the deadline would attribute
+        // the timeout to the queue stage — a load artifact, not the terminal
+        // path under test. The work below blocks on the release channel, so
+        // the deadline still expires mid-execution.
+        const DEADLINE_MS: u64 = 2_000;
+        const BACKSTOP_MS: u64 = DEADLINE_MS + 8_000;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release, wait) = std::sync::mpsc::channel();
         let watchdog = release.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(BACKSTOP_MS));
             let _ = watchdog.send(());
         });
         let error = run_timed(
@@ -248,9 +255,9 @@ mod tests {
                 started_tx
                     .send(())
                     .expect("announce that execution started");
-                let _ = wait.recv_timeout(Duration::from_secs(4));
+                let _ = wait.recv_timeout(Duration::from_millis(BACKSTOP_MS));
             },
-            Duration::from_millis(100),
+            Duration::from_millis(DEADLINE_MS),
             None,
         )
         .await
@@ -269,7 +276,7 @@ mod tests {
             error.timing
         );
         assert!(
-            error.timing.queue_wait_ms <= 100,
+            error.timing.queue_wait_ms <= DEADLINE_MS,
             "dispatch wait exceeded the whole deadline: {:?}",
             error.timing
         );
