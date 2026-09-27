@@ -27,6 +27,23 @@ use crate::tui::text::{
 pub(crate) const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
 pub(crate) const STATUS_LABEL_WIDTH: usize = 13;
 
+/// Compact "time since the last tool call" for the request telemetry line:
+/// `--` when nothing was observed yet, one decimal below 99 s, then `99+ s`.
+pub(crate) fn format_last_tool_call_elapsed(
+    last_tool_call_ms: Option<u128>,
+    now_millis: u128,
+) -> String {
+    let Some(last_tool_call_ms) = last_tool_call_ms else {
+        return "--".to_string();
+    };
+    let elapsed_ms = now_millis.saturating_sub(last_tool_call_ms);
+    if elapsed_ms > 99_000 {
+        "99+ s".to_string()
+    } else {
+        format!("{:.1} s", elapsed_ms as f64 / 1_000.0)
+    }
+}
+
 pub(crate) fn draw_ui(
     f: &mut Frame,
     app: &AppState,
@@ -209,6 +226,14 @@ pub(crate) fn draw_ui(
         Line::from(vec![
             status_label(ui_language.text("REQ SESSION", "工作階段請求")),
             Span::styled(app.request_count.to_string(), value_style),
+            Span::styled(
+                format!("  {} ", ui_language.text("last call", "最後呼叫")),
+                muted_style,
+            ),
+            Span::styled(
+                format_last_tool_call_elapsed(app.last_tool_call_ms, now_millis),
+                value_style,
+            ),
         ]),
         Line::from(vec![
             status_label(ui_language.text("REQ TOTAL", "累計請求")),

@@ -718,6 +718,9 @@ pub struct AppState {
     connected_chat_ids: HashSet<String>,
     pub request_count: u64,
     pub total_request_count: u64,
+    /// When the last tool call was observed, for stream-failure correlation:
+    /// a stream error long after this is unlikely to be CatDesk's fault.
+    pub last_tool_call_ms: Option<u128>,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub daily_usage_by_model: DailyUsageByModel,
     pub session_usage_totals: UsageTotals,
@@ -1123,6 +1126,7 @@ impl AppState {
             connected_chat_ids: HashSet::new(),
             request_count: 0,
             total_request_count: config.total_request_count,
+            last_tool_call_ms: None,
             usage_by_model: config.usage_by_model,
             daily_usage_by_model: config.daily_usage_by_model,
             session_usage_totals: UsageTotals::default(),
@@ -1401,6 +1405,9 @@ impl AppState {
         let only_bootstrap_status_events = events_are_bootstrap_status_events(events);
         let starts_tool_call = direction == FlowDirection::Forward
             && events.iter().any(|event| event.starts_with("tools/call:"));
+        if starts_tool_call {
+            self.last_tool_call_ms = Some(now_ms);
+        }
 
         if let Some(idx) = self.flows.iter().position(|flow| flow.flow_id == flow_id) {
             let mut flow = self.flows.remove(idx);
@@ -2301,6 +2308,32 @@ toolCallCount = 0
         let flow = app.flows.first().expect("missing flow");
         assert!(!flow.bootstrap_status_active);
         assert_eq!(flow.bootstrap_progress, FlowBootstrapProgress::default());
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn record_flow_tool_call_tracks_last_tool_call_time() {
+        let (mut app, workspace, config_path) = test_app("catdesk-last-tool-call");
+
+        assert!(app.last_tool_call_ms.is_none());
+        app.record_flow(
+            "stateless",
+            &["tools/call:read".to_string()],
+            FlowDirection::Forward,
+        );
+        let observed = app
+            .last_tool_call_ms
+            .expect("tool call must set the marker");
+
+        // Non-tool events must not move the marker.
+        app.record_flow(
+            "stateless",
+            &["assistant:message".to_string()],
+            FlowDirection::Backward,
+        );
+        assert_eq!(app.last_tool_call_ms, Some(observed));
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
