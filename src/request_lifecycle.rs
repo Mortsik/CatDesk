@@ -107,6 +107,11 @@ pub(crate) struct StreamFailureCorrelation {
     pub(crate) completed_requests: u64,
     /// Requests still in flight at the failure time, oldest first.
     pub(crate) active_at_failure: Vec<ActiveAtFailure>,
+    /// Requests cut by an abrupt restart: their owning pid died before any
+    /// terminal record, and a `process_started` from a different pid proved
+    /// they can no longer finish. Their age is measured from start to the
+    /// restart boundary, not to the failure time.
+    pub(crate) lost_at_restart: Vec<ActiveAtFailure>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -150,6 +155,10 @@ fn record_request_id(record: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn record_pid(record: &Value) -> Option<u64> {
+    record.get("pid").and_then(Value::as_u64)
+}
+
 /// Terminal reason of an `http_finished` record. New records carry
 /// `terminal_reason`; older rotated logs predate it, so the reason is
 /// reconstructed from the scheduler fields (a deadline stage proves a
@@ -186,7 +195,9 @@ fn cancelled_terminal_reason(record: &Value) -> TerminalReason {
 /// `[at_ms - window_ms, at_ms + window_ms]` are ignored so client clock skew
 /// is absorbed by the window rather than by exact matching. The classifier
 /// reads only metadata fields (`event`, `request_id`, `terminal_reason`,
-/// `scheduler_deadline_stage`, `timestamp_ms`), never payloads.
+/// `scheduler_deadline_stage`, `timestamp_ms`, `pid`), never payloads, and
+/// does not require the records to be pre-sorted: the pid-restart boundary is
+/// resolved against `process_started` timestamps, not file order.
 pub(crate) fn classify_stream_failure(
     records: &[Value],
     at_ms: u64,
@@ -202,17 +213,23 @@ pub(crate) fn classify_stream_failure(
     let mut client_cancellations = BTreeSet::new();
     let mut shutdown_cancellations = BTreeSet::new();
     let mut worker_failures = BTreeSet::new();
-    let mut started: Vec<(String, u64)> = Vec::new();
+    let mut started: Vec<(String, u64, Option<u64>)> = Vec::new();
     let mut finished_by_id: BTreeSet<String> = BTreeSet::new();
 
     // "What was in flight at the failure time" needs the full history of the
     // log, not just the window: a request that started long before the window
     // and never finished is exactly the stall the window must still see.
     // Only the three lifecycle events count here; `mcp_request` and friends
-    // also carry a request_id but never terminate a lifecycle.
+    // also carry a request_id but never terminate a lifecycle. `process_started`
+    // is collected in the same sweep because its pid is the restart boundary
+    // below.
+    let mut restarts: Vec<(u64, u64)> = Vec::new();
     for record in records {
         let event = record.get("event").and_then(Value::as_str).unwrap_or("");
-        if !matches!(event, "http_started" | "http_finished" | "http_cancelled") {
+        if !matches!(
+            event,
+            "http_started" | "http_finished" | "http_cancelled" | "process_started"
+        ) {
             continue;
         }
         let Some(timestamp) = record_timestamp_ms(record) else {
@@ -224,7 +241,12 @@ pub(crate) fn classify_stream_failure(
         match event {
             "http_started" => {
                 if let Some(id) = record_request_id(record) {
-                    started.push((id, timestamp));
+                    started.push((id, timestamp, record_pid(record)));
+                }
+            }
+            "process_started" => {
+                if let Some(pid) = record_pid(record) {
+                    restarts.push((timestamp, pid));
                 }
             }
             _ => {
@@ -234,6 +256,7 @@ pub(crate) fn classify_stream_failure(
             }
         }
     }
+    restarts.sort_unstable();
 
     // Coincident evidence, on the other hand, is window-bounded so an
     // unrelated old failure never explains a fresh stream error. It never
@@ -276,9 +299,29 @@ pub(crate) fn classify_stream_failure(
     }
 
     // Requests started before the failure time with no terminal record by
-    // then were still in flight; their age is the leading indicator.
-    for (id, started_at) in started {
-        if !finished_by_id.contains(&id) {
+    // then were still in flight; their age is the leading indicator. One
+    // exception: an unfinished request whose pid was followed by a
+    // `process_started` from a different pid cannot finish anymore — the
+    // owning process died abruptly (no `server_stopping` on that path), so
+    // the request was lost at the restart boundary, not still active hours
+    // later. A strict `>` keeps a request alive when its start shares a
+    // millisecond with the boundary, where record order is ambiguous.
+    // Legacy records without a pid carry no boundary signal and stay active.
+    for (id, started_at, pid) in started {
+        if finished_by_id.contains(&id) {
+            continue;
+        }
+        let boundary = pid.and_then(|pid| {
+            restarts
+                .iter()
+                .find(|(ts, restart_pid)| *ts > started_at && *restart_pid != pid)
+        });
+        if let Some((boundary_ts, _)) = boundary {
+            correlation.lost_at_restart.push(ActiveAtFailure {
+                request_id: id,
+                age_ms: boundary_ts - started_at,
+            });
+        } else {
             correlation.active_at_failure.push(ActiveAtFailure {
                 request_id: id,
                 age_ms: at_ms - started_at,
@@ -287,6 +330,9 @@ pub(crate) fn classify_stream_failure(
     }
     correlation
         .active_at_failure
+        .sort_by(|a, b| b.age_ms.cmp(&a.age_ms));
+    correlation
+        .lost_at_restart
         .sort_by(|a, b| b.age_ms.cmp(&a.age_ms));
 
     correlation.deadline_timeouts = deadline_timeouts.into_iter().collect();
@@ -475,6 +521,80 @@ mod tests {
         assert_eq!(correlation.active_at_failure[0].age_ms, 6_000);
         assert_eq!(correlation.active_at_failure[1].age_ms, 2_000);
         assert_eq!(correlation.active_at_failure[2].age_ms, 500);
+    }
+
+    #[test]
+    fn restart_under_a_new_pid_cuts_unfinished_requests() {
+        // The ghost-request shape from the abrupt-restart investigation: the
+        // old process started a request, died without any terminal record,
+        // and a new pid took over. Reading that request as "active" hours
+        // after the restart is wrong — it was cut at the pid boundary.
+        let records = vec![
+            json!({"event": "http_started", "request_id": "ghost", "timestamp_ms": 5_800,
+                "pid": 100}),
+            json!({"event": "process_started", "timestamp_ms": 6_000, "pid": 200,
+                "version": "0.9.2"}),
+            json!({"event": "http_started", "request_id": "fresh", "timestamp_ms": 6_200,
+                "pid": 200}),
+        ];
+        let correlation = classify_stream_failure(&records, FAILURE_AT_MS, WINDOW_MS);
+        assert_eq!(
+            correlation
+                .lost_at_restart
+                .iter()
+                .map(|lost| lost.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["ghost"]
+        );
+        // Age runs from start to the restart boundary, not to the failure.
+        assert_eq!(correlation.lost_at_restart[0].age_ms, 200);
+        // The new process's request is genuinely still in flight.
+        assert_eq!(
+            correlation
+                .active_at_failure
+                .iter()
+                .map(|active| active.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["fresh"]
+        );
+        assert_eq!(correlation.active_at_failure[0].age_ms, 3_800);
+    }
+
+    #[test]
+    fn same_pid_process_started_does_not_cut_in_flight_requests() {
+        // A re-opened log slot (or the concurrent directory) can re-record
+        // `process_started` for the very same pid; that is not a restart.
+        let records = vec![
+            json!({"event": "http_started", "request_id": "live", "timestamp_ms": 9_000,
+                "pid": 7}),
+            json!({"event": "process_started", "timestamp_ms": 9_500, "pid": 7}),
+        ];
+        let correlation = classify_stream_failure(&records, FAILURE_AT_MS, WINDOW_MS);
+        assert!(correlation.lost_at_restart.is_empty(), "{correlation:?}");
+        assert_eq!(
+            correlation
+                .active_at_failure
+                .iter()
+                .map(|active| active.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["live"]
+        );
+    }
+
+    #[test]
+    fn finished_after_the_boundary_is_not_lost_at_restart() {
+        // Overlapping processes: the old pid finished its request after the
+        // new pid had already started. A terminal record absolves the request.
+        let records = vec![
+            json!({"event": "http_started", "request_id": "slow", "timestamp_ms": 5_000,
+                "pid": 100}),
+            json!({"event": "process_started", "timestamp_ms": 6_000, "pid": 200}),
+            json!({"event": "http_finished", "request_id": "slow", "timestamp_ms": 6_500,
+                "pid": 100, "status": 200}),
+        ];
+        let correlation = classify_stream_failure(&records, FAILURE_AT_MS, WINDOW_MS);
+        assert!(correlation.lost_at_restart.is_empty(), "{correlation:?}");
+        assert!(correlation.active_at_failure.is_empty(), "{correlation:?}");
     }
 
     #[test]
