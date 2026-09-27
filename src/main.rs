@@ -14,6 +14,7 @@ mod linux_sandbox;
 mod macos_terminal;
 mod mascot;
 mod mcp;
+mod request_lifecycle;
 mod request_workers;
 mod ngrok;
 mod perf_metrics;
@@ -252,7 +253,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let result = run_app(&mut terminal, state.clone(), session_started_at).await;
 
     diagnostics::event("process_stopping");
-    diagnostics::event("server_stopping");
+    diagnostics::server_stopping();
 
     stdout().execute(DisableBracketedPaste)?;
     stdout().execute(DisableMouseCapture)?;

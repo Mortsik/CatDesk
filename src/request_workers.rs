@@ -67,6 +67,12 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Callback fired on the blocking-pool thread when the task starts running.
+/// Used to advance the request's live lifecycle stage (see
+/// `request_lifecycle`); diagnostics task-locals do not exist on that thread,
+/// so the caller captures whatever it needs in this closure.
+pub(crate) type ExecuteStarted = Arc<dyn Fn() + Send + Sync>;
+
 /// Sentinel stored in the shared dispatch timestamp until the blocking task
 /// has actually started running.
 const NOT_DISPATCHED: u64 = u64::MAX;
@@ -74,6 +80,7 @@ const NOT_DISPATCHED: u64 = u64::MAX;
 pub(crate) async fn run_timed<F>(
     work: F,
     deadline: Duration,
+    execute_started: Option<ExecuteStarted>,
 ) -> Result<TimedRequestResult<F::Output>, TimedRequestError>
 where
     F: Future + Send + 'static,
@@ -91,6 +98,9 @@ where
     let task = tokio::task::spawn_blocking(move || {
         let queue_wait_ms = elapsed_ms(request_started);
         observed_dispatch_ms.store(queue_wait_ms, Ordering::Release);
+        if let Some(execute_started) = execute_started {
+            execute_started();
+        }
         let execution_started = Instant::now();
         let value = runtime.block_on(work);
         (value, queue_wait_ms, elapsed_ms(execution_started))
@@ -181,7 +191,7 @@ mod tests {
     use super::*;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     #[tokio::test]
@@ -208,6 +218,7 @@ mod tests {
                     .expect("worker fixture was never released")
             },
             Duration::from_secs(5),
+            None,
         )
         .await
         .expect("worker request failed")
@@ -237,6 +248,7 @@ mod tests {
                 let _ = wait.recv_timeout(Duration::from_secs(4));
             },
             Duration::from_millis(100),
+            None,
         )
         .await
         .expect_err("work outliving its deadline must hit the response deadline");
@@ -282,6 +294,7 @@ mod tests {
                         barrier.wait().await;
                     },
                     Duration::from_secs(10),
+                    None,
                 )
                 .await
                 .expect("no request may be rejected");
@@ -297,10 +310,27 @@ mod tests {
 
     #[tokio::test]
     async fn timed_requests_report_successful_dispatch_and_execution() {
-        let result = run_timed(async { 42u8 }, Duration::from_secs(1))
+        let result = run_timed(async { 42u8 }, Duration::from_secs(1), None)
             .await
             .expect("timed request should succeed");
         assert_eq!(result.value, 42);
         assert_eq!(result.timing.deadline_stage, None);
+    }
+
+    #[tokio::test]
+    async fn execution_callback_fires_when_the_blocking_task_starts() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        let callback: ExecuteStarted = Arc::new(move || observed.store(true, Ordering::SeqCst));
+        let result = run_timed(async { 7u8 }, Duration::from_secs(5), Some(callback))
+            .await
+            .expect("timed request should succeed");
+        assert_eq!(result.value, 7);
+        // The callback runs on the blocking task before its result is joined,
+        // so by the time run_timed returns it must have fired.
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "execution callback never fired although the task completed"
+        );
     }
 }

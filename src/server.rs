@@ -25,6 +25,7 @@ use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::project_scope;
+use crate::request_lifecycle::{RequestStage, TerminalReason};
 use crate::request_workers::{RequestClass, run_timed};
 use crate::session_context::{ProjectStateChange, SessionContextStore};
 use crate::state::{
@@ -4191,6 +4192,9 @@ async fn post_mcp_http(
     // tool workers so clients can distinguish overload from a dead server.
     let metadata = serde_json::from_slice::<Value>(&body_bytes).ok();
     if metadata.as_ref().and_then(|v| v.get("method")).and_then(Value::as_str) == Some("ping") {
+        // The ping path never enters the scheduler; it goes straight to
+        // responding so its lifecycle record does not claim queued time.
+        crate::diagnostics::set_current_request_stage(RequestStage::Responding);
         let body = metadata.as_ref().unwrap();
         crate::diagnostics::rpc_request(body);
         if serde_json::from_value::<JsonRpcRequest>(body.clone()).is_err() {
@@ -4217,13 +4221,20 @@ async fn post_mcp_http(
         .map(request_class)
         .unwrap_or(RequestClass::General);
     let id = metadata.as_ref().and_then(|v| v.get("id").cloned());
+    // Dispatch marks the handoff to the scheduler; the blocking task itself
+    // reports `Executing` (its thread has no request task-local, hence the
+    // captured callback).
+    let execute_started = crate::diagnostics::current_execute_started();
+    crate::diagnostics::set_current_request_stage(RequestStage::Dispatch);
     match run_timed(
         async move { post_mcp_inner(State(s), body_bytes, &headers, None).await },
         request_deadline(class),
+        execute_started,
     )
     .await
     {
         Ok(result) => {
+            crate::diagnostics::set_current_request_stage(RequestStage::Responding);
             let mut response = result.value;
             response
                 .extensions_mut()
@@ -4237,9 +4248,14 @@ async fn post_mcp_http(
         }
         Err(error) => {
             use crate::request_workers::RequestFailure;
-            let status = match &error.failure {
-                RequestFailure::Deadline => StatusCode::GATEWAY_TIMEOUT,
-                RequestFailure::Failed => StatusCode::INTERNAL_SERVER_ERROR,
+            let (status, terminal_reason) = match &error.failure {
+                RequestFailure::Deadline => {
+                    (StatusCode::GATEWAY_TIMEOUT, TerminalReason::DeadlineTimeout)
+                }
+                RequestFailure::Failed => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    TerminalReason::WorkerFailed,
+                ),
             };
             crate::diagnostics::event(request_failure_event(&error.failure));
             let payload = mcp::JsonRpcResponse::error(
@@ -4255,6 +4271,9 @@ async fn post_mcp_http(
             response
                 .extensions_mut()
                 .insert(crate::diagnostics::RpcError(-32000));
+            response
+                .extensions_mut()
+                .insert(crate::diagnostics::TerminalReasonExt(terminal_reason));
             response
                 .extensions_mut()
                 .insert(crate::diagnostics::SchedulerTiming {

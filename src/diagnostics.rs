@@ -1,5 +1,7 @@
 //! Bounded, metadata-only connection diagnostics. Never persist MCP payloads.
 
+use crate::request_lifecycle::{RequestStage, TerminalReason};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,13 +134,113 @@ mod tests {
             write_failures: Arc::new(AtomicU64::new(0)),
             write_dropped: Arc::new(AtomicU64::new(0)),
             active: Arc::new(AtomicU64::new(0)),
-            active_started: Arc::new(StdMutex::new(HashMap::new())),
+            active_requests: Arc::new(StdMutex::new(HashMap::new())),
+            stopping_since: Arc::new(StdMutex::new(None)),
         };
         log.record(json!({"event": "first"}));
         log.record(json!({"event": "dropped"}));
         assert_eq!(receiver.recv().unwrap().unwrap()["event"], "first");
         log.record(json!({"event": "next"}));
         assert_eq!(receiver.recv().unwrap().unwrap()["dropped_records"], 1);
+    }
+
+    #[test]
+    fn lifecycle_stages_are_visible_in_the_active_registry() {
+        let root =
+            std::env::temp_dir().join(format!("catdesk-stage-registry-{}", uuid::Uuid::new_v4()));
+        let (log, guard) = Diagnostics::start(&root).unwrap();
+
+        log.begin_request("slow", Instant::now() - Duration::from_millis(900));
+        log.begin_request("fresh", Instant::now());
+        assert_eq!(log.active_requests_view()[0].request_id, "slow");
+        assert_eq!(log.active_requests_view()[0].stage, RequestStage::Queued);
+
+        // Stage transitions are visible live, including on the oldest request.
+        log.update_stage("slow", RequestStage::Dispatch);
+        log.update_stage("fresh", RequestStage::Dispatch);
+        log.update_stage("fresh", RequestStage::Executing);
+        let view = log.active_requests_view();
+        assert_eq!(view[0].stage, RequestStage::Dispatch);
+        assert_eq!(view[1].request_id, "fresh");
+        assert_eq!(view[1].stage, RequestStage::Executing);
+
+        let snapshot = log.finish_request("fresh");
+        assert_eq!(snapshot.oldest_active_stage, Some(RequestStage::Dispatch));
+        assert_eq!(log.finish_request("slow").active_requests, 0);
+        assert!(log.active_requests_view().is_empty());
+
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellations_after_server_stopping_are_attributed_to_shutdown() {
+        let root =
+            std::env::temp_dir().join(format!("catdesk-cancel-reason-{}", uuid::Uuid::new_v4()));
+        let (log, guard) = Diagnostics::start(&root).unwrap();
+
+        let make_trace = |id: &str| RequestLog {
+            log: log.clone(),
+            id: id.to_string(),
+            started: Instant::now(),
+            complete: AtomicBool::new(false),
+            tool: AtomicU8::new(0),
+        };
+        drop(make_trace("client-drop"));
+        log.mark_server_stopping();
+        drop(make_trace("shutdown-drop"));
+
+        drop(guard); // waits for every accepted record to reach disk
+        let records: Vec<Value> = std::fs::read_to_string(root.join("connections.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let cancelled: Vec<_> = records
+            .iter()
+            .filter(|record| record["event"] == "http_cancelled")
+            .collect();
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(cancelled[0]["terminal_reason"], "client_disconnect");
+        assert_eq!(cancelled[0]["stage"], "cancelled");
+        assert_eq!(cancelled[1]["terminal_reason"], "server_shutdown");
+        assert_eq!(cancelled[1]["stage"], "cancelled");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn response_terminal_reason_prefers_scheduler_failure_then_deadline_stage() {
+        let deadline_stage = |stage: Option<&'static str>| SchedulerTiming {
+            class: "control",
+            queue_wait_ms: 0,
+            execution_ms: 1,
+            deadline_stage: stage,
+        };
+        assert_eq!(
+            response_terminal_reason(None, None),
+            TerminalReason::Completed
+        );
+        assert_eq!(
+            response_terminal_reason(Some(deadline_stage(None)), None),
+            TerminalReason::Completed
+        );
+        // A deadline stage alone (legacy records and older responses) is a
+        // timeout, while an explicit scheduler failure outranks it.
+        assert_eq!(
+            response_terminal_reason(Some(deadline_stage(Some("execution"))), None),
+            TerminalReason::DeadlineTimeout
+        );
+        assert_eq!(
+            response_terminal_reason(
+                Some(deadline_stage(None)),
+                Some(TerminalReason::DeadlineTimeout)
+            ),
+            TerminalReason::DeadlineTimeout
+        );
+        assert_eq!(
+            response_terminal_reason(None, Some(TerminalReason::WorkerFailed)),
+            TerminalReason::WorkerFailed
+        );
     }
 
     #[test]
@@ -153,6 +255,7 @@ mod tests {
         let first = log.begin_request("first", now - Duration::from_millis(100));
         assert_eq!(first.active_requests, 1);
         assert!(first.oldest_active_request_ms >= 50);
+        assert_eq!(first.oldest_active_stage, Some(RequestStage::Queued));
 
         let second = log.begin_request("second", now - Duration::from_millis(10));
         assert_eq!(second.active_requests, 2);
@@ -166,6 +269,7 @@ mod tests {
         let empty = log.finish_request("second");
         assert_eq!(empty.active_requests, 0);
         assert_eq!(empty.oldest_active_request_ms, 0);
+        assert_eq!(empty.oldest_active_stage, None);
 
         drop(guard);
         std::fs::remove_dir_all(root).unwrap();
@@ -326,6 +430,10 @@ mod tests {
         for start in &starts {
             assert!(start["active_requests"].is_number());
             assert!(start["oldest_active_request_ms"].is_number());
+            // Every request enters the registry queued; the snapshot always
+            // names a live stage because the request itself is active.
+            assert_eq!(start["stage"], "queued");
+            assert!(start["oldest_active_stage"].is_string());
             let finishes: Vec<_> = records
                 .iter()
                 .filter(|r| r["event"] == "http_finished" && r["request_id"] == start["request_id"])
@@ -334,6 +442,9 @@ mod tests {
             assert!(finishes[0]["elapsed_ms"].is_number());
             assert!(finishes[0]["active_requests"].is_number());
             assert!(finishes[0]["oldest_active_request_ms"].is_number());
+            // A produced response completes the lifecycle, whatever the status.
+            assert_eq!(finishes[0]["stage"], "completed");
+            assert_eq!(finishes[0]["terminal_reason"], "completed");
         }
         let init = records
             .iter()
@@ -473,6 +584,261 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    async fn spawn_diagnostic_server(
+        root: &std::path::Path,
+    ) -> (String, Diagnostics, Guard, tokio::task::JoinHandle<()>) {
+        use crate::{command_jobs::CommandJobManager, state::AppState};
+        use tokio::sync::{Mutex, mpsc::channel};
+        let (log, guard) = Diagnostics::start(&root.join("logs")).unwrap();
+        let state = AppState::new_for_test(
+            0,
+            root.to_string_lossy().into_owned(),
+            root.join("config.toml"),
+        )
+        .unwrap();
+        let (events, _receiver) = channel(crate::state::UI_EVENT_CAPACITY);
+        let app = crate::server::router(
+            Arc::new(Mutex::new(state)),
+            None,
+            CommandJobManager::new(),
+            "/secret-slug/mcp".into(),
+            events,
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            Some(log.clone()),
+            http_request,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, log, guard, server)
+    }
+
+    async fn post_tools_call(
+        client: &reqwest::Client,
+        base: &str,
+        tool: &'static str,
+        arguments: Value,
+    ) -> Value {
+        client
+            .post(format!("{base}/secret-slug/mcp"))
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", tool)
+            .json(
+                &json!({"jsonrpc": "2.0", "id": "lifecycle-id", "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments, "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}}}}),
+            )
+            .send()
+            .await
+            .expect("tool call request must complete")
+            .json::<Value>()
+            .await
+            .expect("tool call response must be JSON")
+    }
+
+    #[tokio::test]
+    async fn client_disconnection_is_recorded_as_cancelled_with_a_reason() {
+        let root =
+            std::env::temp_dir().join(format!("catdesk-cancel-http-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (base, log, guard, server) = spawn_diagnostic_server(&root).await;
+        let client = reqwest::Client::new();
+
+        // The instruction gate must be opened for the (anonymous) session
+        // before any other tool is accepted.
+        let instruction = post_tools_call(&client, &base, "catdesk_instruction", json!({})).await;
+        // A denied call would carry the gate's structured errorCode.
+        assert!(
+            instruction["result"]["structuredContent"]["errorCode"].is_null(),
+            "catdesk_instruction must open the session gate: {instruction}"
+        );
+
+        // A job that outlives the poll keeps the scheduled request blocked.
+        let start = post_tools_call(
+            &client,
+            &base,
+            "start_command",
+            json!({"command": "sleep 3"}),
+        )
+        .await;
+        let job_id = start["result"]["structuredContent"]["jobId"]
+            .as_str()
+            .expect("start_command must return a jobId")
+            .to_string();
+
+        // Poll with a wait, then drop the connection mid-request.
+        let poll = tokio::spawn({
+            let client = client.clone();
+            let base = base.clone();
+            async move {
+                post_tools_call(
+                    &client,
+                    &base,
+                    "poll_command",
+                    json!({"job_id": job_id, "wait_ms": 1_500}),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        poll.abort();
+
+        // The lifecycle registry is updated synchronously on drop, so it
+        // proves the server saw the disconnect without waiting for disk.
+        let mut drained = false;
+        for _ in 0..50 {
+            if log.active_requests_view().is_empty() {
+                drained = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            drained,
+            "the cancelled request never left the lifecycle registry"
+        );
+
+        server.abort();
+        let _ = server.await;
+        drop(guard); // waits for every accepted record to reach disk
+        let records: Vec<Value> = std::fs::read_to_string(root.join("logs/connections.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let cancelled: Vec<_> = records
+            .iter()
+            .filter(|record| record["event"] == "http_cancelled")
+            .collect();
+        assert_eq!(cancelled.len(), 1, "only the dropped poll is cancelled");
+        assert_eq!(
+            cancelled[0]["terminal_reason"], "client_disconnect",
+            "a mid-request disconnect must be attributed to the client"
+        );
+        assert_eq!(cancelled[0]["stage"], "cancelled");
+        let poll_start = records
+            .iter()
+            .find(|r| r["event"] == "http_started" && r["request_id"] == cancelled[0]["request_id"])
+            .expect("the cancelled request must have started");
+        assert_eq!(poll_start["stage"], "queued");
+        assert_eq!(log.active.load(Ordering::Relaxed), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_scheduled_requests_keep_correlated_lifecycle_records() {
+        let root =
+            std::env::temp_dir().join(format!("catdesk-concurrent-http-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (base, log, guard, server) = spawn_diagnostic_server(&root).await;
+        let client = reqwest::Client::new();
+
+        // The instruction gate must be opened for the (anonymous) session
+        // before any other tool is accepted.
+        let instruction = post_tools_call(&client, &base, "catdesk_instruction", json!({})).await;
+        // A denied call would carry the gate's structured errorCode.
+        assert!(
+            instruction["result"]["structuredContent"]["errorCode"].is_null(),
+            "catdesk_instruction must open the session gate: {instruction}"
+        );
+
+        let start = post_tools_call(
+            &client,
+            &base,
+            "start_command",
+            json!({"command": "sleep 3"}),
+        )
+        .await;
+        let job_id = start["result"]["structuredContent"]["jobId"]
+            .as_str()
+            .expect("start_command must return a jobId")
+            .to_string();
+
+        // One deliberately slow poll plus fast ones running alongside it:
+        // concurrency must not lose or merge any lifecycle record.
+        let slow = tokio::spawn({
+            let client = client.clone();
+            let base = base.clone();
+            let job_id = job_id.clone();
+            async move {
+                post_tools_call(
+                    &client,
+                    &base,
+                    "poll_command",
+                    json!({"job_id": job_id, "wait_ms": 1_000}),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut fast = Vec::new();
+        for _ in 0..4 {
+            fast.push(post_tools_call(
+                &client,
+                &base,
+                "poll_command",
+                json!({"job_id": "missing-job", "wait_ms": 0}),
+            ));
+        }
+        for (index, body) in fast.into_iter().enumerate() {
+            let body = body.await;
+            assert_eq!(body["result"]["isError"], true, "fast poll {index} errored");
+        }
+        let slow_body = slow.await.expect("slow poll task panicked");
+        assert!(
+            slow_body["result"]["structuredContent"]["state"].is_string(),
+            "the slow poll must return a job snapshot: {slow_body}"
+        );
+
+        server.abort();
+        let _ = server.await;
+        drop(guard);
+        let records: Vec<Value> = std::fs::read_to_string(root.join("logs/connections.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let starts: Vec<_> = records
+            .iter()
+            .filter(|r| r["event"] == "http_started")
+            .collect();
+        assert_eq!(
+            starts.len(),
+            7,
+            "one instruction, one start_command and five polls"
+        );
+        for start in &starts {
+            let finishes: Vec<_> = records
+                .iter()
+                .filter(|r| r["event"] == "http_finished" && r["request_id"] == start["request_id"])
+                .collect();
+            assert_eq!(finishes.len(), 1, "exactly one terminal per request id");
+            assert_eq!(finishes[0]["stage"], "completed");
+            assert_eq!(finishes[0]["terminal_reason"], "completed");
+            // polls and catdesk_instruction are control; start_command is process.
+            assert!(
+                ["control", "process"]
+                    .contains(&finishes[0]["scheduler_class"].as_str().unwrap_or("")),
+                "unexpected scheduler class: {}",
+                finishes[0]
+            );
+            assert!(finishes[0]["scheduler_deadline_stage"].is_null());
+        }
+        assert!(
+            starts
+                .iter()
+                .any(|start| start["active_requests"].as_u64() >= Some(2)),
+            "the concurrent polls must overlap in the lifecycle registry"
+        );
+        assert_eq!(log.active.load(Ordering::Relaxed), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 use axum::{
@@ -509,7 +875,11 @@ pub(crate) struct Diagnostics {
     write_failures: Arc<AtomicU64>,
     write_dropped: Arc<AtomicU64>,
     active: Arc<AtomicU64>,
-    active_started: Arc<StdMutex<HashMap<String, Instant>>>,
+    /// Live lifecycle registry: request id -> start and current stage.
+    active_requests: Arc<StdMutex<HashMap<String, ActiveRequest>>>,
+    /// Set when the server begins stopping so cancellations after it are
+    /// attributed to the shutdown rather than to client disconnects.
+    stopping_since: Arc<StdMutex<Option<Instant>>>,
 }
 
 /// Drain accepted records on ordinary exit. A crash may lose queued records.
@@ -529,46 +899,149 @@ impl Drop for Guard {
     }
 }
 
+/// One in-flight request in the lifecycle registry.
+#[derive(Clone, Copy, Debug)]
+struct ActiveRequest {
+    started: Instant,
+    stage: RequestStage,
+}
+
+/// A correlated live view of one in-flight request.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveRequestView {
+    pub(crate) request_id: String,
+    pub(crate) stage: RequestStage,
+    pub(crate) age_ms: u64,
+}
+
+/// The scheduler-level terminal reason of a response, carried in extensions so
+/// the HTTP middleware can record why the request lifecycle ended.
+#[derive(Clone, Copy)]
+pub(crate) struct TerminalReasonExt(pub(crate) TerminalReason);
+
+fn ms_since(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Why a produced response's lifecycle ended. The scheduler failure wins; a
+/// recorded scheduler deadline stage is the legacy fallback for responses
+/// built before terminal reasons existed; everything else completed.
+fn response_terminal_reason(
+    scheduler: Option<SchedulerTiming>,
+    scheduled_failure: Option<TerminalReason>,
+) -> TerminalReason {
+    scheduled_failure
+        .or_else(|| {
+            scheduler
+                .filter(|timing| timing.deadline_stage.is_some())
+                .map(|_| TerminalReason::DeadlineTimeout)
+        })
+        .unwrap_or(TerminalReason::Completed)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveRequestSnapshot {
     active_requests: u64,
     oldest_active_request_ms: u64,
+    oldest_active_stage: Option<RequestStage>,
 }
 
 impl Diagnostics {
-    fn active_request_snapshot(active_started: &HashMap<String, Instant>) -> ActiveRequestSnapshot {
+    fn active_request_snapshot(
+        active_requests: &HashMap<String, ActiveRequest>,
+    ) -> ActiveRequestSnapshot {
+        // The oldest request is the one that started first; ties resolve to
+        // any one of them, which is fine for a diagnostic snapshot.
+        let oldest = active_requests
+            .values()
+            .min_by_key(|request| request.started);
         ActiveRequestSnapshot {
-            active_requests: u64::try_from(active_started.len()).unwrap_or(u64::MAX),
-            oldest_active_request_ms: active_started
-                .values()
-                .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
-                .max()
-                .unwrap_or(0),
+            active_requests: u64::try_from(active_requests.len()).unwrap_or(u64::MAX),
+            oldest_active_request_ms: oldest.map_or(0, |request| ms_since(request.started)),
+            oldest_active_stage: oldest.map(|request| request.stage),
         }
     }
 
     fn begin_request(&self, id: &str, started: Instant) -> ActiveRequestSnapshot {
-        let mut active_started = self
-            .active_started
+        let mut active_requests = self
+            .active_requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        active_started.insert(id.to_string(), started);
-        let snapshot = Self::active_request_snapshot(&active_started);
+        active_requests.insert(
+            id.to_string(),
+            ActiveRequest {
+                started,
+                stage: RequestStage::Queued,
+            },
+        );
+        let snapshot = Self::active_request_snapshot(&active_requests);
         self.active
             .store(snapshot.active_requests, Ordering::Relaxed);
         snapshot
     }
 
-    fn finish_request(&self, id: &str) -> ActiveRequestSnapshot {
-        let mut active_started = self
-            .active_started
+    fn update_stage(&self, id: &str, stage: RequestStage) {
+        let mut active_requests = self
+            .active_requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        active_started.remove(id);
-        let snapshot = Self::active_request_snapshot(&active_started);
+        if let Some(request) = active_requests.get_mut(id) {
+            request.stage = stage;
+        }
+    }
+
+    fn finish_request(&self, id: &str) -> ActiveRequestSnapshot {
+        let mut active_requests = self
+            .active_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active_requests.remove(id);
+        let snapshot = Self::active_request_snapshot(&active_requests);
         self.active
             .store(snapshot.active_requests, Ordering::Relaxed);
         snapshot
+    }
+
+    /// Correlated live view of every in-flight request, oldest first.
+    #[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn active_requests_view(&self) -> Vec<ActiveRequestView> {
+        let active_requests = self
+            .active_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut view: Vec<_> = active_requests
+            .iter()
+            .map(|(request_id, request)| ActiveRequestView {
+                request_id: request_id.clone(),
+                stage: request.stage,
+                age_ms: ms_since(request.started),
+            })
+            .collect();
+        view.sort_by(|a, b| b.age_ms.cmp(&a.age_ms));
+        view
+    }
+
+    fn mark_server_stopping(&self) {
+        let mut stopping_since = self
+            .stopping_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if stopping_since.is_none() {
+            *stopping_since = Some(Instant::now());
+        }
+    }
+
+    fn cancellation_reason(&self) -> TerminalReason {
+        let stopping_since = self
+            .stopping_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if stopping_since.is_some() {
+            TerminalReason::ServerShutdown
+        } else {
+            TerminalReason::ClientDisconnect
+        }
     }
 
     fn start(root: &Path) -> io::Result<(Self, Guard)> {
@@ -586,7 +1059,8 @@ impl Diagnostics {
             write_failures: write_failures.clone(),
             write_dropped: write_dropped.clone(),
             active: Arc::new(AtomicU64::new(0)),
-            active_started: Arc::new(StdMutex::new(HashMap::new())),
+            active_requests: Arc::new(StdMutex::new(HashMap::new())),
+            stopping_since: Arc::new(StdMutex::new(None)),
         };
         let writer_root = writer.root.clone();
         let writer_limit = writer.limit;
@@ -657,6 +1131,45 @@ pub(crate) fn event(event: &'static str) {
     if let Some(log) = GLOBAL.get() {
         log.record(json!({"event": event}));
     }
+}
+
+/// Record the server-stop event and mark the moment, so request futures
+/// dropped afterwards are attributed to the shutdown instead of client
+/// disconnects.
+pub(crate) fn server_stopping() {
+    if let Some(log) = GLOBAL.get() {
+        log.mark_server_stopping();
+    }
+    event("server_stopping");
+}
+
+/// Advance the live lifecycle stage of the request running on this task.
+/// No-op outside request scope, so stage transitions are free for paths
+/// that never entered the middleware.
+pub(crate) fn set_current_request_stage(stage: RequestStage) {
+    let _ = REQUEST.try_with(|request| request.log.update_stage(&request.id, stage));
+}
+
+/// A callback for `run_timed` that advances the creating request's stage to
+/// `Executing` from the blocking-pool thread, where task-locals do not exist.
+pub(crate) fn current_execute_started() -> Option<crate::request_workers::ExecuteStarted> {
+    let reporter = REQUEST
+        .try_with(|request| StageReporter {
+            log: request.log.clone(),
+            id: request.id.clone(),
+        })
+        .ok()?;
+    Some(Arc::new(move || {
+        reporter
+            .log
+            .update_stage(&reporter.id, RequestStage::Executing)
+    }) as crate::request_workers::ExecuteStarted)
+}
+
+/// Owned handle to one request's live stage, usable from any thread.
+struct StageReporter {
+    log: Diagnostics,
+    id: String,
 }
 
 /// Identity appears exactly once per process, in this record; per-request
@@ -771,12 +1284,15 @@ struct RequestLog {
 impl Drop for RequestLog {
     fn drop(&mut self) {
         if !self.complete.load(Ordering::Relaxed) {
+            let reason = self.log.cancellation_reason();
             let active = self.log.finish_request(&self.id);
             self.log
                 .record(json!({"event": "http_cancelled", "request_id": self.id,
+                "stage": reason.stage_str(), "terminal_reason": reason.as_str(),
                 "elapsed_ms": self.started.elapsed().as_millis(),
                 "active_requests": active.active_requests,
-                "oldest_active_request_ms": active.oldest_active_request_ms}));
+                "oldest_active_request_ms": active.oldest_active_request_ms,
+                "oldest_active_stage": active.oldest_active_stage.map(RequestStage::as_str)}));
         }
     }
 }
@@ -812,14 +1328,20 @@ pub(crate) async fn http_request(
     let active = trace.log.begin_request(&trace.id, trace.started);
     trace.log.record(
         json!({"event": "http_started", "request_id": trace.id, "http_method": method,
+        "stage": RequestStage::Queued.as_str(),
         "route_matched": request.extensions().get::<MatchedPath>().is_some(),
         "active_requests": active.active_requests,
-        "oldest_active_request_ms": active.oldest_active_request_ms}),
+        "oldest_active_request_ms": active.oldest_active_request_ms,
+        "oldest_active_stage": active.oldest_active_stage.map(RequestStage::as_str)}),
     );
     REQUEST.scope(trace, async {
         let response = next.run(request).await;
         REQUEST.with(|trace| {
             let scheduler = response.extensions().get::<SchedulerTiming>().copied();
+            let terminal_reason = response_terminal_reason(
+                scheduler,
+                response.extensions().get::<TerminalReasonExt>().map(|e| e.0),
+            );
             let active = trace.log.finish_request(&trace.id);
             trace.complete.store(true, Ordering::Relaxed);
             let elapsed_ms = trace.started.elapsed().as_millis();
@@ -835,6 +1357,7 @@ pub(crate) async fn http_request(
                 );
             }
             trace.log.record(json!({"event": "http_finished", "request_id": trace.id,
+                "stage": terminal_reason.stage_str(), "terminal_reason": terminal_reason.as_str(),
                 "status": response.status().as_u16(), "rpc_error_code": response.extensions().get::<RpcError>().map(|e| e.0),
                 "tool_error": response.extensions().get::<ToolResult>().and_then(|r| r.is_error),
                 "content_items": response.extensions().get::<ToolResult>().and_then(|r| r.content_items),
@@ -844,7 +1367,8 @@ pub(crate) async fn http_request(
                 "scheduler_deadline_stage": scheduler.and_then(|timing| timing.deadline_stage),
                 "elapsed_ms": elapsed_ms,
                 "active_requests": active.active_requests,
-                "oldest_active_request_ms": active.oldest_active_request_ms}));
+                "oldest_active_request_ms": active.oldest_active_request_ms,
+                "oldest_active_stage": active.oldest_active_stage.map(RequestStage::as_str)}));
         });
         response
     }).await
