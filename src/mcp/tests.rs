@@ -2735,6 +2735,31 @@ fn catdesk_instruction_tells_agents_not_to_write_catdesk_trailers() {
 }
 
 #[test]
+fn catdesk_instruction_steers_long_commands_to_start_and_poll() {
+    let workspace_root = std::env::temp_dir().join(format!(
+        "catdesk-mcp-instruction-long-command-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+    let instruction =
+        catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
+            .expect("build instruction");
+    assert!(
+        instruction.contains("longer than about two minutes must never run through run_command"),
+        "long commands must be steered away from synchronous run_command: {instruction}"
+    );
+    assert!(
+        instruction
+            .contains("start them with start_command and read their progress with poll_command"),
+        "long commands must be steered to start_command + poll_command: {instruction}"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
 fn catdesk_instruction_drops_link_segment_guidance_without_code_support() {
     let workspace_root = std::env::temp_dir().join(format!(
         "catdesk-mcp-instruction-no-link-segment-{}",

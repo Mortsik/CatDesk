@@ -208,6 +208,10 @@ Always specify the branch explicitly when using `git push`."#
                 .to_string(),
         );
         lines.push(
+            "Commands expected to take longer than about two minutes must never run through run_command: the synchronous call is cut off at a hard 120-second ceiling and returns a timeout instead of output, so start them with start_command and read their progress with poll_command."
+                .to_string(),
+        );
+        lines.push(
             "Use poll_command to read incremental output from a background command. Pass the returned nextCursor as after on the next poll so output is not repeated. If hasMoreOutput is true, keep polling even after the command reaches a terminal state so all buffered output can be drained."
                 .to_string(),
         );
