@@ -3,7 +3,7 @@
 #
 # The in-suite scenarios (src/soak.rs) shorten response deadlines through a
 # test-only override so `cargo test` stays fast. This script runs the REAL
-# production policy — a genuine 45-second control-deadline timeout, a ~2-minute
+# production policy — the real 15-second stream-safe poll boundary, a ~2-minute
 # request near the 120-second ceiling, real concurrency, real client
 # disconnects, and the ngrok supervisor's real tunnel lifecycle events — and
 # asserts the same failure budget: every induced failure carries its expected
@@ -182,6 +182,14 @@ job_id_of() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["structuredContent"]["jobId"])' "$LAST_BODY_FILE"
 }
 
+cursor_of() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["structuredContent"]["nextCursor"])' "$LAST_BODY_FILE"
+}
+
+state_of() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["structuredContent"]["state"])' "$LAST_BODY_FILE"
+}
+
 # The assertion engine: same failure budget as src/soak.rs, over the real log.
 cat >"$TMP/assert.py" <<'EOF'
 import json, sys
@@ -221,15 +229,20 @@ if mode == "summary":
         print(f"  {event or '-'} / {reason or '-'}: {n}")
     leak_gate()
     print(f"  leak gate: {len(records)} records, no leaked requests")
-elif mode == "long504":
-    timeouts = [r for r in terminals("http_finished", "deadline_timeout")
-                if r.get("status") == 504 and r.get("scheduler_class") == "control"
-                and r.get("scheduler_deadline_stage") == "execution"
-                and r.get("elapsed_ms", 0) >= 44_000]
-    if not timeouts:
-        fail("no control-class 504 with terminal_reason=deadline_timeout, "
-             "deadline_stage=execution and elapsed>=44s")
-    print(f"  long poll 504 after {timeouts[0]['elapsed_ms']} ms (expected >=44000)")
+elif mode == "poll15":
+    requested_ids = {r.get("request_id") for r in records
+                     if r.get("event") == "mcp_request"
+                     and r.get("rpc_tool") == "poll_command"
+                     and r.get("requested_wait_ms") == 15_000}
+    if not requested_ids:
+        fail("no metadata record with requested_wait_ms=15000")
+    polls = [r for r in terminals("http_finished", "completed")
+             if r.get("request_id") in requested_ids
+             and r.get("status") == 200 and r.get("scheduler_class") == "control"
+             and 14_000 <= r.get("elapsed_ms", 0) < 30_000]
+    if not polls:
+        fail("no matching completed control-class poll near the 15s stream-safe boundary")
+    print(f"  stream-safe poll completed after {polls[0]['elapsed_ms']} ms")
 elif mode == "disconnect":
     drops = [r for r in terminals("http_cancelled", "client_disconnect")
              if r.get("elapsed_ms", 1 << 30) < 10_000]
@@ -279,14 +292,30 @@ echo "== phase: instruction gate =="
 call "tools/call" "catdesk_instruction" '{}' 30
 [[ "$STATUS" == 200 ]] || fail "catdesk_instruction returned $STATUS"
 
-# ── phase A: long request vs the real 45 s control deadline (~46 s) ──
-echo "== phase: long request hits the real 45s control deadline =="
+# ── phase A: real stream-safe poll boundary (~15 s) ──
+echo "== phase: poll returns at the real 15s stream-safe boundary =="
 call "tools/call" "start_command" '{"command":"sleep 90"}' 30
 [[ "$STATUS" == 200 ]] || fail "start_command returned $STATUS"
 JOB_A="$(job_id_of)"
-call "tools/call" "poll_command" "{\"job_id\":\"$JOB_A\",\"wait_ms\":46000}" 60
-[[ "$STATUS" == 504 ]] || fail "long poll returned $STATUS (expected 504)"
-echo "  poll hit the 45s deadline (HTTP $STATUS)"
+CURSOR_A="$(cursor_of)"
+call "tools/call" "poll_command" "{\"job_id\":\"$JOB_A\",\"after\":$CURSOR_A,\"wait_ms\":0}" 10
+[[ "$STATUS" == 200 ]] || fail "priming poll returned $STATUS"
+CURSOR_A="$(cursor_of)"
+STATE_A="$(state_of)"
+if [[ "$STATE_A" == "queued" ]]; then
+    call "tools/call" "poll_command" "{\"job_id\":\"$JOB_A\",\"after\":$CURSOR_A,\"wait_ms\":5000}" 10
+    [[ "$STATUS" == 200 ]] || fail "queued-to-running poll returned $STATUS"
+    CURSOR_A="$(cursor_of)"
+    STATE_A="$(state_of)"
+fi
+if [[ "$STATE_A" != "running" ]]; then
+    body_json >&2
+    fail "job did not reach running state before 15s poll (state=$STATE_A)"
+fi
+call "tools/call" "poll_command" "{\"job_id\":\"$JOB_A\",\"after\":$CURSOR_A,\"wait_ms\":15000}" 30
+[[ "$STATUS" == 200 ]] || fail "15s poll returned $STATUS (expected 200)"
+echo "  poll returned without approaching the 45s control deadline (HTTP $STATUS)"
+assert_ok "poll15"
 
 # ── phase B: concurrency burst (24 parallel calls) ──
 echo "== phase: 24 concurrent tool calls =="
@@ -318,8 +347,23 @@ call "tools/call" "start_command" \
     '{"command":"sleep 3 && echo survived > disconnect-effect.txt"}' 30
 [[ "$STATUS" == 200 ]] || fail "start_command returned $STATUS"
 JOB_C="$(job_id_of)"
+CURSOR_C="$(cursor_of)"
+call "tools/call" "poll_command" "{\"job_id\":\"$JOB_C\",\"after\":$CURSOR_C,\"wait_ms\":0}" 10
+[[ "$STATUS" == 200 ]] || fail "disconnect priming poll returned $STATUS"
+CURSOR_C="$(cursor_of)"
+STATE_C="$(state_of)"
+if [[ "$STATE_C" == "queued" ]]; then
+    call "tools/call" "poll_command" "{\"job_id\":\"$JOB_C\",\"after\":$CURSOR_C,\"wait_ms\":5000}" 10
+    [[ "$STATUS" == 200 ]] || fail "disconnect queued-to-running poll returned $STATUS"
+    CURSOR_C="$(cursor_of)"
+    STATE_C="$(state_of)"
+fi
+if [[ "$STATE_C" != "running" ]]; then
+    body_json >&2
+    fail "disconnect job did not reach running state (state=$STATE_C)"
+fi
 # curl gives up after ~2 s mid-request; the server must classify the drop.
-call "tools/call" "poll_command" "{\"job_id\":\"$JOB_C\",\"wait_ms\":30000}" 2
+call "tools/call" "poll_command" "{\"job_id\":\"$JOB_C\",\"after\":$CURSOR_C,\"wait_ms\":15000}" 2
 sleep 4
 [[ -f "$WORKSPACE/disconnect-effect.txt" ]] || fail "side effect did not survive the disconnect"
 echo "  side effect survived the disconnect"
@@ -359,7 +403,7 @@ fi
 
 # ── phase F: budgets over the whole log ──
 echo "== failure budget gates =="
-assert_ok "long504"
+assert_ok "poll15"
 assert_ok "disconnect"
 assert_ok "concurrency"
 echo "-- assert summary"

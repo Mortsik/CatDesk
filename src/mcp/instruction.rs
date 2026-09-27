@@ -200,11 +200,11 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.computer_enabled() && tool_mode.run_command_enabled() {
         lines.push(
-            "Use run_command only as a last resort when the available dedicated tools cannot complete the operation, and keep it for short commands that should finish quickly."
+            "Use run_command only as a last resort when the available dedicated tools cannot complete the operation, and keep it for short commands that should normally finish within about 20 seconds."
                 .to_string(),
         );
         lines.push(
-            "For builds, compilation, dependency installation, long-running test suites, development servers, or commands that may take more than about one minute, use start_command instead of keeping run_command open."
+            "For builds, compilation, dependency installation, long-running test suites, development servers, or commands that may take more than about 20 seconds, use start_command instead of keeping run_command open."
                 .to_string(),
         );
         lines.push(

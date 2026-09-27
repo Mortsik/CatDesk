@@ -15,9 +15,12 @@ Records contain Unix milliseconds (`timestamp_ms`), process ID (`pid`), and:
   of the oldest one (`oldest_active_stage`). Paths, query strings and headers
   are not saved.
 - `mcp_request`: the same generated ID, an allowlisted `rpc_method`, and for tool
-  calls an allowlisted local `rpc_tool`. Unknown methods/tool names become
-  `other`. Client IDs, arguments, custom/browser tool names, resource
-  names, commands, output, credentials and connector URLs are never saved.
+  calls an allowlisted local `rpc_tool`. For `poll_command`, an explicitly
+  requested numeric `wait_ms` is recorded as `requested_wait_ms`; for
+  `run_command`, an explicitly requested numeric `timeout` is recorded as
+  `requested_timeout_ms`. Unknown methods/tool names become `other`. Client IDs,
+  all other arguments, custom/browser tool names, resource names, commands,
+  output, credentials and connector URLs are never saved.
 - `http_finished`: HTTP `status`, numeric `rpc_error_code` when provided by the
   MCP handler, `tool_error` and `content_items` for tool responses, and `elapsed_ms`.
   Scheduled MCP calls additionally record `scheduler_class`,
@@ -146,8 +149,11 @@ bounded only by the host OS and the Tokio runtime, and a saturated search or
 command pipeline waits rather than fails with a busy error. Response deadlines
 are 45 seconds for control, 60 seconds for general, and 120 seconds for
 filesystem, process and browser work, so every scheduled MCP request has a hard
-120-second response ceiling. A deadline returns 504 with
-`request_worker_timeout`.
+120-second response ceiling. `poll_command` caps a requested wait at 15 seconds,
+well below the control deadline, and agents are instructed to move commands
+likely to take more than about 20 seconds to `start_command` plus short polls
+instead of holding one foreground `run_command` open. A scheduler deadline
+returns 504 with `request_worker_timeout`.
 
 Each `http_started`, `http_finished`, and `http_cancelled` record also includes
 `active_requests` and `oldest_active_request_ms`. The latter is recomputed from the
@@ -208,10 +214,10 @@ The production failure modes above are exercised by two layers of soak (the
   45/60/120-second policy is never modified and is pinned by
   `production_response_deadlines_stay_at_the_documented_defaults`.
 - `ops/soak-real-duration.sh` runs the true durations against the real
-  policy: a genuine 45-second control-deadline timeout, a near-ceiling
-  ~2-minute request (`--full`), 24 parallel calls, real client disconnects,
-  and the ngrok supervisor's real tunnel lifecycle records, with the same
-  budget assertions over the produced JSONL. A mid-stream tunnel drop needs
+  policy: a real 15-second stream-safe poll boundary, a near-ceiling ~2-minute
+  request (`--full`), 24 parallel calls, real client disconnects, and the ngrok
+  supervisor's real tunnel lifecycle records, with the same budget assertions
+  over the produced JSONL. A mid-stream tunnel drop needs
   a live tunnel; see the script header for the `CLOUDFLARED_UNIT` opt-in.
 
 ## External cloudflared reliability

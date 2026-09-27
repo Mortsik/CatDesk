@@ -23,7 +23,7 @@ pub const MAX_JOB_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 // A running job whose owner never polls is reaped after this window; polling
 // is the heartbeat that keeps a still-needed job alive.
 pub const DEFAULT_ABANDON_AFTER_MS: u64 = 30 * 60 * 1_000;
-pub const MAX_POLL_WAIT_MS: u64 = 30_000;
+pub const MAX_POLL_WAIT_MS: u64 = 15_000;
 pub const DEFAULT_POLL_WAIT_MS: u64 = 10_000;
 const MAX_RETAINED_JOBS: usize = 64;
 const TERMINAL_JOB_TTL: StdDuration = StdDuration::from_secs(60 * 60);

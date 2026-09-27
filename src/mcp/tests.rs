@@ -1459,6 +1459,47 @@ async fn run_command_success_keeps_content_empty() {
 }
 
 #[tokio::test]
+async fn command_tool_descriptors_keep_silent_waits_stream_safe() {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!("req-tools-list-stream-safe")),
+        method: "tools/list".into(),
+        params: json!({}),
+    };
+    let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+    let tools = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("tools"))
+        .and_then(Value::as_array)
+        .expect("missing tools");
+
+    let run = tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("run_command"))
+        .expect("missing run_command");
+    let run_description = run
+        .get("description")
+        .and_then(Value::as_str)
+        .expect("missing run_command description");
+    assert!(run_description.contains("20 seconds"), "{run_description}");
+    assert!(
+        run_description.contains("start_command"),
+        "{run_description}"
+    );
+
+    let poll = tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("poll_command"))
+        .expect("missing poll_command");
+    assert_eq!(
+        poll["inputSchema"]["properties"]["wait_ms"]["maximum"],
+        json!(15_000),
+        "poll_command must not advertise a silent wait above 15 seconds"
+    );
+}
+
+#[tokio::test]
 async fn command_job_tools_document_restart_durability() {
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
@@ -2747,8 +2788,12 @@ fn catdesk_instruction_steers_long_commands_to_start_and_poll() {
         catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
             .expect("build instruction");
     assert!(
+        instruction.contains("more than about 20 seconds"),
+        "commands likely to create a long silent foreground call must be steered to background jobs: {instruction}"
+    );
+    assert!(
         instruction.contains("longer than about two minutes must never run through run_command"),
-        "long commands must be steered away from synchronous run_command: {instruction}"
+        "the hard synchronous ceiling must remain documented: {instruction}"
     );
     assert!(
         instruction
@@ -4160,6 +4205,29 @@ async fn read_tool_budget_goes_to_the_smallest_files_first() {
     );
 
     let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[tokio::test]
+async fn poll_command_rejects_wait_above_stream_safe_ceiling() {
+    let jobs = CommandJobManager::new();
+    let req = tool_call_request(
+        "poll_command",
+        json!({"job_id": "missing-job", "wait_ms": 15_001}),
+    );
+    let response = handle_poll_command(&req, &jobs).await;
+    assert_eq!(
+        response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("isError"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        result_text(&response).contains("wait_ms must be at most 15000"),
+        "unexpected error: {}",
+        result_text(&response)
+    );
 }
 
 #[tokio::test]

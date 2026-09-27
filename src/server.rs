@@ -569,8 +569,9 @@ fn request_class(req: &Value) -> RequestClass {
 
 fn request_deadline(class: RequestClass) -> StdDuration {
     match class {
-        // poll_command may legitimately wait up to 30 seconds. Leave headroom
-        // without allowing a stalled control call to run unbounded.
+        // poll_command may legitimately wait up to 15 seconds. Leave generous
+        // headroom for dispatch/serialization without tightening the global
+        // control deadline around otherwise healthy requests.
         RequestClass::Control => StdDuration::from_secs(45),
         RequestClass::Filesystem | RequestClass::Process | RequestClass::Browser => {
             MCP_HTTP_REQUEST_MAX_DURATION

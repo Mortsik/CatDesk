@@ -60,6 +60,51 @@ mod tests {
     }
 
     #[test]
+    fn request_metadata_records_only_safe_requested_timing_values() {
+        let poll = request_metadata(&json!({
+            "method": "tools/call",
+            "params": {
+                "name": "poll_command",
+                "arguments": {
+                    "job_id": "secret-job-id",
+                    "wait_ms": 15_000,
+                    "command": "secret-command"
+                }
+            }
+        }));
+        assert_eq!(poll["rpc_tool"], "poll_command");
+        assert_eq!(poll["requested_wait_ms"], 15_000);
+        assert!(poll.get("requested_timeout_ms").is_none());
+        assert!(!poll.to_string().contains("secret"));
+
+        let run = request_metadata(&json!({
+            "method": "tools/call",
+            "params": {
+                "name": "run_command",
+                "arguments": {
+                    "command": "secret-command",
+                    "timeout": 20_000,
+                    "token": "secret-token"
+                }
+            }
+        }));
+        assert_eq!(run["rpc_tool"], "run_command");
+        assert_eq!(run["requested_timeout_ms"], 20_000);
+        assert!(run.get("requested_wait_ms").is_none());
+        assert!(!run.to_string().contains("secret"));
+
+        let invalid = request_metadata(&json!({
+            "method": "tools/call",
+            "params": {
+                "name": "poll_command",
+                "arguments": {"wait_ms": "secret-not-a-number"}
+            }
+        }));
+        assert!(invalid.get("requested_wait_ms").is_none());
+        assert!(!invalid.to_string().contains("secret"));
+    }
+
+    #[test]
     fn writer_persists_records_and_rotates_with_private_permissions() {
         let root =
             std::env::temp_dir().join(format!("catdesk-diagnostics-{}", uuid::Uuid::new_v4()));
@@ -1235,6 +1280,32 @@ fn request_metadata(body: &Value) -> Value {
             _ => "other",
         };
         metadata["rpc_tool"] = json!(tool);
+
+        // Persist only bounded numeric timing hints that help correlate a
+        // client-visible stream stall with an intentionally blocking tool
+        // call. Never persist command text, job ids, paths, or other payloads.
+        let arguments = body
+            .get("params")
+            .and_then(|params| params.get("arguments"));
+        match tool {
+            "poll_command" => {
+                if let Some(wait_ms) = arguments
+                    .and_then(|arguments| arguments.get("wait_ms"))
+                    .and_then(Value::as_u64)
+                {
+                    metadata["requested_wait_ms"] = json!(wait_ms);
+                }
+            }
+            "run_command" => {
+                if let Some(timeout_ms) = arguments
+                    .and_then(|arguments| arguments.get("timeout"))
+                    .and_then(Value::as_u64)
+                {
+                    metadata["requested_timeout_ms"] = json!(timeout_ms);
+                }
+            }
+            _ => {}
+        }
     }
     metadata
 }

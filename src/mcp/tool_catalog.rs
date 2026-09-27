@@ -408,7 +408,7 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
             tools.push(json!({
                 "name": "run_command",
                 "title": "Run command",
-                "description": "Execute a shell command inside the workspace root. Common directory-listing commands are parsed before execution and may return structured workspace listings instead of raw shell output. Returns stdout and stderr for non-intercepted commands.",
+                "description": "Execute a short shell command inside the workspace root. Keep foreground commands to work that should normally finish within about 20 seconds; use start_command for anything likely to take longer. Common directory-listing commands are parsed before execution and may return structured workspace listings instead of raw shell output. Returns stdout and stderr for non-intercepted commands.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -419,7 +419,7 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
                             "minimum": 1,
                             "maximum": command::MAX_TIMEOUT_MS,
                             "description": format!(
-                                "Timeout in milliseconds for short commands. Maximum {}; use start_command for long-running work.",
+                                "Timeout in milliseconds for short commands. Prefer start_command when work may take more than about 20 seconds. Hard maximum {} ms.",
                                 command::MAX_TIMEOUT_MS
                             )
                         }
