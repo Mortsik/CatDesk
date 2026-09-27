@@ -91,10 +91,7 @@ mod tests {
 
     fn denied(command: &str) {
         let result = check_vm_bounce(command);
-        assert!(
-            result.is_err(),
-            "expected DENY for: {command:?}, got Ok"
-        );
+        assert!(result.is_err(), "expected DENY for: {command:?}, got Ok");
         let message = result.unwrap_err();
         assert!(
             message.contains("DENIED"),

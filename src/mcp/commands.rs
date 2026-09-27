@@ -8,20 +8,19 @@ use tokio::sync::Mutex;
 use crate::change_tracking::{ChangeScope, ChangeSession, ChangeTarget};
 use crate::command;
 use crate::command_jobs::{
-    CommandJobManager, CommandJobSnapshot, CommandJobState, DEFAULT_POLL_WAIT_MS,
-    MAX_POLL_WAIT_MS,
+    CommandJobManager, CommandJobSnapshot, CommandJobState, DEFAULT_POLL_WAIT_MS, MAX_POLL_WAIT_MS,
 };
 use crate::devtools::DevtoolsBridge;
 use crate::project_scope;
 use crate::state::{ShowDetailMode, ToolMode};
 use crate::workspace_tools;
 
+use crate::mcp::file_tools::{optional_string_argument, required_string_argument};
 use crate::mcp::jsonrpc::{
     JsonRpcRequest, JsonRpcResponse, tool_arguments, tool_error_response,
     tool_error_response_with_structured, tool_name_from_request,
     tool_success_response_with_structured,
 };
-use crate::mcp::file_tools::{optional_string_argument, required_string_argument};
 use crate::mcp::{read_only_blocked_response, tool_is_read_only};
 
 pub(crate) async fn forward_to_devtools(
@@ -677,7 +676,6 @@ fn build_run_command_listing_structured(
     })
 }
 
-
 fn resolve_effective_command_cwd(
     workspace_root: &str,
     cwd_input: Option<&str>,
@@ -687,19 +685,13 @@ fn resolve_effective_command_cwd(
         Some(cwd) => Some(command::resolve_workspace_path(workspace_root, Some(cwd))?),
         None => None,
     };
-    project_scope::select_effective_cwd(
-        Path::new(workspace_root),
-        explicit_cwd,
-        active_project,
-    )
-    .map(|(cwd, _)| cwd)
+    project_scope::select_effective_cwd(Path::new(workspace_root), explicit_cwd, active_project)
+        .map(|(cwd, _)| cwd)
 }
 
 fn command_change_scope(workspace_root: &str, cwd: &Path) -> ChangeScope {
     match project_scope::command_change_tracking_root(Path::new(workspace_root), cwd) {
-        Ok(Some(project_root)) => {
-            ChangeScope::single(ChangeTarget::discovered(project_root, true))
-        }
+        Ok(Some(project_root)) => ChangeScope::single(ChangeTarget::discovered(project_root, true)),
         Ok(None) | Err(_) => ChangeScope::none(),
     }
 }
@@ -764,8 +756,9 @@ pub(crate) fn change_scope_for_request(
     }
 }
 
-
-pub(crate) async fn fetch_devtools_tools(bridge: &Arc<Mutex<DevtoolsBridge>>) -> Option<Vec<Value>> {
+pub(crate) async fn fetch_devtools_tools(
+    bridge: &Arc<Mutex<DevtoolsBridge>>,
+) -> Option<Vec<Value>> {
     let list_req = json!({
         "jsonrpc": "2.0",
         "id": "dt-tools-list",
@@ -791,4 +784,3 @@ async fn devtools_tool_is_read_only(
         .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
         .map(tool_is_read_only)
 }
-

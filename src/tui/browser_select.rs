@@ -3,10 +3,10 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
+use crate::UI_POLL_INTERVAL;
 use crate::browser;
 use crate::state::{SharedState, UiLanguage};
 use crate::theme;
-use crate::UI_POLL_INTERVAL;
 use crate::tui::chrome::draw_tui_header;
 
 pub(crate) async fn mode_is_browser_enabled(state: SharedState) -> bool {
@@ -163,7 +163,10 @@ pub(crate) async fn run_browser_select(
     }
 }
 
-pub(crate) async fn persist_selected_browser(state: SharedState, selected: browser::DetectedBrowser) {
+pub(crate) async fn persist_selected_browser(
+    state: SharedState,
+    selected: browser::DetectedBrowser,
+) {
     let remote_info = selected
         .remote_debug_target
         .as_deref()
@@ -439,4 +442,3 @@ pub(crate) fn sanitize_for_filename(input: &str) -> String {
         sanitized
     }
 }
-

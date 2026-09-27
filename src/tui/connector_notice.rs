@@ -6,14 +6,14 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::CHATGPT_CONNECTOR_SETTINGS_URL;
 use crate::CHATGPT_PLUGIN_SETTINGS_URL;
-use crate::tui::logs::MCP_URL_MASK;
 use crate::MCP_URL_REVEAL_DURATION;
 use crate::UI_POLL_INTERVAL;
+use crate::drain_server_ui_events;
 use crate::state::{ServerUiEvent, SharedState, UiLanguage};
 use crate::theme;
-use crate::drain_server_ui_events;
 use crate::tui::chrome::{centered_rect, draw_mode_select, rect_contains, render_toast};
 use crate::tui::clipboard::clipboard_copy;
+use crate::tui::logs::MCP_URL_MASK;
 use crate::tui::text::{mcp_url_reveal_bar_segments, mcp_url_reveal_seconds};
 
 pub(crate) async fn run_chatgpt_connector_refresh_notice(
@@ -371,4 +371,3 @@ pub(crate) fn draw_chatgpt_connector_refresh_notice(
         inner,
     );
 }
-

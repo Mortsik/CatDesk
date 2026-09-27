@@ -8,8 +8,8 @@ use crate::project_scope;
 use crate::state::{AgentsPathMode, Mode, ShowDetailMode, ToolMode, app_config_path};
 
 use crate::mcp::agents_state::{
-    agents_widget_state, agents_widget_state_payload, cached_agents_text,
-    instruction_context_root, widget_path_strings,
+    agents_widget_state, agents_widget_state_payload, cached_agents_text, instruction_context_root,
+    widget_path_strings,
 };
 use crate::mcp::jsonrpc::{
     JsonRpcRequest, JsonRpcResponse, tool_error_response, tool_name_from_request,
@@ -167,8 +167,8 @@ Always specify the branch explicitly when using `git push`."#
             "When image content cannot reach your own vision (for example through the ChatGPT connector, which drops image blocks from tool results), pass analyze=true or a custom prompt string to read_image: CatDesk describes the image server-side with a vision model and returns the description as text in structuredContent.analysis.description."
                 .to_string(),
         );
-        let handoff_search_prefix = handoff::handoff_search_prefix(&context_root_str)
-            .map_err(std::io::Error::other)?;
+        let handoff_search_prefix =
+            handoff::handoff_search_prefix(&context_root_str).map_err(std::io::Error::other)?;
         let handoff_filename =
             handoff::handoff_filename(&context_root_str).map_err(std::io::Error::other)?;
         lines.push(format!(
@@ -340,20 +340,17 @@ pub(crate) fn handle_catdesk_instruction_with_show_detail_mode(
     show_detail_mode: ShowDetailMode,
     active_project: Option<&Path>,
 ) -> JsonRpcResponse {
-    let instruction_text = match catdesk_instruction_text_for_project(
-        workspace_root,
-        mode,
-        tool_mode,
-        active_project,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return tool_error_response(
-                req,
-                format!("Failed to resolve AGENTS.md configuration: {error}"),
-            );
-        }
-    };
+    let instruction_text =
+        match catdesk_instruction_text_for_project(workspace_root, mode, tool_mode, active_project)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return tool_error_response(
+                    req,
+                    format!("Failed to resolve AGENTS.md configuration: {error}"),
+                );
+            }
+        };
     let structured = catdesk_instruction_structured_from_text(&instruction_text);
     let mut response = tool_success_response_with_structured(req, instruction_text, structured);
     if show_detail_mode == ShowDetailMode::Disable {
@@ -375,4 +372,3 @@ pub(crate) fn handle_catdesk_instruction_with_show_detail_mode(
     }
     response
 }
-

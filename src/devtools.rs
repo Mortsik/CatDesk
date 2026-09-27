@@ -268,7 +268,10 @@ impl DevtoolsBridge {
 
     async fn restart(&mut self) -> Result<(), String> {
         let Some(launch) = self.launch.clone() else {
-            return Err("DevTools process disconnected; this bridge cannot be restarted automatically.".into());
+            return Err(
+                "DevTools process disconnected; this bridge cannot be restarted automatically."
+                    .into(),
+            );
         };
         if let Some(next) = self.next_restart_at {
             if let Some(remaining) = next.checked_duration_since(Instant::now()) {
@@ -502,7 +505,8 @@ mod tests {
 
     #[tokio::test]
     async fn next_call_restarts_a_disconnected_bridge_without_replaying_failed_work() {
-        let marker = std::env::temp_dir().join(format!("catdesk-devtools-restart-{}", uuid::Uuid::new_v4()));
+        let marker =
+            std::env::temp_dir().join(format!("catdesk-devtools-restart-{}", uuid::Uuid::new_v4()));
         let script = format!(
             "if [ ! -f '{marker}' ]; then touch '{marker}'; read line; exit 0; else while IFS= read -r line; do printf '%s\\n' \"$line\"; done; fi",
             marker = marker.display()
@@ -538,7 +542,8 @@ mod tests {
         let busy = bridge.lock().await;
         let request = json!({"id": 1, "method": "ping"});
         let queued_bridge = bridge.clone();
-        let queued = tokio::spawn(async move { DevtoolsBridge::call(&queued_bridge, &request).await });
+        let queued =
+            tokio::spawn(async move { DevtoolsBridge::call(&queued_bridge, &request).await });
 
         tokio::time::sleep(Duration::from_millis(2_200)).await;
         assert!(

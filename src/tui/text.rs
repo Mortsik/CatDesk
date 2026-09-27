@@ -93,7 +93,10 @@ pub(crate) fn format_cost_estimate_usd(estimate: usage_pricing::CostEstimate) ->
 /// Average cost per call or per day, priced over `count` units of the matching
 /// metric. Averages only cover the priced part; the unpriced tail (if any) keeps
 /// the `+N/A` marker so a partially priced map never reads as fully billed.
-pub(crate) fn format_average_usage_cost_usd(estimate: usage_pricing::CostEstimate, count: u64) -> String {
+pub(crate) fn format_average_usage_cost_usd(
+    estimate: usage_pricing::CostEstimate,
+    count: u64,
+) -> String {
     if count == 0 {
         return "$0".to_string();
     }

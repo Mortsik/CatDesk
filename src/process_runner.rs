@@ -33,8 +33,14 @@ pub(crate) fn exit_status_signal_diagnostic(status: &std::process::ExitStatus) -
         libc::SIGXFSZ => "SIGXFSZ",
         _ => "UNKNOWN",
     };
-    let core = if status.core_dumped() { " (core dumped)" } else { "" };
-    Some(format!("Command terminated by signal {signal} ({name}){core}"))
+    let core = if status.core_dumped() {
+        " (core dumped)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "Command terminated by signal {signal} ({name}){core}"
+    ))
 }
 
 #[cfg(not(unix))]
@@ -886,16 +892,13 @@ mod tests {
     #[tokio::test]
     async fn spawn_shell_command_denies_wsl_shutdown_before_spawn() {
         let root = workspace("deny-vm-bounce");
-        let error = match spawn_shell_command(
-            "/mnt/c/Windows/System32/wsl.exe --shutdown",
-            &root,
-            &root,
-        )
-        .await
-        {
-            Ok(_) => panic!("wsl --shutdown must be denied before spawn"),
-            Err(error) => error,
-        };
+        let error =
+            match spawn_shell_command("/mnt/c/Windows/System32/wsl.exe --shutdown", &root, &root)
+                .await
+            {
+                Ok(_) => panic!("wsl --shutdown must be denied before spawn"),
+                Err(error) => error,
+            };
         assert!(
             error.to_string().contains("DENIED (operator-only)"),
             "unexpected error: {error}"

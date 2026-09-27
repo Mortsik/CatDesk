@@ -163,18 +163,12 @@ fn runtime_read_paths() -> BTreeSet<PathBuf> {
     if let Some(xdg_cache) = std::env::var_os("XDG_CACHE_HOME")
         && !xdg_cache.is_empty()
     {
-        insert_existing(
-            &mut paths,
-            PathBuf::from(xdg_cache).join("ms-playwright"),
-        );
+        insert_existing(&mut paths, PathBuf::from(xdg_cache).join("ms-playwright"));
     }
     if let Some(home) = std::env::var_os("HOME")
         && !home.is_empty()
     {
-        insert_existing(
-            &mut paths,
-            PathBuf::from(home).join(".cache/ms-playwright"),
-        );
+        insert_existing(&mut paths, PathBuf::from(home).join(".cache/ms-playwright"));
     }
 
     paths
@@ -619,10 +613,7 @@ fn bubblewrap_argv(
         // CATDESK_SANDBOX_UNIT from the CatDesk process must not leak into a
         // sandbox that gets no scope (Sol r4 685bb5ea). Explicit removal keeps
         // the invariant marker ⇒ existing scope.
-        argv.extend([
-            "--unsetenv".into(),
-            "CATDESK_SANDBOX_UNIT".into(),
-        ]);
+        argv.extend(["--unsetenv".into(), "CATDESK_SANDBOX_UNIT".into()]);
     }
     argv.extend([
         "--setenv".into(),
@@ -1334,9 +1325,8 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("create cwd");
         std::fs::create_dir_all(&scratch).expect("create scratch");
 
-        let argv =
-            bubblewrap_argv("pwd", &workspace, &cwd, &scratch, "marker-sandbox-id", true)
-                .expect("build bubblewrap argv");
+        let argv = bubblewrap_argv("pwd", &workspace, &cwd, &scratch, "marker-sandbox-id", true)
+            .expect("build bubblewrap argv");
 
         assert!(argv.iter().any(|arg| arg.as_os_str() == "--new-session"));
         if Path::new("/etc/ssh").is_dir() {
@@ -1377,8 +1367,15 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("create cwd");
         std::fs::create_dir_all(&scratch).expect("create scratch");
 
-        let argv = bubblewrap_argv("pwd", &workspace, &cwd, &scratch, "marker-sandbox-id", false)
-            .expect("build bubblewrap argv");
+        let argv = bubblewrap_argv(
+            "pwd",
+            &workspace,
+            &cwd,
+            &scratch,
+            "marker-sandbox-id",
+            false,
+        )
+        .expect("build bubblewrap argv");
         // Other --setenv entries (SSH_AUTH_SOCK, TMPDIR, ...) stay; only the
         // marker must not be set...
         assert!(
@@ -1424,15 +1421,14 @@ mod tests {
         );
         let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
         assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair[0] == OsStr::new("--setenv")
-                    && pair[1] == OsStr::new("CATDESK_SANDBOX_UNIT")),
+            !args.windows(2).any(|pair| pair[0] == OsStr::new("--setenv")
+                && pair[1] == OsStr::new("CATDESK_SANDBOX_UNIT")),
             "no --setenv unit marker without the scope"
         );
         assert!(
-            args.windows(2).any(|pair| pair[0] == OsStr::new("--unsetenv")
-                && pair[1] == OsStr::new("CATDESK_SANDBOX_UNIT")),
+            args.windows(2)
+                .any(|pair| pair[0] == OsStr::new("--unsetenv")
+                    && pair[1] == OsStr::new("CATDESK_SANDBOX_UNIT")),
             "inherited/planted marker must be actively removed"
         );
         std::fs::remove_dir_all(scratch).expect("remove scratch directory");

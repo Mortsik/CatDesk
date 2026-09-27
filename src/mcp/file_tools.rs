@@ -1,17 +1,17 @@
 use base64::Engine as _;
-use std::path::Path;
 use serde_json::{Value, json};
+use std::path::Path;
 
 use crate::handoff;
 use crate::vision;
 use crate::workspace_tools;
 
+use crate::mcp::agents_state::instruction_context_root;
 use crate::mcp::jsonrpc::{
     JsonRpcRequest, JsonRpcResponse, image_tool_success_response, tool_arguments,
     tool_error_response, tool_error_response_with_structured,
     tool_success_response_with_structured,
 };
-use crate::mcp::agents_state::instruction_context_root;
 
 pub(crate) fn parse_read_paths(arguments: &Value) -> Result<Vec<String>, String> {
     let items = arguments
@@ -85,7 +85,10 @@ fn parse_optional_image_dimension(arguments: &Value, name: &str) -> Result<Optio
     Ok(Some(value))
 }
 
-pub(crate) async fn handle_read_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+pub(crate) async fn handle_read_image(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let path = match arguments.get("path").and_then(Value::as_str) {
         Some(path) if !path.is_empty() => path,
@@ -509,7 +512,10 @@ pub(crate) fn handle_search_text(req: &JsonRpcRequest, workspace_root: &str) -> 
     }
 }
 
-pub(crate) fn required_string_argument<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
+pub(crate) fn required_string_argument<'a>(
+    arguments: &'a Value,
+    name: &str,
+) -> Result<&'a str, String> {
     match arguments.get(name) {
         Some(value) => value
             .as_str()
@@ -612,4 +618,3 @@ pub(crate) fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> 
         Err(e) => tool_error_response(req, e),
     }
 }
-

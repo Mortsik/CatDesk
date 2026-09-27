@@ -6,19 +6,17 @@ use tokio::sync::Mutex;
 use crate::change_tracking::{ChangeSession, FileChange};
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
-use crate::state::{
-    Mode, ShowDetailMode, TokenStatsLayout, ToolMode, WidgetCornerStyle,
-};
+use crate::state::{Mode, ShowDetailMode, TokenStatsLayout, ToolMode, WidgetCornerStyle};
 
-mod jsonrpc;
-mod token_usage;
 mod agents_state;
-mod resources;
-mod instruction;
 mod commands;
 mod file_tools;
-mod widget;
+mod instruction;
+mod jsonrpc;
+mod resources;
+mod token_usage;
 mod tool_catalog;
+mod widget;
 
 use tool_catalog::handle_tools_list_with_show_detail_mode;
 
@@ -28,8 +26,8 @@ use widget::{
 };
 
 use file_tools::{
-    handle_create_handoff_for_project, handle_delete_path, handle_edit_file,
-    handle_read_files, handle_read_image, handle_search_text, handle_write_file,
+    handle_create_handoff_for_project, handle_delete_path, handle_edit_file, handle_read_files,
+    handle_read_image, handle_search_text, handle_write_file,
 };
 
 use commands::{
@@ -48,8 +46,8 @@ pub(crate) use resources::{
     is_catdesk_widget_resource_uri,
 };
 use resources::{
-    handle_resources_list_with_show_detail_mode, handle_server_discover,
-    handle_resources_read_with_show_detail_mode,
+    handle_resources_list_with_show_detail_mode, handle_resources_read_with_show_detail_mode,
+    handle_server_discover,
 };
 
 pub(crate) use agents_state::agents_widget_state_payload;
@@ -58,9 +56,9 @@ use agents_state::cached_app_config;
 pub(crate) use token_usage::estimate_turn_token_counts;
 use token_usage::estimate_turn_token_usage;
 
-pub use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 #[cfg(test)]
 use jsonrpc::tool_error_response_with_structured;
+pub use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 use jsonrpc::{tool_error_response, tool_name_from_request};
 
 #[derive(Clone)]
@@ -329,7 +327,8 @@ async fn handle_tools_call_with_session(
                             .await
                         }
                         "poll_command" => {
-                            handle_poll_command_with_session(req, command_jobs, session_namespace).await
+                            handle_poll_command_with_session(req, command_jobs, session_namespace)
+                                .await
                         }
                         "cancel_command" => {
                             handle_cancel_command_with_session(req, command_jobs, session_namespace)
@@ -347,8 +346,9 @@ async fn handle_tools_call_with_session(
                     "read" => handle_read_files(req, workspace_root),
                     "read_image" => handle_read_image(req, workspace_root).await,
                     "search" => handle_search_text(req, workspace_root),
-                    "create_handoff" =>
-                        handle_create_handoff_for_project(req, workspace_root, active_project),
+                    "create_handoff" => {
+                        handle_create_handoff_for_project(req, workspace_root, active_project)
+                    }
                     _ => {
                         if tool_mode.write_tools_enabled() {
                             match tool_name.as_str() {

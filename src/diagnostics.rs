@@ -1005,7 +1005,7 @@ impl Diagnostics {
 
     /// Correlated live view of every in-flight request, oldest first.
     #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn active_requests_view(&self) -> Vec<ActiveRequestView> {
+    pub(crate) fn active_requests_view(&self) -> Vec<ActiveRequestView> {
         let active_requests = self
             .active_requests
             .lock()

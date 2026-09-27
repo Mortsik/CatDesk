@@ -5,17 +5,17 @@ use std::time::Instant;
 
 use crate::NGROK_SETUP_URL;
 use crate::UI_POLL_INTERVAL;
+use crate::normalize_ngrok_authtoken_input;
 use crate::state::{
     SharedState, UiLanguage, app_config_path, load_ngrok_authtoken, load_ngrok_domain,
     save_ngrok_authtoken, save_ngrok_domain,
 };
 use crate::theme;
-use crate::tui::browser_select::selected_supported_browser_idx;
-use crate::normalize_ngrok_authtoken_input;
-use crate::tui::clipboard::{clipboard_paste, key_is_clipboard_paste, text_input_key_is_cancel};
 use crate::tui::browser_select::draw_browser_select;
+use crate::tui::browser_select::selected_supported_browser_idx;
 use crate::tui::chrome::{centered_rect, draw_mode_select, rect_contains, render_toast};
 use crate::tui::clipboard::clipboard_copy;
+use crate::tui::clipboard::{clipboard_paste, key_is_clipboard_paste, text_input_key_is_cancel};
 
 pub(crate) async fn run_ngrok_auth_setup(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -633,4 +633,3 @@ pub(crate) fn draw_ngrok_auth_setup(
     };
     f.render_widget(footer, modal_chunks[2]);
 }
-

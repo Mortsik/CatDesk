@@ -20,8 +20,8 @@ pub(crate) use connector_notice::run_chatgpt_connector_refresh_notice;
 pub(crate) use dashboard::draw_ui;
 pub(crate) use flow::build_animation_snapshot;
 pub(crate) use logs::{
-    LogView, Selection, export_logs, extract_from_screen, is_secret_log_message,
-    post_mcp_path, secret_log_copy_value,
+    LogView, Selection, export_logs, extract_from_screen, is_secret_log_message, post_mcp_path,
+    secret_log_copy_value,
 };
 pub(crate) use ngrok_setup::{run_ngrok_auth_setup, run_ngrok_domain_setup};
 pub(crate) use settings::run_settings;

@@ -120,7 +120,8 @@ fn normalize_scope_paths(
         // Commands can supply a Windows verbatim path even when the snapshot
         // root uses an ordinary expanded drive path. Normalize both sides.
         let normalized_target = command::normalize_windows_verbatim_path(target.path.clone());
-        target.path = if let Ok(relative) = normalized_target.strip_prefix(original_workspace_root) {
+        target.path = if let Ok(relative) = normalized_target.strip_prefix(original_workspace_root)
+        {
             canonical_workspace_root.join(relative)
         } else {
             normalized_target

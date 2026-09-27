@@ -8,8 +8,8 @@ use crate::state::{
 };
 use crate::theme;
 
-use crate::run_prompt;
 use crate::UI_POLL_INTERVAL;
+use crate::run_prompt;
 use crate::tui::chrome::draw_tui_header;
 
 pub(crate) async fn run_settings(
@@ -702,4 +702,3 @@ pub(crate) fn draw_settings(
     );
     f.render_widget(keys, chunks[2]);
 }
-

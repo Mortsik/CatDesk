@@ -20,7 +20,6 @@ impl TokenUsage {
     }
 }
 
-
 pub(crate) fn build_turn_token_payload(req: &JsonRpcRequest, tool_name: &str) -> Value {
     json!({
         "name": tool_name,
@@ -43,7 +42,11 @@ pub(crate) fn estimate_value_tokens_o200k(value: &Value) -> u64 {
     }
 }
 
-pub(crate) fn estimate_turn_token_usage(req: &JsonRpcRequest, tool_name: &str, result: &Value) -> TokenUsage {
+pub(crate) fn estimate_turn_token_usage(
+    req: &JsonRpcRequest,
+    tool_name: &str,
+    result: &Value,
+) -> TokenUsage {
     let tool_input_payload = build_turn_token_payload(req, tool_name);
     let tool_input_tokens = estimate_value_tokens_o200k(&tool_input_payload);
     let tool_output_payload = sanitize_result_for_turn_token_count(result);
@@ -74,4 +77,3 @@ pub(crate) fn sanitize_result_for_turn_token_count(result: &Value) -> Value {
     }
     sanitized
 }
-

@@ -177,7 +177,8 @@ impl InstructionGate {
         session: &ClientSession,
         project: std::path::PathBuf,
     ) -> ProjectStateChange {
-        self.contexts.set_active_project(session.namespace(), project)
+        self.contexts
+            .set_active_project(session.namespace(), project)
     }
 
     fn clear_active_project(&self, session: &ClientSession) -> bool {
@@ -540,7 +541,10 @@ fn request_tool_arguments(req: &Value) -> Option<&serde_json::Map<String, Value>
 }
 
 fn request_class(req: &Value) -> RequestClass {
-    let method = req.get("method").and_then(Value::as_str).unwrap_or_default();
+    let method = req
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match method {
         "server/discover" | "tools/list" | "resources/list" | "resources/read" => {
             RequestClass::Control
@@ -551,8 +555,7 @@ fn request_class(req: &Value) -> RequestClass {
             }
             Some("run_command" | "start_command") => RequestClass::Process,
             Some(
-                "read" | "read_image" | "search" | "write" | "edit" | "create_handoff"
-                | "delete",
+                "read" | "read_image" | "search" | "write" | "edit" | "create_handoff" | "delete",
             ) => RequestClass::Filesystem,
             // Any tool not owned by CatDesk itself is a dynamically discovered
             // DevTools operation when browser mode is enabled. Isolate it from
@@ -1590,25 +1593,74 @@ mod tests {
         use crate::request_workers::RequestClass;
 
         let cases = [
-            (mcp_request_body("server/discover", json!({})), RequestClass::Control),
-            (mcp_request_body("tools/list", json!({})), RequestClass::Control),
-            (mcp_request_body("resources/list", json!({})), RequestClass::Control),
-            (mcp_request_body("resources/read", json!({ "uri": "ui://widget/catdesk-dashboard.html" })), RequestClass::Control),
-            (tool_call_body("catdesk_instruction", json!({})), RequestClass::Control),
-            (tool_call_body("poll_command", json!({ "job_id": "x" })), RequestClass::Control),
-            (tool_call_body("cancel_command", json!({ "job_id": "x" })), RequestClass::Control),
-            (tool_call_body("read", json!({ "paths": ["x"] })), RequestClass::Filesystem),
-            (tool_call_body("search", json!({ "pattern": "x" })), RequestClass::Filesystem),
-            (tool_call_body("edit", json!({ "path": "x", "edits": [] })), RequestClass::Filesystem),
-            (tool_call_body("run_command", json!({ "command": "true" })), RequestClass::Process),
-            (tool_call_body("start_command", json!({ "command": "true" })), RequestClass::Process),
-            (tool_call_body("take_screenshot", json!({})), RequestClass::Browser),
-            (mcp_request_body("catdesk/unknown", json!({})), RequestClass::General),
+            (
+                mcp_request_body("server/discover", json!({})),
+                RequestClass::Control,
+            ),
+            (
+                mcp_request_body("tools/list", json!({})),
+                RequestClass::Control,
+            ),
+            (
+                mcp_request_body("resources/list", json!({})),
+                RequestClass::Control,
+            ),
+            (
+                mcp_request_body(
+                    "resources/read",
+                    json!({ "uri": "ui://widget/catdesk-dashboard.html" }),
+                ),
+                RequestClass::Control,
+            ),
+            (
+                tool_call_body("catdesk_instruction", json!({})),
+                RequestClass::Control,
+            ),
+            (
+                tool_call_body("poll_command", json!({ "job_id": "x" })),
+                RequestClass::Control,
+            ),
+            (
+                tool_call_body("cancel_command", json!({ "job_id": "x" })),
+                RequestClass::Control,
+            ),
+            (
+                tool_call_body("read", json!({ "paths": ["x"] })),
+                RequestClass::Filesystem,
+            ),
+            (
+                tool_call_body("search", json!({ "pattern": "x" })),
+                RequestClass::Filesystem,
+            ),
+            (
+                tool_call_body("edit", json!({ "path": "x", "edits": [] })),
+                RequestClass::Filesystem,
+            ),
+            (
+                tool_call_body("run_command", json!({ "command": "true" })),
+                RequestClass::Process,
+            ),
+            (
+                tool_call_body("start_command", json!({ "command": "true" })),
+                RequestClass::Process,
+            ),
+            (
+                tool_call_body("take_screenshot", json!({})),
+                RequestClass::Browser,
+            ),
+            (
+                mcp_request_body("catdesk/unknown", json!({})),
+                RequestClass::General,
+            ),
         ];
 
         for (body, expected) in cases {
             let body: Value = serde_json::from_slice(&body).expect("parse test request");
-            assert_eq!(request_class(&body), expected, "unexpected class for {body}");
+            assert_eq!(
+                request_class(&body),
+                expected,
+                "unexpected class for {body}"
+            );
         }
     }
 
@@ -2144,7 +2196,10 @@ mod tests {
 
     fn modern_mcp_headers_for_session(body: &Bytes, session_id: &str) -> HeaderMap {
         let mut headers = modern_mcp_headers_for_body(body);
-        headers.insert("mcp-session-id", session_id.parse().expect("session header"));
+        headers.insert(
+            "mcp-session-id",
+            session_id.parse().expect("session header"),
+        );
         headers
     }
 
@@ -2193,12 +2248,10 @@ mod tests {
             catdesk_instruction_called: InstructionGate::with_anonymous(false),
         };
         let _locked = state.lock().await;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            health(State(server)),
-        )
-        .await
-        .expect("health must not wait for AppState");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), health(State(server)))
+                .await
+                .expect("health must not wait for AppState");
         assert_eq!(result.0.get("status").and_then(Value::as_str), Some("ok"));
         assert_eq!(result.0.get("busy").and_then(Value::as_bool), Some(true));
         assert!(
@@ -2252,18 +2305,37 @@ mod tests {
     async fn ping_remains_responsive_while_app_state_is_locked() {
         let root = unique_temp_path("catdesk-ping-busy");
         std::fs::create_dir_all(&root).unwrap();
-        let app = AppState::new_for_test(0, root.to_string_lossy().into_owned(), root.join("config.toml")).unwrap();
+        let app = AppState::new_for_test(
+            0,
+            root.to_string_lossy().into_owned(),
+            root.join("config.toml"),
+        )
+        .unwrap();
         let state = Arc::new(Mutex::new(app));
         let (ui_events, _receiver) = channel(crate::state::UI_EVENT_CAPACITY);
         let server = ServerState {
-            app: state.clone(), devtools: None, command_jobs: CommandJobManager::new(),
-            ui_events, catdesk_instruction_called: InstructionGate::with_anonymous(false),
+            app: state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events,
+            catdesk_instruction_called: InstructionGate::with_anonymous(false),
         };
         let _locked = state.lock().await;
-        let result = tokio::time::timeout(std::time::Duration::from_millis(100), post_mcp_http(
-            State(server), modern_mcp_headers("ping", None), mcp_request_body("ping", json!({})),
-        )).await;
-        assert_eq!(result.expect("ping must not wait for UI/persistence").status(), StatusCode::OK);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            post_mcp_http(
+                State(server),
+                modern_mcp_headers("ping", None),
+                mcp_request_body("ping", json!({})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            result
+                .expect("ping must not wait for UI/persistence")
+                .status(),
+            StatusCode::OK
+        );
         drop(_locked);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -3110,9 +3182,21 @@ mod tests {
             .iter()
             .map(|flow| flow.flow_id.clone())
             .collect::<Vec<_>>();
-        assert!(session_flow_ids.iter().any(|flow_id| flow_id != STATELESS_FLOW_ID));
-        assert!(session_flow_ids.iter().all(|flow_id| !flow_id.contains("client-a-secret-session")));
-        assert!(session_flow_ids.iter().all(|flow_id| !flow_id.contains("client-b-secret-session")));
+        assert!(
+            session_flow_ids
+                .iter()
+                .any(|flow_id| flow_id != STATELESS_FLOW_ID)
+        );
+        assert!(
+            session_flow_ids
+                .iter()
+                .all(|flow_id| !flow_id.contains("client-a-secret-session"))
+        );
+        assert!(
+            session_flow_ids
+                .iter()
+                .all(|flow_id| !flow_id.contains("client-b-secret-session"))
+        );
 
         let _ = std::fs::remove_dir_all(workspace_root);
         let _ = std::fs::remove_dir_all(config_root);
@@ -3204,12 +3288,18 @@ mod tests {
                 break snapshot;
             }
         };
-        assert_eq!(a_terminal.state, crate::command_jobs::CommandJobState::Cancelled);
+        assert_eq!(
+            a_terminal.state,
+            crate::command_jobs::CommandJobState::Cancelled
+        );
         let b_snapshot = command_jobs
             .poll_for_session(&b_job.snapshot.job_id, 0, 0, Some("session-b"))
             .await
             .expect("poll surviving session-b job");
-        assert_eq!(b_snapshot.state, crate::command_jobs::CommandJobState::Running);
+        assert_eq!(
+            b_snapshot.state,
+            crate::command_jobs::CommandJobState::Running
+        );
 
         assert!(
             app_state.lock().await.remote_connected,
@@ -3264,10 +3354,8 @@ mod tests {
         };
 
         for session_id in ["chat-a", "chat-b"] {
-            let body = with_openai_session(
-                tool_call_body("catdesk_instruction", json!({})),
-                session_id,
-            );
+            let body =
+                with_openai_session(tool_call_body("catdesk_instruction", json!({})), session_id);
             let headers = modern_mcp_headers_for_body(&body);
             assert!(headers.get(MCP_SESSION_ID_HEADER).is_none());
             let response = post_mcp_http(State(server_state.clone()), headers, body).await;
@@ -3314,12 +3402,7 @@ mod tests {
         };
         let request = tool_call_body("catdesk_instruction", json!({}));
         let headers = modern_mcp_headers_for_session(&request, "queue-saturated-session");
-        let response = post_mcp_http(
-            State(server_state.clone()),
-            headers.clone(),
-            request,
-        )
-        .await;
+        let response = post_mcp_http(State(server_state.clone()), headers.clone(), request).await;
         assert_eq!(response.status(), StatusCode::OK);
         {
             let app = app_state.lock().await;
@@ -3467,13 +3550,19 @@ mod tests {
                 ]
             }),
         ));
-        assert_eq!(project_signal_for_request(&mixed, &workspace_root_str), None);
+        assert_eq!(
+            project_signal_for_request(&mixed, &workspace_root_str),
+            None
+        );
 
         let root_search = parse(tool_call_body(
             "search",
             json!({ "pattern": "a", "path": workspace_root.to_string_lossy() }),
         ));
-        assert_eq!(project_signal_for_request(&root_search, &workspace_root_str), None);
+        assert_eq!(
+            project_signal_for_request(&root_search, &workspace_root_str),
+            None
+        );
 
         let repo_search = parse(tool_call_body(
             "search",
@@ -3488,7 +3577,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn three_named_sessions_keep_independent_projects_across_command_read_and_search_signals() {
+    async fn three_named_sessions_keep_independent_projects_across_command_read_and_search_signals()
+    {
         let workspace_root = unique_temp_path("catdesk-three-session-project-workspace");
         let config_root = unique_temp_path("catdesk-three-session-project-config");
         let config_path = config_root.join("config.toml");
@@ -3521,12 +3611,7 @@ mod tests {
             catdesk_instruction_called: gate.clone(),
         };
 
-        async fn call(
-            state: ServerState,
-            session_id: &str,
-            tool: &str,
-            arguments: Value,
-        ) -> Value {
+        async fn call(state: ServerState, session_id: &str, tool: &str, arguments: Value) -> Value {
             let body = tool_call_body(tool, arguments);
             let response = post_mcp_http(
                 State(state),
@@ -3549,10 +3634,8 @@ mod tests {
 
         for session_id in ["session-a", "session-b", "session-c"] {
             let body = tool_call_body("catdesk_instruction", json!({}));
-            let session = ClientSession::from_headers(&modern_mcp_headers_for_session(
-                &body,
-                session_id,
-            ));
+            let session =
+                ClientSession::from_headers(&modern_mcp_headers_for_session(&body, session_id));
             gate.mark_called(&session);
         }
 
@@ -3635,7 +3718,8 @@ mod tests {
         let gate = InstructionGate::with_anonymous(false);
         for session_id in ["session-a", "session-b"] {
             let body = tool_call_body("catdesk_instruction", json!({}));
-            let session = ClientSession::from_headers(&modern_mcp_headers_for_session(&body, session_id));
+            let session =
+                ClientSession::from_headers(&modern_mcp_headers_for_session(&body, session_id));
             gate.mark_called(&session);
         }
         let command_jobs = CommandJobManager::new();
@@ -3653,11 +3737,7 @@ mod tests {
         };
         let start_body = tool_call_body("start_command", json!({ "command": command }));
 
-        async fn call_start(
-            state: &ServerState,
-            body: &Bytes,
-            session_id: &str,
-        ) -> Value {
+        async fn call_start(state: &ServerState, body: &Bytes, session_id: &str) -> Value {
             let response = post_mcp_http(
                 State(state.clone()),
                 modern_mcp_headers_for_session(body, session_id),
@@ -3721,10 +3801,8 @@ mod tests {
         for index in 0..18 {
             let session_id = format!("stress-session-{index}");
             let body = tool_call_body("catdesk_instruction", json!({}));
-            let session = ClientSession::from_headers(&modern_mcp_headers_for_session(
-                &body,
-                &session_id,
-            ));
+            let session =
+                ClientSession::from_headers(&modern_mcp_headers_for_session(&body, &session_id));
             gate.mark_called(&session);
         }
         let command_jobs = CommandJobManager::new();
@@ -3764,14 +3842,16 @@ mod tests {
 
         let mut process_jobs = Vec::new();
         for task in tasks {
-            let (index, session_id, status, payload) = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                task,
-            )
-            .await
-            .expect("parallel MCP request hung")
-            .expect("parallel MCP task panicked");
-            assert_eq!(status, StatusCode::OK, "request failed for {session_id}: {payload}");
+            let (index, session_id, status, payload) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                    .await
+                    .expect("parallel MCP request hung")
+                    .expect("parallel MCP task panicked");
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "request failed for {session_id}: {payload}"
+            );
             assert_eq!(payload.get("id").and_then(Value::as_str), Some("req-mcp"));
             match index % 3 {
                 0 => assert!(
@@ -3792,7 +3872,9 @@ mod tests {
                     let job_id = payload
                         .pointer("/result/structuredContent/jobId")
                         .and_then(Value::as_str)
-                        .unwrap_or_else(|| panic!("process response missing job id for {session_id}: {payload}"));
+                        .unwrap_or_else(|| {
+                            panic!("process response missing job id for {session_id}: {payload}")
+                        });
                     process_jobs.push((session_id, job_id.to_string()));
                 }
             }
@@ -4077,7 +4159,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(!config_path.exists(), "deferred persistence wrote synchronously");
+        assert!(
+            !config_path.exists(),
+            "deferred persistence wrote synchronously"
+        );
 
         for _ in 0..100 {
             if config_path.exists() {
@@ -4085,7 +4170,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(config_path.exists(), "deferred usage persistence never wrote config.toml");
+        assert!(
+            config_path.exists(),
+            "deferred usage persistence never wrote config.toml"
+        );
 
         let reloaded = AppState::new_for_test(
             8787,
@@ -4191,27 +4279,45 @@ async fn post_mcp_http(
     // Parsing is bounded by axum's body limit. Keep ping independent of busy
     // tool workers so clients can distinguish overload from a dead server.
     let metadata = serde_json::from_slice::<Value>(&body_bytes).ok();
-    if metadata.as_ref().and_then(|v| v.get("method")).and_then(Value::as_str) == Some("ping") {
+    if metadata
+        .as_ref()
+        .and_then(|v| v.get("method"))
+        .and_then(Value::as_str)
+        == Some("ping")
+    {
         // The ping path never enters the scheduler; it goes straight to
         // responding so its lifecycle record does not claim queued time.
         crate::diagnostics::set_current_request_stage(RequestStage::Responding);
         let body = metadata.as_ref().unwrap();
         crate::diagnostics::rpc_request(body);
         if serde_json::from_value::<JsonRpcRequest>(body.clone()).is_err() {
-            return jsonrpc_error_response(StatusCode::BAD_REQUEST, -32600, "Invalid JSON-RPC request");
+            return jsonrpc_error_response(
+                StatusCode::BAD_REQUEST,
+                -32600,
+                "Invalid JSON-RPC request",
+            );
         }
-        if let Err(response) = validate_modern_request(body, &headers) { return response; }
+        if let Err(response) = validate_modern_request(body, &headers) {
+            return response;
+        }
         let _ = s.ui_events.try_send(ServerUiEvent::IncrementRequestCount);
         s.catdesk_instruction_called
             .set_remote_connected_nonblocking(s.app.clone(), true);
         let Some(id) = body.get("id").filter(|v| !v.is_null()) else {
-            return Response::builder().status(StatusCode::ACCEPTED).body(Body::empty()).unwrap();
+            return Response::builder()
+                .status(StatusCode::ACCEPTED)
+                .body(Body::empty())
+                .unwrap();
         };
         let mut result = json!({});
         mcp::decorate_modern_result("ping", &mut result);
-        return Response::builder().status(StatusCode::OK)
+        return Response::builder()
+            .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json!({"jsonrpc":"2.0", "id":id, "result":result}).to_string())).unwrap();
+            .body(Body::from(
+                json!({"jsonrpc":"2.0", "id":id, "result":result}).to_string(),
+            ))
+            .unwrap();
     }
     if let Some(body) = &metadata {
         crate::diagnostics::rpc_request(body);
@@ -4310,12 +4416,13 @@ fn project_signal_for_request(req: &JsonRpcRequest, workspace_root: &str) -> Opt
             .and_then(|path| inferred_project_for_request_path(workspace_root, path)),
         "read" => {
             let paths = arguments.get("paths")?.as_array()?;
-            let mut projects = paths
-                .iter()
-                .map(Value::as_str)
-                .map(|path| path.and_then(|path| inferred_project_for_request_path(workspace_root, path)));
+            let mut projects = paths.iter().map(Value::as_str).map(|path| {
+                path.and_then(|path| inferred_project_for_request_path(workspace_root, path))
+            });
             let first = projects.next()??;
-            projects.all(|project| project.as_ref() == Some(&first)).then_some(first)
+            projects
+                .all(|project| project.as_ref() == Some(&first))
+                .then_some(first)
         }
         "search" => {
             let project = arguments
@@ -4331,16 +4438,13 @@ fn project_signal_for_request(req: &JsonRpcRequest, workspace_root: &str) -> Opt
 
 fn tool_call_succeeded(resp: &mcp::JsonRpcResponse) -> bool {
     resp.error.is_none()
-        && resp.result.as_ref().is_some_and(|result| {
-            result.get("isError").and_then(Value::as_bool) != Some(true)
-        })
+        && resp
+            .result
+            .as_ref()
+            .is_some_and(|result| result.get("isError").and_then(Value::as_bool) != Some(true))
 }
 
-fn record_project_selection(
-    gate: &InstructionGate,
-    session: &ClientSession,
-    project: PathBuf,
-) {
+fn record_project_selection(gate: &InstructionGate, session: &ClientSession, project: PathBuf) {
     match gate.set_active_project(session, project) {
         ProjectStateChange::Selected => crate::diagnostics::event("session_project_selected"),
         ProjectStateChange::Changed => crate::diagnostics::event("session_project_changed"),
@@ -4488,7 +4592,9 @@ async fn post_mcp_inner(
         stored_active_project.as_deref(),
     );
     if stored_active_project.is_some() && active_project.is_none() {
-        if s.catdesk_instruction_called.clear_active_project(&client_session) {
+        if s.catdesk_instruction_called
+            .clear_active_project(&client_session)
+        {
             crate::diagnostics::event("session_project_cleared");
         }
     }
@@ -4517,11 +4623,7 @@ async fn post_mcp_inner(
             if tool_call_succeeded(&resp)
                 && let Some(project) = project_signal.clone()
             {
-                record_project_selection(
-                    &s.catdesk_instruction_called,
-                    &client_session,
-                    project,
-                );
+                record_project_selection(&s.catdesk_instruction_called, &client_session, project);
             }
             if req.params.get("name").and_then(Value::as_str) == Some("catdesk_instruction")
                 && resp.error.is_none()
@@ -4596,13 +4698,13 @@ async fn post_mcp_inner(
                     .and_then(|uri| query_param_value(uri, "toolName"))
                     .filter(|tool_name| !tool_name.is_empty())
                 {
-                    let _ = s
-                        .ui_events
-                        .try_send(ServerUiEvent::RecordBootstrapWidgetReadResponse {
-                            flow_id: flow_id.clone(),
-                            tool_name: tool_name.to_string(),
-                            success: response_succeeded,
-                        });
+                    let _ =
+                        s.ui_events
+                            .try_send(ServerUiEvent::RecordBootstrapWidgetReadResponse {
+                                flow_id: flow_id.clone(),
+                                tool_name: tool_name.to_string(),
+                                success: response_succeeded,
+                            });
                 }
             }
             _ => {}

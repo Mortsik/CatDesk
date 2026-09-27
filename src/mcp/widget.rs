@@ -4,13 +4,13 @@ use crate::change_tracking::FileChange;
 use crate::state::ShowDetailMode;
 
 use crate::mcp::commands::format_command_output_events;
+#[cfg(test)]
+use crate::mcp::current_show_detail_mode;
 use crate::mcp::jsonrpc::{JsonRpcRequest, structured_content_text, tool_name_from_request};
 use crate::mcp::resources::{
     WIDGET_PAYLOAD_META_KEY, current_widget_resource_uri, current_widget_resource_uri_for_tool,
 };
 use crate::mcp::token_usage::TokenUsage;
-#[cfg(test)]
-use crate::mcp::current_show_detail_mode;
 use crate::mcp::{AutoWidgetContext, current_token_stats_layout, current_widget_corner_style};
 
 const MAX_WIDGET_COMMAND_OUTPUT_CHARS: usize = 4_000;
@@ -305,7 +305,6 @@ pub(crate) fn base_widget_payload_with_show_detail_mode(
     );
     payload
 }
-
 
 fn attach_widget_changed_files(
     payload: &mut Map<String, Value>,

@@ -3,26 +3,24 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::CHATGPT_CONNECTOR_SETTINGS_URL;
 use crate::mascot::{TUI_MASCOT_BLOCK_HEIGHT, TUI_MASCOT_BLOCK_WIDTH, render_tui_lines};
-use crate::state::{AppState, FlowLane, LIVE_USAGE_WINDOW_MS};
 use crate::perf_metrics;
-use crate::usage_pricing;
+use crate::state::{AppState, FlowLane, LIVE_USAGE_WINDOW_MS};
 use crate::tui::chrome::{draw_tui_header, render_toast};
 use crate::tui::flow::{
-    active_bootstrap_status_flow, flow_bootstrap_status_lines,
-    flow_lane_left_label, flow_lane_spans, flow_turn_usage_spans, latest_flow_action,
-    should_display_flow_row,
+    active_bootstrap_status_flow, flow_bootstrap_status_lines, flow_lane_left_label,
+    flow_lane_spans, flow_turn_usage_spans, latest_flow_action, should_display_flow_row,
     should_show_connect_guide,
 };
-use crate::CHATGPT_CONNECTOR_SETTINGS_URL;
 use crate::tui::logs::MCP_URL_MASK;
 use crate::tui::logs::{LogView, localize_log_message, mask_secret_log_message, wrap_log_message};
 use crate::tui::text::{
-    pad_right_to_cell_width,
     format_average_usage_cost_usd, format_cost_estimate_usd, format_session_duration,
-    format_token_compact, format_usd_compact, mcp_url_reveal_bar_segments,
-    mcp_url_reveal_seconds, session_cost_rates, trim_line,
+    format_token_compact, format_usd_compact, mcp_url_reveal_bar_segments, mcp_url_reveal_seconds,
+    pad_right_to_cell_width, session_cost_rates, trim_line,
 };
+use crate::usage_pricing;
 
 pub(crate) const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
 pub(crate) const STATUS_LABEL_WIDTH: usize = 13;
@@ -218,9 +216,15 @@ pub(crate) fn draw_ui(
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
             status_label(ui_language.text("REQ NOW", "即時請求")),
-            Span::styled(format!("{} ", ui_language.text("CHATS", "聊天")), muted_style),
+            Span::styled(
+                format!("{} ", ui_language.text("CHATS", "聊天")),
+                muted_style,
+            ),
             Span::styled(app.connected_chat_count().to_string(), value_style),
-            Span::styled(format!("      {} ", ui_language.text("JOBS", "工作")), muted_style),
+            Span::styled(
+                format!("      {} ", ui_language.text("JOBS", "工作")),
+                muted_style,
+            ),
             Span::styled(active_job_count.to_string(), value_style),
         ]),
         Line::from(vec![
@@ -267,7 +271,10 @@ pub(crate) fn draw_ui(
                 format!("${}/h", format_usd_compact(session_cost_per_hour_usd)),
                 cost_style,
             ),
-            Span::styled(ui_language.text("      SPENT ", "      已花費 "), muted_style),
+            Span::styled(
+                ui_language.text("      SPENT ", "      已花費 "),
+                muted_style,
+            ),
             Span::styled(
                 format!("${}", format_usd_compact(session_usage_cost_usd)),
                 cost_style,
@@ -341,12 +348,24 @@ pub(crate) fn draw_ui(
         Line::from(vec![
             status_label(ui_language.text("SYSTEM", "系統")),
             Span::styled("MCP ", muted_style),
-            Span::styled(if app.server_running { "✓" } else { "×" }, health_style(app.server_running)),
+            Span::styled(
+                if app.server_running { "✓" } else { "×" },
+                health_style(app.server_running),
+            ),
             Span::styled("      NGROK ", muted_style),
-            Span::styled(if app.ngrok_running { "✓" } else { "×" }, health_style(app.ngrok_running)),
+            Span::styled(
+                if app.ngrok_running { "✓" } else { "×" },
+                health_style(app.ngrok_running),
+            ),
             Span::styled("      DEVTOOLS ", muted_style),
-            Span::styled(devtools_indicator.0, devtools_indicator.1.add_modifier(Modifier::BOLD)),
-            Span::styled(format!("      {} ", ui_language.text("MODE", "模式")), muted_style),
+            Span::styled(
+                devtools_indicator.0,
+                devtools_indicator.1.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("      {} ", ui_language.text("MODE", "模式")),
+                muted_style,
+            ),
             Span::styled(mode_label, value_style),
             Span::styled(" / ", muted_style),
             Span::styled(tool_mode_label, value_style),
@@ -740,4 +759,3 @@ pub(crate) fn draw_ui(
         render_toast(f, palette, msg, pos);
     }
 }
-

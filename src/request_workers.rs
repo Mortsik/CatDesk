@@ -115,8 +115,11 @@ where
             },
         }),
         Ok(Err(_)) => {
-            let timing =
-                observed_timing(&request_started, dispatch_wait_ms.load(Ordering::Acquire), None);
+            let timing = observed_timing(
+                &request_started,
+                dispatch_wait_ms.load(Ordering::Acquire),
+                None,
+            );
             Err(TimedRequestError {
                 failure: RequestFailure::Failed,
                 timing,

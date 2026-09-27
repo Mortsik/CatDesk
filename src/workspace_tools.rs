@@ -9,9 +9,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Read};
-use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -2233,7 +2233,8 @@ mod tests {
 
         let workspace_root = test_workspace("search-rust-file-cap");
         fs::create_dir_all(&workspace_root).expect("create workspace");
-        let mut file = fs::File::create(workspace_root.join("large.txt")).expect("create large file");
+        let mut file =
+            fs::File::create(workspace_root.join("large.txt")).expect("create large file");
         file.write_all(&vec![b'a'; MAX_FALLBACK_SEARCH_FILE_BYTES as usize])
             .expect("write prefix");
         file.write_all(b"\nneedle-after-cap\n")
@@ -2259,7 +2260,10 @@ mod tests {
         )
         .expect("search");
 
-        assert_eq!(output.match_count, 0, "fallback read past its per-file byte cap");
+        assert_eq!(
+            output.match_count, 0,
+            "fallback read past its per-file byte cap"
+        );
         assert!(
             output.backend_note.contains("2 MiB per file"),
             "missing bounded-scan note: {}",
@@ -2628,7 +2632,12 @@ mod tests {
             command::FileListingFilter::All,
         )
         .expect("list workspace");
-        assert!(listing.entries.iter().any(|entry| entry.path == "local.txt"));
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.path == "local.txt")
+        );
         assert!(
             listing
                 .entries
@@ -2682,7 +2691,12 @@ mod tests {
             },
         )
         .expect("public search workspace");
-        assert!(public_search.results.iter().any(|entry| entry.path == "local.txt"));
+        assert!(
+            public_search
+                .results
+                .iter()
+                .any(|entry| entry.path == "local.txt")
+        );
         assert!(
             public_search
                 .results
@@ -2692,7 +2706,13 @@ mod tests {
             public_search.backend
         );
 
-        assert!(Command::new("umount").arg(&archive).status().unwrap().success());
+        assert!(
+            Command::new("umount")
+                .arg(&archive)
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2879,11 +2899,8 @@ mod tests {
         let workspace_root = test_workspace("search-deadline");
         fs::create_dir_all(&workspace_root).expect("create workspace");
         for index in 0..50 {
-            fs::write(
-                workspace_root.join(format!("file-{index}.txt")),
-                "filler\n",
-            )
-            .expect("write file");
+            fs::write(workspace_root.join(format!("file-{index}.txt")), "filler\n")
+                .expect("write file");
         }
         let started = Instant::now();
         let output = search_text_rg_with_deadline(

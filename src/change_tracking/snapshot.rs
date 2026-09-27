@@ -379,7 +379,8 @@ mod bounded_tests {
             return;
         }
 
-        let root = std::env::temp_dir().join(format!("catdesk-explicit-mount-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("catdesk-explicit-mount-{}", uuid::Uuid::new_v4()));
         let archive = root.join("archive");
         fs::create_dir_all(&archive).unwrap();
         assert!(

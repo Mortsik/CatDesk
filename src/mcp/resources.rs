@@ -2,8 +2,8 @@ use base64::Engine as _;
 use serde_json::{Map, Value, json};
 use std::sync::OnceLock;
 
-use crate::mcp::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 use crate::mascot;
+use crate::mcp::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 use crate::perf_metrics::{self, CacheKind};
 use crate::state::ShowDetailMode;
 
@@ -27,13 +27,17 @@ static REENABLE_WIDGET_IMAGE: OnceLock<String> = OnceLock::new();
 static REFRESH_CATDESK_IMAGE: OnceLock<String> = OnceLock::new();
 static REMOVE_CATDESK_IMAGE: OnceLock<String> = OnceLock::new();
 const WIDGET_RESOURCE_URI_PLACEHOLDER: &str = "__catdeskWidgetResourceUriPlaceholder__";
-pub(crate) const REENABLE_WIDGET_IMAGE_PLACEHOLDER: &str = "__catdeskReenableWidgetImageDataUriPlaceholder__";
-pub(crate) const REFRESH_CATDESK_IMAGE_PLACEHOLDER: &str = "__catdeskRefreshCatdeskImageDataUriPlaceholder__";
-pub(crate) const REMOVE_CATDESK_IMAGE_PLACEHOLDER: &str = "__catdeskRemoveCatdeskImageDataUriPlaceholder__";
+pub(crate) const REENABLE_WIDGET_IMAGE_PLACEHOLDER: &str =
+    "__catdeskReenableWidgetImageDataUriPlaceholder__";
+pub(crate) const REFRESH_CATDESK_IMAGE_PLACEHOLDER: &str =
+    "__catdeskRefreshCatdeskImageDataUriPlaceholder__";
+pub(crate) const REMOVE_CATDESK_IMAGE_PLACEHOLDER: &str =
+    "__catdeskRemoveCatdeskImageDataUriPlaceholder__";
 pub(crate) const INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER: &str =
     "__catdeskInitialTokenStatsLayoutPlaceholder__";
 pub(crate) const INITIAL_TOOL_NAME_PLACEHOLDER: &str = "__catdeskInitialToolNamePlaceholder__";
-pub(crate) const INITIAL_MASCOT_OUTLINE_PLACEHOLDER: &str = "__catdeskInitialMascotOutlinePlaceholder__";
+pub(crate) const INITIAL_MASCOT_OUTLINE_PLACEHOLDER: &str =
+    "__catdeskInitialMascotOutlinePlaceholder__";
 
 fn server_capabilities(show_detail_mode: ShowDetailMode) -> Value {
     if show_detail_mode == ShowDetailMode::Disable {

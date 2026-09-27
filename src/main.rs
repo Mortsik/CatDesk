@@ -5,22 +5,22 @@ mod change_tracking;
 mod command;
 mod command_jobs;
 mod command_policy;
-mod job_store;
 mod devtools;
 mod diagnostics;
 mod handoff;
+mod job_store;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
 mod macos_terminal;
 mod mascot;
 mod mcp;
-mod request_lifecycle;
-mod request_workers;
 mod ngrok;
 mod perf_metrics;
 mod process_exit;
 mod process_runner;
 mod project_scope;
+mod request_lifecycle;
+mod request_workers;
 mod server;
 mod session_context;
 mod startup;
@@ -47,16 +47,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use state::{
-    AppState, Mode, ServerUiEvent, SharedState, UiLanguage,
-    load_macos_terminal_profile, save_macos_terminal_profile, user_home_dir,
-};
-use tui::{
-    LogView, Selection, build_animation_snapshot, centered_rect, clipboard_copy,
-    draw_mode_select, post_mcp_path,
-    draw_ui, export_logs, extract_from_screen, find_available_remote_debug_port,
-    is_secret_log_message, mode_is_browser_enabled, run_browser_select,
-    run_chatgpt_connector_refresh_notice, run_ngrok_auth_setup, run_ngrok_domain_setup,
-    run_settings, sanitize_for_filename, secret_log_copy_value,
+    AppState, Mode, ServerUiEvent, SharedState, UiLanguage, load_macos_terminal_profile,
+    save_macos_terminal_profile, user_home_dir,
 };
 use std::collections::HashMap;
 use std::io::{Write, stdout};
@@ -65,6 +57,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::{
     Mutex,
     mpsc::{Receiver, Sender, channel},
+};
+use tui::{
+    LogView, Selection, build_animation_snapshot, centered_rect, clipboard_copy, draw_mode_select,
+    draw_ui, export_logs, extract_from_screen, find_available_remote_debug_port,
+    is_secret_log_message, mode_is_browser_enabled, post_mcp_path, run_browser_select,
+    run_chatgpt_connector_refresh_notice, run_ngrok_auth_setup, run_ngrok_domain_setup,
+    run_settings, sanitize_for_filename, secret_log_copy_value,
 };
 
 const REMOTE_CONNECT_UI_GRACE_MS: u128 = 8_000;
@@ -101,7 +100,9 @@ fn drain_server_ui_events(app: &mut AppState, ui_events: &mut Receiver<ServerUiE
     // An ongoing request stream must not postpone keyboard handling forever.
     let mut changed = false;
     for _ in 0..256 {
-        let Ok(event) = ui_events.try_recv() else { break };
+        let Ok(event) = ui_events.try_recv() else {
+            break;
+        };
         app.apply_server_ui_event(event);
         changed = true;
     }
@@ -147,7 +148,9 @@ fn macos_terminal_profile_enabled() -> std::io::Result<bool> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     let result = runtime.block_on(async_main());
     // A filesystem mounted over 9p/NFS can remain blocked in the kernel. Do not
     // let Tokio's implicit infinite wait for blocking workers prevent exit.
@@ -283,7 +286,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         app.remote_connected = false;
         app.last_remote_activity_ms = None;
     };
-    if tokio::time::timeout(Duration::from_secs(6), cleanup).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(6), cleanup)
+        .await
+        .is_err()
+    {
         diagnostics::event("shutdown_cleanup_timeout");
     }
 
@@ -966,7 +972,9 @@ async fn run_tui(
                     selection.clear();
                     match key.code {
                         KeyCode::Char('q') => break,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break;
+                        }
                         KeyCode::Char('e') => {
                             let export_result = {
                                 let app = state.lock().await;

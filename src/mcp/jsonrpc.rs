@@ -172,7 +172,11 @@ pub(crate) fn image_tool_success_response(
     )
 }
 
-pub(crate) fn tool_message_structured(req: &JsonRpcRequest, message: String, is_error: bool) -> Value {
+pub(crate) fn tool_message_structured(
+    req: &JsonRpcRequest,
+    message: String,
+    is_error: bool,
+) -> Value {
     json!({
         "toolName": tool_name_from_request(req),
         "message": message,
@@ -212,4 +216,3 @@ pub(crate) fn tool_name_from_request(req: &JsonRpcRequest) -> String {
         .unwrap_or("unknown_tool")
         .to_string()
 }
-

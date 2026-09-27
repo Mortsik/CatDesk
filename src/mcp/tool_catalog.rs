@@ -3,18 +3,21 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::command;
-use crate::command_jobs::{DEFAULT_ABANDON_AFTER_MS, DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS};
+use crate::command_jobs::{
+    DEFAULT_ABANDON_AFTER_MS, DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS, MAX_JOB_TIMEOUT_MS,
+    MAX_POLL_WAIT_MS,
+};
 use crate::devtools::DevtoolsBridge;
 use crate::handoff;
 use crate::state::{Mode, ShowDetailMode, ToolMode};
 use crate::workspace_tools;
 
 use crate::mcp::commands::fetch_devtools_tools;
-use crate::mcp::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
-use crate::mcp::widget::ensure_tool_descriptor_widget_template_with_show_detail_mode;
 #[cfg(test)]
 use crate::mcp::current_show_detail_mode;
+use crate::mcp::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 use crate::mcp::tool_is_read_only;
+use crate::mcp::widget::ensure_tool_descriptor_widget_template_with_show_detail_mode;
 
 // ── tools/list ──────────────────────────────────────────────
 

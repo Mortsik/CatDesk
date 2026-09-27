@@ -2,15 +2,13 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::time::SystemTime;
 
+use crate::REMOTE_CONNECT_UI_GRACE_MS;
 use crate::state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
     ShowDetailMode, UiLanguage, flow_anim_lit_count,
 };
-use crate::REMOTE_CONNECT_UI_GRACE_MS;
-use crate::tui::text::{
-    format_token_compact, format_usd_compact, terminal_cell_width, trim_line,
-};
 use crate::theme;
+use crate::tui::text::{format_token_compact, format_usd_compact, terminal_cell_width, trim_line};
 use crate::usage_pricing;
 
 pub(crate) const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
@@ -53,7 +51,11 @@ pub(crate) fn flow_lit_count(flow: Option<&FlowLane>, now_millis: u128, cells: u
         .unwrap_or(0)
 }
 
-pub(crate) fn debug_lane(direction: Option<FlowDirection>, lit_count: usize, cells: usize) -> String {
+pub(crate) fn debug_lane(
+    direction: Option<FlowDirection>,
+    lit_count: usize,
+    cells: usize,
+) -> String {
     let mut out = String::with_capacity(cells);
     for i in 0..cells {
         let lit_here = match direction {
@@ -416,7 +418,10 @@ pub(crate) fn flow_bootstrap_status_visible(flow: &FlowLane, now_millis: u128) -
         .is_some_and(|deadline| now_millis < deadline)
 }
 
-pub(crate) fn flow_bootstrap_countdown_remaining_seconds(flow: &FlowLane, now_millis: u128) -> Option<u128> {
+pub(crate) fn flow_bootstrap_countdown_remaining_seconds(
+    flow: &FlowLane,
+    now_millis: u128,
+) -> Option<u128> {
     let deadline = flow.bootstrap_status_close_deadline_ms?;
     if now_millis >= deadline {
         return Some(0);
@@ -424,7 +429,10 @@ pub(crate) fn flow_bootstrap_countdown_remaining_seconds(flow: &FlowLane, now_mi
     Some((deadline.saturating_sub(now_millis) + 999) / 1000)
 }
 
-pub(crate) fn active_bootstrap_status_flow<'a>(app: &'a AppState, now_millis: u128) -> Option<&'a FlowLane> {
+pub(crate) fn active_bootstrap_status_flow<'a>(
+    app: &'a AppState,
+    now_millis: u128,
+) -> Option<&'a FlowLane> {
     app.flows.iter().find(|flow| {
         should_display_flow_row(flow, app.remote_connected)
             && flow.bootstrap_status_active

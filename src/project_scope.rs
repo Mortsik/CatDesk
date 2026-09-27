@@ -54,15 +54,14 @@ pub(crate) fn infer_project_root(
     // Translate either spelling into the same canonical namespace before
     // enforcing the workspace boundary and locating the nearest project.
     let normalized_workspace = crate::command::normalize_windows_verbatim_path(workspace.clone());
-    let candidate_in_canonical_namespace = if let Ok(relative) =
-        candidate_lexical.strip_prefix(&workspace_lexical)
-    {
-        workspace.join(relative)
-    } else if let Ok(relative) = candidate_lexical.strip_prefix(&normalized_workspace) {
-        workspace.join(relative)
-    } else {
-        candidate_lexical.clone()
-    };
+    let candidate_in_canonical_namespace =
+        if let Ok(relative) = candidate_lexical.strip_prefix(&workspace_lexical) {
+            workspace.join(relative)
+        } else if let Ok(relative) = candidate_lexical.strip_prefix(&normalized_workspace) {
+            workspace.join(relative)
+        } else {
+            candidate_lexical.clone()
+        };
     if !candidate_in_canonical_namespace.starts_with(&workspace) {
         return Err(path_escape_error(candidate));
     }
