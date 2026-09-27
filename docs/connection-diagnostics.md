@@ -69,7 +69,9 @@ correlate the records around `T` by `request_id`:
   `terminal_reason: "server_shutdown"`: the transport or the process was
   disrupted;
 - requests whose `http_started` precedes `T` with no terminal record by `T`
-  were still in flight — their age is the leading stall indicator;
+  were still in flight — their age is the leading stall indicator — unless a
+  later `process_started` carries a different `pid`: the owning process died
+  abruptly, so the request was lost at that restart boundary, not still active;
 - none of the above: no CatDesk-side failure; suspect the client or network.
 
 When several coincide, precedence for a single verdict is: server shutdown,
@@ -79,6 +81,26 @@ implements this over log records and is exercised by the test suite).
 The dashboard also shows the time since the last observed tool call
 ("last call" on the REQ SESSION line), so a stream error long after the last
 call is unlikely to be CatDesk's fault.
+
+## `catdesk diagnose`
+
+The classifier has a built-in caller. `catdesk diagnose` runs the correlation
+offline over the log directory — the current file, both rotations, and the
+`concurrent/` slot an overlapping restart wrote to, merged and sorted by
+`timestamp_ms` — without starting the TUI or opening the diagnostics writer:
+
+```
+catdesk diagnose [--recent 30m] [--at 2026-09-22T14:03:00Z] [--window 30s] [--logs-dir ~/.catdesk/logs]
+```
+
+`--at` takes an RFC 3339 timestamp and `--recent` an offset back from now
+(`ms`/`s`/`m`/`h`); the two are mutually exclusive and 30 minutes is the
+default. `--window` defaults to 30 seconds. The report prints the ranked
+verdict, the per-window evidence counts (deadline timeouts, client and
+shutdown cancellations, worker failures, tunnel events, completed requests,
+server-stopping events), then the full-history findings: requests lost at an
+abrupt restart with their in-flight age to the boundary, and the oldest
+requests still active at the reference time.
 
 The disk writer runs on a separate thread with a bounded queue. When saturated,
 requests continue and records are dropped; `dropped_records` on a later record

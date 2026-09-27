@@ -6,6 +6,7 @@ mod command;
 mod command_jobs;
 mod command_policy;
 mod devtools;
+mod diagnose;
 mod diagnostics;
 mod handoff;
 mod job_store;
@@ -148,6 +149,24 @@ fn macos_terminal_profile_enabled() -> std::io::Result<bool> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `catdesk diagnose <args>` is the offline log-analysis mode. Dispatch it
+    // before the runtime, the rustls provider, the terminal and the
+    // diagnostics writer: it reads the persisted logs read-only and must not
+    // start or touch any of them.
+    let mut argv = std::env::args();
+    let _program = argv.next();
+    if argv.next().as_deref() == Some("diagnose") {
+        match diagnose::run(&argv.collect::<Vec<_>>()) {
+            Ok(output) => println!("{output}"),
+            // Returning Err from main would print the message debug-quoted
+            // with escaped newlines; usage errors belong on stderr as-is.
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
+        }
+        return Ok(());
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

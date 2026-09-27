@@ -76,7 +76,6 @@ impl TerminalReason {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 /// One request that had started but produced no terminal record by the
 /// failure time: its ID and how long it had been in flight.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,7 +84,6 @@ pub(crate) struct ActiveAtFailure {
     pub(crate) age_ms: u64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 /// CatDesk-side evidence found in a window of connection-diagnostic records
 /// around a client-reported stream failure (for example "Resume stream
 /// unavailable" or "Stream cache expired").
@@ -114,7 +112,6 @@ pub(crate) struct StreamFailureCorrelation {
     pub(crate) lost_at_restart: Vec<ActiveAtFailure>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl StreamFailureCorrelation {
     pub(crate) fn is_empty(&self) -> bool {
         self == &Self::default()
@@ -142,12 +139,10 @@ impl StreamFailureCorrelation {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn record_timestamp_ms(record: &Value) -> Option<u64> {
+pub(crate) fn record_timestamp_ms(record: &Value) -> Option<u64> {
     record.get("timestamp_ms").and_then(Value::as_u64)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn record_request_id(record: &Value) -> Option<String> {
     record
         .get("request_id")
@@ -189,7 +184,6 @@ fn cancelled_terminal_reason(record: &Value) -> TerminalReason {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 /// Correlate one window of connection-diagnostic records with a stream
 /// failure reported at `at_ms` (Unix milliseconds). Records outside
 /// `[at_ms - window_ms, at_ms + window_ms]` are ignored so client clock skew
