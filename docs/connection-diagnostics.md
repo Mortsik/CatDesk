@@ -10,8 +10,10 @@ continues without diagnostics. Check both directories when comparing restarts.
 
 Records contain Unix milliseconds (`timestamp_ms`), process ID (`pid`), and:
 
-- `http_started`: generated `request_id`, HTTP method, `route_matched`, and the
-  number of active requests. Paths, query strings and headers are not saved.
+- `http_started`: generated `request_id`, HTTP method, `route_matched`,
+  `stage: "queued"`, and the number of active requests with the live `stage`
+  of the oldest one (`oldest_active_stage`). Paths, query strings and headers
+  are not saved.
 - `mcp_request`: the same generated ID, an allowlisted `rpc_method`, and for tool
   calls an allowlisted local `rpc_tool`. Unknown methods/tool names become
   `other`. Client IDs, arguments, custom/browser tool names, resource
@@ -27,10 +29,56 @@ Records contain Unix milliseconds (`timestamp_ms`), process ID (`pid`), and:
   work that continues after a response deadline. The tool fields record only the
   error flag and content count, not content. An `http_finished` record means the
   handler produced its response; it does not prove that ChatGPT received it.
+  Every finish also carries the terminal `stage` (`completed`) and the
+  `terminal_reason`: `completed`, `deadline_timeout` (the scheduler deadline
+  expired), or `worker_failed` (the request worker failed).
 - `http_cancelled`: the request future ended without producing a response.
+  Terminal `stage` is `cancelled` and `terminal_reason` is
+  `client_disconnect`, or `server_shutdown` when the server had already begun
+  stopping.
 - Process, server and tunnel lifecycle events such as `process_started`,
   `server_started`, `tunnel_started`, `tunnel_failed` and `process_stopping`.
   Raw error messages are deliberately omitted because they can contain URLs.
+
+## Request lifecycle stages
+
+While a request is in flight, the in-memory lifecycle registry tracks its
+`stage`: `queued` (accepted, not yet handed to the scheduler), `dispatch`
+(handed to the scheduler, waiting for a blocking-pool thread), `executing`
+(running on the blocking pool), and `responding` (work returned, response
+being assembled). Stages are metadata only; they add no admission control.
+The stage of the oldest active request is published on every
+`http_started`/`http_finished`/`http_cancelled` record, so a stream of records
+shows what stalled work was doing. `http_started` records carry the stage of
+their own request (`queued`); later transitions are visible in memory
+(`Diagnostics::active_requests_view`) rather than on disk to keep the log
+compact.
+
+## Attributing a client stream failure
+
+When ChatGPT reports "Resume stream unavailable" or "Stream cache expired" at
+time `T`, take a window (30 seconds each side absorbs client clock skew) and
+correlate the records around `T` by `request_id`:
+
+- any `http_finished` with `terminal_reason: "deadline_timeout"` (status 504):
+  CatDesk missed the response deadline — the failure is explained server-side;
+- any `http_cancelled` with `terminal_reason: "client_disconnect"`: the client
+  dropped the connection; that drop is often the stream failure itself, not a
+  CatDesk fault;
+- `tunnel_started`/`tunnel_failed`/`tunnel_*` events or
+  `terminal_reason: "server_shutdown"`: the transport or the process was
+  disrupted;
+- requests whose `http_started` precedes `T` with no terminal record by `T`
+  were still in flight — their age is the leading stall indicator;
+- none of the above: no CatDesk-side failure; suspect the client or network.
+
+When several coincide, precedence for a single verdict is: server shutdown,
+CatDesk timeout, worker failure, tunnel event, client cancellation, then
+"no CatDesk-side failure" (`request_lifecycle::classify_stream_failure`
+implements this over log records and is exercised by the test suite).
+The dashboard also shows the time since the last observed tool call
+("last call" on the REQ SESSION line), so a stream error long after the last
+call is unlikely to be CatDesk's fault.
 
 The disk writer runs on a separate thread with a bounded queue. When saturated,
 requests continue and records are dropped; `dropped_records` on a later record
@@ -87,7 +135,8 @@ failures without persisting MCP payloads or session secrets.
 Check `scheduler_deadline_stage` to see whether the deadline expired before the
 blocking task started (`queue`) or during `execution`. Work that already started
 continues to completion, including after client disconnection or response
-timeout.
+timeout. The terminal reason on the finish record names the outcome directly:
+`deadline_timeout` for a 504, `worker_failed` when the request worker failed.
 **A timeout does not prove that a command or write stopped.** Inspect the result
 or poll an existing command job before retrying. MCP `ping` stays independent of
 this pipeline and of the shared application-state lock, with normal MCP validation.
