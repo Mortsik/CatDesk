@@ -190,6 +190,30 @@ browser processes and other file operations can still consume substantial RAM.
 On Linux, compare `/proc/<pid>/status`, `/proc/pressure/memory` and kernel OOM
 records. A large swap allocation alone is not proof of an OOM kill.
 
+## Soak scenarios
+
+The production failure modes above are exercised by two layers of soak (the
+`catdesk-43k.3` work):
+
+- `src/soak.rs` runs deterministic in-suite scenarios on every `cargo test`:
+  a long request outliving its response deadline (the 504 is classified
+  `deadline_timeout` while the side-effectful command survives and stays
+  pollable), concurrent tool calls across scheduler classes, client
+  disconnects during side-effectful work, a mixed failure storm, and the
+  classifier's tunnel branch. Each scenario asserts the failure budget:
+  every induced failure carries its expected terminal classification, every
+  started request has exactly one terminal record, and the lifecycle registry
+  is empty afterwards. Deadlines are shortened only through a per-router
+  request-extension override read by the HTTP handler; the production
+  45/60/120-second policy is never modified and is pinned by
+  `production_response_deadlines_stay_at_the_documented_defaults`.
+- `ops/soak-real-duration.sh` runs the true durations against the real
+  policy: a genuine 45-second control-deadline timeout, a near-ceiling
+  ~2-minute request (`--full`), 24 parallel calls, real client disconnects,
+  and the ngrok supervisor's real tunnel lifecycle records, with the same
+  budget assertions over the produced JSONL. A mid-stream tunnel drop needs
+  a live tunnel; see the script header for the `CLOUDFLARED_UNIT` opt-in.
+
 ## External cloudflared reliability
 
 When CatDesk is exposed through a separately managed `cloudflared.service`, keep

@@ -1044,7 +1044,11 @@ impl Diagnostics {
         }
     }
 
-    fn start(root: &Path) -> io::Result<(Self, Guard)> {
+    /// Open the log writer and spawn its drain thread. Besides the module's
+    /// own tests this is the harness entry point for the in-suite soak
+    /// scenarios (src/soak.rs), which need a Diagnostics instance that is not
+    /// installed as the process global.
+    pub(crate) fn start(root: &Path) -> io::Result<(Self, Guard)> {
         // An overlapping restart must not silently lose all diagnostics while
         // the old process still holds the primary log. Two fixed slots retain
         // rotation bounds; they do not accumulate per-PID files indefinitely.

@@ -1,7 +1,7 @@
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{Form, Path, State},
+    extract::{Extension, Form, Path, State},
     http::{HeaderMap, Response, StatusCode, header},
     response::Json,
     routing::{delete, get, post},
@@ -1665,6 +1665,34 @@ mod tests {
     }
 
     #[test]
+    fn production_response_deadlines_stay_at_the_documented_defaults() {
+        // The soak scenarios (src/soak.rs) shorten deadlines only through a
+        // per-router request-extension override; these production defaults are
+        // the policy documented in docs/connection-diagnostics.md and must not
+        // move to accommodate a test.
+        assert_eq!(
+            request_deadline(RequestClass::Control),
+            StdDuration::from_secs(45)
+        );
+        assert_eq!(
+            request_deadline(RequestClass::General),
+            StdDuration::from_secs(60)
+        );
+        assert_eq!(
+            request_deadline(RequestClass::Filesystem),
+            MCP_HTTP_REQUEST_MAX_DURATION
+        );
+        assert_eq!(
+            request_deadline(RequestClass::Process),
+            MCP_HTTP_REQUEST_MAX_DURATION
+        );
+        assert_eq!(
+            request_deadline(RequestClass::Browser),
+            MCP_HTTP_REQUEST_MAX_DURATION
+        );
+    }
+
+    #[test]
     fn request_deadlines_never_exceed_mcp_http_ceiling() {
         let ceiling = StdDuration::from_secs(120);
         for class in [
@@ -2326,6 +2354,7 @@ mod tests {
             post_mcp_http(
                 State(server),
                 modern_mcp_headers("ping", None),
+                None,
                 mcp_request_body("ping", json!({})),
             ),
         )
@@ -2377,6 +2406,7 @@ mod tests {
         let discover = post_mcp_http(
             State(server_state.clone()),
             modern_mcp_headers("server/discover", None),
+            None,
             mcp_request_body("server/discover", json!({})),
         )
         .await;
@@ -2419,6 +2449,7 @@ mod tests {
         let tools = post_mcp_http(
             State(server_state.clone()),
             modern_mcp_headers("tools/list", None),
+            None,
             mcp_request_body("tools/list", json!({})),
         )
         .await;
@@ -2453,6 +2484,7 @@ mod tests {
         let unknown = post_mcp_http(
             State(server_state.clone()),
             modern_mcp_headers("catdesk/unknown", None),
+            None,
             mcp_request_body("catdesk/unknown", json!({})),
         )
         .await;
@@ -2475,6 +2507,7 @@ mod tests {
         let mismatch = post_mcp_http(
             State(server_state),
             mismatched_headers,
+            None,
             mcp_request_body("server/discover", json!({})),
         )
         .await;
@@ -2524,6 +2557,7 @@ mod tests {
         let legacy_shape = post_mcp_http(
             State(server_state.clone()),
             HeaderMap::new(),
+            None,
             raw_mcp_request_body(
                 "initialize",
                 json!({
@@ -2551,6 +2585,7 @@ mod tests {
         let modern_shape = post_mcp_http(
             State(server_state),
             modern_mcp_headers("initialize", None),
+            None,
             mcp_request_body("initialize", json!({})),
         )
         .await;
@@ -3135,6 +3170,7 @@ mod tests {
         let instruction = post_mcp_http(
             State(server_state.clone()),
             modern_mcp_headers_for_session(&instruction_body, "client-a-secret-session"),
+            None,
             instruction_body,
         )
         .await;
@@ -3144,6 +3180,7 @@ mod tests {
         let read_a = post_mcp_http(
             State(server_state.clone()),
             modern_mcp_headers_for_session(&read_a_body, "client-a-secret-session"),
+            None,
             read_a_body,
         )
         .await;
@@ -3161,6 +3198,7 @@ mod tests {
         let read_b = post_mcp_http(
             State(server_state),
             modern_mcp_headers_for_session(&read_b_body, "client-b-secret-session"),
+            None,
             read_b_body,
         )
         .await;
@@ -3358,7 +3396,7 @@ mod tests {
                 with_openai_session(tool_call_body("catdesk_instruction", json!({})), session_id);
             let headers = modern_mcp_headers_for_body(&body);
             assert!(headers.get(MCP_SESSION_ID_HEADER).is_none());
-            let response = post_mcp_http(State(server_state.clone()), headers, body).await;
+            let response = post_mcp_http(State(server_state.clone()), headers, None, body).await;
             assert_eq!(response.status(), StatusCode::OK);
         }
 
@@ -3402,7 +3440,8 @@ mod tests {
         };
         let request = tool_call_body("catdesk_instruction", json!({}));
         let headers = modern_mcp_headers_for_session(&request, "queue-saturated-session");
-        let response = post_mcp_http(State(server_state.clone()), headers.clone(), request).await;
+        let response =
+            post_mcp_http(State(server_state.clone()), headers.clone(), None, request).await;
         assert_eq!(response.status(), StatusCode::OK);
         {
             let app = app_state.lock().await;
@@ -3463,6 +3502,7 @@ mod tests {
         let explicit_response = post_mcp_http(
             State(server_state.clone()),
             modern_mcp_headers_for_session(&explicit_body, session_id),
+            None,
             explicit_body,
         )
         .await;
@@ -3487,6 +3527,7 @@ mod tests {
         let implicit_response = post_mcp_http(
             State(server_state),
             modern_mcp_headers_for_session(&implicit_body, session_id),
+            None,
             implicit_body,
         )
         .await;
@@ -3616,6 +3657,7 @@ mod tests {
             let response = post_mcp_http(
                 State(state),
                 modern_mcp_headers_for_session(&body, session_id),
+                None,
                 body,
             )
             .await;
@@ -3741,6 +3783,7 @@ mod tests {
             let response = post_mcp_http(
                 State(state.clone()),
                 modern_mcp_headers_for_session(body, session_id),
+                None,
                 body.clone(),
             )
             .await;
@@ -3830,7 +3873,7 @@ mod tests {
             let headers = modern_mcp_headers_for_session(&body, &session_id);
             let state = server_state.clone();
             tasks.push(tokio::spawn(async move {
-                let response = post_mcp_http(State(state), headers, body).await;
+                let response = post_mcp_http(State(state), headers, None, body).await;
                 let status = response.status();
                 let bytes = to_bytes(response.into_body(), usize::MAX)
                     .await
@@ -4274,6 +4317,13 @@ mod tests {
 async fn post_mcp_http(
     State(s): State<ServerState>,
     headers: HeaderMap,
+    // Soak-harness knob (src/soak.rs): a request-extension deadline injected
+    // by a test-only layer so failure scenarios can shorten response deadlines
+    // inline. Production routers never install that layer, so this is always
+    // `None` and the documented 45/60/120-second policy from
+    // `request_deadline` governs; the defaults are pinned by
+    // `production_response_deadlines_stay_at_the_documented_defaults`.
+    response_deadline_override: Option<Extension<StdDuration>>,
     body_bytes: Bytes,
 ) -> Response<Body> {
     // Parsing is bounded by axum's body limit. Keep ping independent of busy
@@ -4332,9 +4382,12 @@ async fn post_mcp_http(
     // captured callback).
     let execute_started = crate::diagnostics::current_execute_started();
     crate::diagnostics::set_current_request_stage(RequestStage::Dispatch);
+    let deadline = response_deadline_override
+        .map(|Extension(deadline)| deadline)
+        .unwrap_or_else(|| request_deadline(class));
     match run_timed(
         async move { post_mcp_inner(State(s), body_bytes, &headers, None).await },
-        request_deadline(class),
+        deadline,
         execute_started,
     )
     .await

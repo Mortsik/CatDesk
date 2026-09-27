@@ -1246,4 +1246,7 @@ mod test_serialization {
 }
 
 #[cfg(test)]
+mod soak;
+
+#[cfg(test)]
 mod tests;
