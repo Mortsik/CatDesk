@@ -137,18 +137,23 @@ The ngrok SDK reconnects its session internally after transport failures,
 rebinding the same tunnel without ending the forwarder task. CatDesk wraps the
 session connector around `ngrok::session::default_connect` (transport behavior
 unchanged) and records every SDK dial: `tunnel_session_reconnect_attempt` each
-time the SDK redials after a connection drop, and `tunnel_session_renewed` once
-the transport is re-established and the SDK rebinds the tunnel on top of it.
-The initial connect stays silent — the supervisor's `tunnel_starting` already
-covers it. With the default connector the SDK retries reconnects indefinitely
-and stops only when the session is canceled, so a prolonged outage produces a
-stream of `tunnel_session_reconnect_attempt` records with no renewal (and no
-`tunnel_failed`) for as long as the SDK keeps dialing, leaving the forwarder
-pending. The supervisor's `tunnel_reconnect_*` records are a separate family:
-they cover full supervisor-loop restarts after session setup failures or
-forwarder exits, not in-session reconnects. To identify an upstream ngrok
-error, retain its HTTP response body or `ngrok-error-code` header at the time
-of failure. Never publish the secret connector URL.
+time the SDK redials after a dropped connection, and `tunnel_transport_reconnected`
+once the re-established transport dial succeeds. The success event claims only
+the transport: after it, the SDK still authenticates and rebinds the tunnels,
+and if either step fails it simply redials — which surfaces as the next
+`tunnel_session_reconnect_attempt`. ngrok's public API exposes no observation
+point for the fully completed reconnect, so no record claims a renewed session
+or tunnel. The initial connect stays silent — the supervisor's `tunnel_starting`
+already covers it. With the default connector the SDK retries reconnects
+indefinitely and stops only when the session is canceled, so a prolonged outage
+produces repeated `tunnel_session_reconnect_attempt` records (occasionally
+punctuated by a `tunnel_transport_reconnected` that did not lead to a working
+tunnel) and never a `tunnel_failed`, leaving the forwarder pending. The
+supervisor's `tunnel_reconnect_*` records are a separate family: they cover
+full supervisor-loop restarts after session setup failures or forwarder exits,
+not in-session reconnects. To identify an upstream ngrok error, retain its
+HTTP response body or `ngrok-error-code` header at the time of failure. Never
+publish the secret connector URL.
 
 Use `tail -n 100 ~/.catdesk/logs/connections.jsonl` to inspect recent activity.
 New logging starts only after restarting CatDesk with the updated binary.
