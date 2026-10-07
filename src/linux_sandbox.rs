@@ -869,10 +869,21 @@ fn sandbox_scope_systemd_run_with(
 ) -> Option<PathBuf> {
     sandbox_memory_limits()?;
     let executable = systemd_run_executable(workspace)?;
-    if !scope_usable(&executable) {
+    sandbox_scope_for_resolved(&executable, scope_usable)
+}
+
+/// [`sandbox_scope_systemd_run`] for an already-resolved executable: production
+/// resolves through `PATH` (excluding workspace-local candidates), while tests
+/// pass their stub by absolute path — the decision path then runs hermetically,
+/// without depending on the host's ambient `systemd-run` being present.
+fn sandbox_scope_for_resolved(
+    executable: &Path,
+    scope_usable: impl FnOnce(&Path) -> bool,
+) -> Option<PathBuf> {
+    if !scope_usable(executable) {
         return None;
     }
-    Some(executable)
+    Some(executable.to_path_buf())
 }
 
 fn sandbox_command(
@@ -1756,14 +1767,15 @@ mod tests {
         std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755))
             .expect("chmod systemd-run stub");
 
-        // No PATH rewrite: the stub is passed by absolute path, so this test
-        // holds no env window during which concurrent PATH-resolved spawns in
-        // other tests could see the stub-only dir (full-suite flake source).
+        // No PATH rewrite and no resolver involvement: the stub is passed by
+        // absolute path through `sandbox_scope_for_resolved`, so this test
+        // exercises its own stub on hosts that have no ambient `systemd-run`
+        // at all, and holds no env window for concurrent spawns to trip over.
         let _env = EnvGuards::set_str("CATDESK_SANDBOX_MEMORY", "on");
 
         assert!(
-            sandbox_scope_systemd_run_with(Path::new("."), |_| {
-                systemd_scope_usable_within(&systemd_run, SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT)
+            sandbox_scope_for_resolved(&systemd_run, |executable| {
+                systemd_scope_usable_within(executable, SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT)
             })
             .is_none(),
             "a failing preflight means no scope: fail open to plain bwrap"
@@ -1790,15 +1802,16 @@ mod tests {
         std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755))
             .expect("chmod systemd-run stub");
 
-        // No PATH rewrite: the stub is passed by absolute path, so the ~250 ms
-        // deadline window holds no env rewrite during which concurrent
-        // PATH-resolved spawns in other tests could see the stub-only dir
-        // (full-suite flake source).
+        // No PATH rewrite and no resolver involvement: the stub is passed by
+        // absolute path through `sandbox_scope_for_resolved`, so the deadline
+        // window holds no env rewrite for concurrent spawns to trip over, and
+        // the test runs its own stub even on hosts with no ambient
+        // `systemd-run` (the "unavailable" case it exists to cover).
         let _env = EnvGuards::set_str("CATDESK_SANDBOX_MEMORY", "on");
 
         let started = Instant::now();
-        let scope = sandbox_scope_systemd_run_with(Path::new("."), |_| {
-            systemd_scope_usable_within(&systemd_run, Duration::from_millis(250))
+        let scope = sandbox_scope_for_resolved(&systemd_run, |executable| {
+            systemd_scope_usable_within(executable, Duration::from_millis(250))
         });
         let elapsed = started.elapsed();
         assert!(
