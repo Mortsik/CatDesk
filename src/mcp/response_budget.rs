@@ -221,7 +221,8 @@ fn compact_value(
             };
             if text.len() > limit {
                 let original_bytes = text.len();
-                let (preview, omitted_bytes) = head_tail_preview_with_omitted(text, limit);
+                let (preview, omitted_bytes) =
+                    head_tail_preview_with_omitted(text, limit, BUDGET_REFERENCE_NOTE);
                 let preview_bytes = preview.len();
                 let kind = if is_blob_field(field_name) {
                     "blob"
@@ -310,8 +311,11 @@ fn reduce_to_essentials(value: &mut Value, is_error: bool, omissions: &mut Omiss
             if let Value::String(text) = child {
                 if text.len() > FALLBACK_TEXT_PREVIEW_BYTES {
                     let original_bytes = text.len();
-                    let (preview, omitted_bytes) =
-                        head_tail_preview_with_omitted(text, FALLBACK_TEXT_PREVIEW_BYTES);
+                    let (preview, omitted_bytes) = head_tail_preview_with_omitted(
+                        text,
+                        FALLBACK_TEXT_PREVIEW_BYTES,
+                        BUDGET_REFERENCE_NOTE,
+                    );
                     let preview_bytes = preview.len();
                     let path = json_pointer_child("/structuredContent", key);
                     let kind = if is_blob_field(Some(key)) {
@@ -422,7 +426,8 @@ fn compact_error_content(
         return;
     }
 
-    let (preview, omitted_bytes) = head_tail_preview_with_omitted(&text, limit);
+    let (preview, omitted_bytes) =
+        head_tail_preview_with_omitted(&text, limit, BUDGET_REFERENCE_NOTE);
     let preview_bytes = preview.len();
     if let Some(text_value) = content
         .first_mut()
@@ -517,15 +522,23 @@ fn value_is_small_scalar(value: &Value) -> bool {
 }
 
 fn head_tail_preview(text: &str, max_bytes: usize) -> String {
-    head_tail_preview_with_omitted(text, max_bytes).0
+    head_tail_preview_with_omitted(text, max_bytes, BUDGET_REFERENCE_NOTE).0
 }
 
-fn head_tail_preview_with_omitted(text: &str, max_bytes: usize) -> (String, usize) {
+/// Where a previewed text's remainder lives. Budgeted surfaces store the full
+/// payload in the large-result store, so their marker points at outputRef.
+const BUDGET_REFERENCE_NOTE: &str = "see responseBudget.outputRef";
+
+fn head_tail_preview_with_omitted(
+    text: &str,
+    max_bytes: usize,
+    reference_note: &str,
+) -> (String, usize) {
     if text.len() <= max_bytes {
         return (text.to_string(), 0);
     }
 
-    let mut marker = "\n… <omitted bytes; see responseBudget.outputRef> …\n".to_string();
+    let mut marker = format!("\n… <omitted bytes; {reference_note}> …\n");
     let mut head_end = 0;
     let mut tail_start = text.len();
 
@@ -539,7 +552,7 @@ fn head_tail_preview_with_omitted(text: &str, max_bytes: usize) -> (String, usiz
             tail_start = head_end;
         }
         let omitted = tail_start.saturating_sub(head_end);
-        marker = format!("\n… <omitted {omitted} bytes; see responseBudget.outputRef> …\n");
+        marker = format!("\n… <omitted {omitted} bytes; {reference_note}> …\n");
     }
 
     let mut preview = String::with_capacity(max_bytes);
@@ -550,7 +563,7 @@ fn head_tail_preview_with_omitted(text: &str, max_bytes: usize) -> (String, usiz
     while preview.len() > max_bytes && head_end > 0 {
         head_end = previous_char_boundary(text, head_end);
         let omitted = tail_start.saturating_sub(head_end);
-        marker = format!("\n… <omitted {omitted} bytes; see responseBudget.outputRef> …\n");
+        marker = format!("\n… <omitted {omitted} bytes; {reference_note}> …\n");
         preview.clear();
         preview.push_str(&text[..head_end]);
         preview.push_str(&marker);
@@ -558,6 +571,18 @@ fn head_tail_preview_with_omitted(text: &str, max_bytes: usize) -> (String, usiz
     }
 
     (preview, tail_start.saturating_sub(head_end))
+}
+
+/// Cap for text the shared budget cannot reach: the multimodal-exempt
+/// `read_image` analysis travels inline next to native image content, so its
+/// model-generated description needs a deterministic bound of its own. Tied to
+/// the error-text preview size so one budget scale governs both surfaces.
+pub(crate) const ANALYSIS_DESCRIPTION_PREVIEW_BYTES: usize = ERROR_TEXT_PREVIEW_BYTES;
+
+/// Deterministic head+tail preview for budget-exempt surfaces. The omission
+/// note is self-contained because these surfaces have no stored outputRef.
+pub(crate) fn preview_text_without_output_ref(text: &str, max_bytes: usize) -> String {
+    head_tail_preview_with_omitted(text, max_bytes, "full text not retained").0
 }
 
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {

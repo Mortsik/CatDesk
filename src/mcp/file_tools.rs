@@ -12,6 +12,9 @@ use crate::mcp::jsonrpc::{
     tool_error_response, tool_error_response_with_structured,
     tool_success_response_with_structured,
 };
+use crate::mcp::response_budget::{
+    ANALYSIS_DESCRIPTION_PREVIEW_BYTES, preview_text_without_output_ref,
+};
 
 pub(crate) fn parse_read_paths(arguments: &Value) -> Result<Vec<String>, String> {
     let items = arguments
@@ -156,7 +159,7 @@ fn parse_optional_analysis_prompt(arguments: &Value) -> Result<Option<Option<Str
     }
 }
 
-fn image_tool_analyzed_response(
+pub(crate) fn image_tool_analyzed_response(
     req: &JsonRpcRequest,
     output: &workspace_tools::ReadImageOutput,
     config: &vision::VisionConfig,
@@ -166,6 +169,14 @@ fn image_tool_analyzed_response(
     // structuredContent text to the model, so the vision description travels
     // in structuredContent while the image stays in content[] for clients
     // with native multimodal support (Claude, Cline, MCP Inspector).
+    //
+    // The native image content exempts this response from the shared response
+    // budget (response_budget::has_native_non_text_content), so the model
+    // output description — of unbounded length — is capped here with the
+    // shared preview machinery instead. The image bytes stay untouched.
+    let description =
+        preview_text_without_output_ref(&analysis, ANALYSIS_DESCRIPTION_PREVIEW_BYTES);
+    let analysis_truncated = description.len() != analysis.len();
     JsonRpcResponse::success(
         req.id.clone(),
         json!({
@@ -187,7 +198,8 @@ fn image_tool_analyzed_response(
                 "analysis": {
                     "backend": config.backend.as_str(),
                     "model": config.model,
-                    "description": analysis,
+                    "description": description,
+                    "analysisTruncated": analysis_truncated,
                 },
                 "message": format!("Read image {} (analyzed with {})", output.path, config.model),
                 "success": true,
