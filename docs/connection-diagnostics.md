@@ -134,14 +134,21 @@ and `http_finished` entries by generated `request_id`:
   records alone are not proof (check writer warnings, restarts and dropped records).
 
 The ngrok SDK reconnects its session internally after transport failures,
-rebinding the same tunnel without ending the forwarder task. CatDesk watches
-the ngrok-assigned session identity and records `tunnel_session_renewed` when
-the SDK re-establishes the session (detected within a 5-second poll window;
-several renewals inside one window collapse into a single record). A reconnect
-that gives up surfaces as `tunnel_failed`, followed by the supervisor's
-`tunnel_reconnect_*` records. To identify an upstream ngrok error, retain its
-HTTP response body or `ngrok-error-code` header at the time of failure. Never
-publish the secret connector URL.
+rebinding the same tunnel without ending the forwarder task. CatDesk wraps the
+session connector around `ngrok::session::default_connect` (transport behavior
+unchanged) and records every SDK dial: `tunnel_session_reconnect_attempt` each
+time the SDK redials after a connection drop, and `tunnel_session_renewed` once
+the transport is re-established and the SDK rebinds the tunnel on top of it.
+The initial connect stays silent — the supervisor's `tunnel_starting` already
+covers it. With the default connector the SDK retries reconnects indefinitely
+and stops only when the session is canceled, so a prolonged outage produces a
+stream of `tunnel_session_reconnect_attempt` records with no renewal (and no
+`tunnel_failed`) for as long as the SDK keeps dialing, leaving the forwarder
+pending. The supervisor's `tunnel_reconnect_*` records are a separate family:
+they cover full supervisor-loop restarts after session setup failures or
+forwarder exits, not in-session reconnects. To identify an upstream ngrok
+error, retain its HTTP response body or `ngrok-error-code` header at the time
+of failure. Never publish the secret connector URL.
 
 Use `tail -n 100 ~/.catdesk/logs/connections.jsonl` to inspect recent activity.
 New logging starts only after restarting CatDesk with the updated binary.
