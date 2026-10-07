@@ -591,7 +591,7 @@ fn reduce_result_to_entry_cap(result: &mut Value, cap_bytes: u64) {
         }
         let mut largest: Option<(String, usize)> = None;
         largest_string_path(result, String::new(), &mut largest);
-        let Some((path, bytes)) = largest.filter(|(_, bytes)| *bytes >= ENTRY_CAP_TRIM_MIN_BYTES)
+        let Some((path, _)) = largest.filter(|(_, bytes)| *bytes >= ENTRY_CAP_TRIM_MIN_BYTES)
         else {
             break;
         };
