@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 fn canonical_existing(path: &Path) -> io::Result<PathBuf> {
@@ -670,26 +670,103 @@ const SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
 /// promptly without spinning the scheduler.
 const SYSTEMD_SCOPE_PREFLIGHT_POLL: Duration = Duration::from_millis(25);
 
+/// How long a positive preflight verdict is trusted. Negative verdicts never
+/// expire: a user manager that was absent at spawn time does not come back
+/// mid-process, so there is nothing to gain from re-probing a known-dead bus.
+/// A positive verdict ages out so a bus that dies mid-process is re-probed
+/// within `SYSTEMD_SCOPE_POSITIVE_TTL` instead of being trusted forever.
+const SYSTEMD_SCOPE_POSITIVE_TTL: Duration = Duration::from_secs(45);
+
+struct ScopeVerdict {
+    usable: bool,
+    decided_at: Instant,
+}
+
+/// Per-process preflight verdicts, keyed by the resolved `systemd-run` path:
+/// distinct resolved executables (workspace-local exclusion can differ per
+/// workspace) must not share a decision.
+#[derive(Default)]
+struct ScopeUsabilityCache {
+    verdicts: BTreeMap<PathBuf, ScopeVerdict>,
+}
+
+impl ScopeUsabilityCache {
+    const fn new() -> Self {
+        Self {
+            verdicts: BTreeMap::new(),
+        }
+    }
+
+    /// Decide scope usability for `executable`, consulting the cache first.
+    /// The injected `probe` performs the real preflight on a cache miss (or
+    /// after a positive verdict's TTL) so tests can drive this hermetically.
+    fn decide(
+        &mut self,
+        executable: &Path,
+        timeout: Duration,
+        ttl: Duration,
+        probe: &mut dyn FnMut(&Path, Duration) -> bool,
+    ) -> bool {
+        if let Some(verdict) = self.verdicts.get(executable) {
+            if !verdict.usable {
+                return false;
+            }
+            if verdict.decided_at.elapsed() < ttl {
+                return true;
+            }
+        }
+        let usable = probe(executable, timeout);
+        self.verdicts.insert(
+            executable.to_path_buf(),
+            ScopeVerdict {
+                usable,
+                decided_at: Instant::now(),
+            },
+        );
+        usable
+    }
+}
+
+/// Process-wide cache. The mutex is held across the probe on purpose:
+/// concurrent first commands queue behind one preflight instead of
+/// stampeding identical transient units into the bus.
+static SCOPE_USABILITY: Mutex<ScopeUsabilityCache> = Mutex::new(ScopeUsabilityCache::new());
+
 /// Whether a transient user scope can actually be created, decided by one real
-/// `systemd-run --user --scope --quiet true` per process (cached).
+/// `systemd-run --user --scope --quiet true` against the resolved executable
+/// and cached per executable.
 ///
 /// Preflight instead of socket probing: a listening-but-dead bus socket
 /// accepts `connect()` while the real client hangs on the D-Bus handshake, and
 /// `systemd-run` resolves the bus strictly as `DBUS_SESSION_BUS_ADDRESS` else
 /// `$XDG_RUNTIME_DIR/bus` with no fallback — so no socket heuristic predicts
-/// usability and only the client itself is an honest oracle. The cached
-/// verdict pays ~50 ms once per process; if the bus dies after a pass, the
-/// real launch fails with a systemd-run error instead of degrading — accepted
-/// and known.
+/// usability and only the client itself is an honest oracle. A negative
+/// verdict is cached for the process lifetime; a positive one expires after
+/// [`SYSTEMD_SCOPE_POSITIVE_TTL`], so a bus that dies mid-process is
+/// re-probed instead of being trusted forever. Residual staleness inside the
+/// TTL window (and a bus dying between the probe and a real launch) still
+/// fails the affected command — an immediate retry-without-scope on a
+/// "Failed to connect to bus" error is tracked as a follow-up.
 fn systemd_scope_usable(executable: &Path) -> bool {
-    static USABLE: OnceLock<bool> = OnceLock::new();
-    *USABLE.get_or_init(|| systemd_scope_usable_within(executable, SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT))
+    SCOPE_USABILITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .decide(
+            executable,
+            SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT,
+            SYSTEMD_SCOPE_POSITIVE_TTL,
+            &mut |executable, timeout| systemd_scope_usable_within(executable, timeout),
+        )
 }
 
 /// Uncached preflight: runs the resolved `systemd-run` with the process env
 /// inherited (the server's environment is exactly what the real launch sees)
 /// and returns true only on a clean exit. Nonzero exit, spawn failure and the
 /// timeout kill (wedged handshake) all count as unusable.
+///
+/// Every path past a successful spawn finalizes the child with `kill()` +
+/// `wait()` (retrying on EINTR): returning early would leak either a zombie
+/// or, worse, a live `systemd-run` wedged in the handshake.
 fn systemd_scope_usable_within(executable: &Path, timeout: Duration) -> bool {
     let mut child = match Command::new(executable)
         .args(["--user", "--scope", "--quiet", "true"])
@@ -703,18 +780,24 @@ fn systemd_scope_usable_within(executable: &Path, timeout: Duration) -> bool {
     };
 
     let deadline = Instant::now() + timeout;
-    loop {
+    let verdict = loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if Instant::now() >= deadline => break false,
             Ok(None) => std::thread::sleep(SYSTEMD_SCOPE_PREFLIGHT_POLL),
-            Err(_) => return false,
+            Err(_) => break false,
+        }
+    };
+
+    let _ = child.kill();
+    loop {
+        match child.wait() {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
         }
     }
+    verdict
 }
 
 /// Memory ceilings for a single sandboxed command, applied through cgroup v2
@@ -1730,6 +1813,127 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "the deadline kill must be promptly enforced (elapsed {elapsed:?})"
         );
+    }
+
+    #[test]
+    fn scope_cache_keeps_negative_verdict_without_reprobing() {
+        let mut cache = ScopeUsabilityCache::new();
+        let executable = Path::new("/opt/bin/systemd-run");
+        let probes = std::cell::Cell::new(0);
+        let first = cache.decide(
+            executable,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            &mut |_, _: Duration| {
+                probes.set(probes.get() + 1);
+                false
+            },
+        );
+        assert!(!first);
+        assert_eq!(probes.get(), 1);
+
+        // A negative verdict never expires: a bus absent at spawn time does
+        // not come back mid-process, so a fresh TTL must not trigger a
+        // re-probe either.
+        let second = cache.decide(
+            executable,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            &mut |_, _: Duration| {
+                probes.set(probes.get() + 1);
+                false
+            },
+        );
+        assert!(!second);
+        assert_eq!(probes.get(), 1, "negative verdict must be trusted forever");
+    }
+
+    #[test]
+    fn scope_cache_positive_verdict_expires_after_ttl() {
+        let mut cache = ScopeUsabilityCache::new();
+        let executable = Path::new("/opt/bin/systemd-run");
+        let probes = std::cell::Cell::new(0);
+        assert!(cache.decide(
+            executable,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            &mut |_, _: Duration| {
+                probes.set(probes.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(probes.get(), 1);
+        // Inside the TTL the positive verdict is trusted without a probe.
+        assert!(cache.decide(
+            executable,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            &mut |_, _: Duration| {
+                probes.set(probes.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(probes.get(), 1);
+        // A zero TTL expires immediately: the next decision must re-probe so
+        // a bus that died after the cached pass is noticed.
+        assert!(cache.decide(
+            executable,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            &mut |_, _: Duration| {
+                probes.set(probes.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(probes.get(), 2);
+    }
+
+    #[test]
+    fn scope_cache_keys_verdicts_by_resolved_executable() {
+        let mut cache = ScopeUsabilityCache::new();
+        let first_executable = Path::new("/opt/bin/systemd-run");
+        let second_executable = Path::new("/usr/bin/systemd-run");
+        let probed = std::cell::RefCell::new(Vec::new());
+        let count_probe = &mut |executable: &Path, _: Duration| {
+            probed.borrow_mut().push(executable.to_path_buf());
+            true
+        };
+
+        assert!(cache.decide(
+            first_executable,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            count_probe
+        ));
+        // A different resolved executable must not inherit the first one's
+        // positive verdict.
+        assert!(cache.decide(
+            second_executable,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            count_probe
+        ));
+        assert_eq!(
+            *probed.borrow(),
+            vec![
+                first_executable.to_path_buf(),
+                second_executable.to_path_buf()
+            ]
+        );
+        // Both verdicts are now cached under their own key.
+        assert!(cache.decide(
+            first_executable,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            count_probe
+        ));
+        assert!(cache.decide(
+            second_executable,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            count_probe
+        ));
+        assert_eq!(probed.borrow().len(), 2);
     }
 
     #[test]
