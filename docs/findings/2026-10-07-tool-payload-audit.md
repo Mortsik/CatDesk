@@ -22,7 +22,9 @@ matrix), and each handler was traced to its bounding mechanism.
 ## Local tool inventory
 
 `Exposed in`: C = `Mode::Computer`-enabled (also `Mode::Both`), M = `ToolMode::MultiTools`,
-R = `ToolMode::ReadOnly`, B = `Mode::Browser` without computer.
+R = `ToolMode::ReadOnly`, B = `Mode::Browser` without computer. Rows use exactly these
+tokens (`C+M`, `C+R`, `B`), comma-separated; the inventory test parses this column and
+compares it against the enumerated catalog exposure per (Mode, ToolMode).
 
 | Tool | Exposed in | Payload surface(s) | Bounding | Evidence | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -30,11 +32,11 @@ R = `ToolMode::ReadOnly`, B = `Mode::Browser` without computer.
 | `start_command` | C+M | `events[]` (early output), job scalars | `shared-budget+pre-cap` | retained-output cap 4 MiB/job `src/command_jobs.rs:31`, `src/mcp/commands.rs:163` | First snapshot may carry early output up to the retained cap; shared budget externalizes anything over 64 KiB. |
 | `poll_command` | C+M | `events[]` (incremental output), text content | `shared-budget+pre-cap` | per-poll clip 128 KiB `src/command_jobs.rs:33,352-381`, retained 4 MiB `src/command_jobs.rs:31` | A single event larger than 128 KiB still passes whole (see discoveries); the shared budget bounds the final inline response. |
 | `cancel_command` | C+M | `events[]` (terminal output) | `shared-budget+pre-cap` | terminal retained output 32 MiB `src/command_jobs.rs:32`, `src/mcp/commands.rs:330` | Bounded by retention cap + shared budget. |
-| `catdesk_instruction` | C+M, C+R, B | `instructionText`, text content | `inherent-static` | static template lines `src/mcp/instruction.rs:142-260` | No host-controlled payload; shared-budget gate remains as backstop. |
+| `catdesk_instruction` | C+M, C+R, B | `instructionText`, text content, widget `_meta` (`binagotchyCards[]` with base64 images) | `shared-budget` | template lines `src/mcp/instruction.rs:142-236`; AGENTS.md layers read unbounded `src/mcp/agents_state.rs:203-211` via `src/mcp/instruction.rs:82-123,232-236`; widget cards read unbounded `src/mascot.rs:520-553` via `src/mcp/instruction.rs:323-336` | Not inherent-static: the template is fixed, but the response embeds host-controlled AGENTS.md text and archived Binagotchy card images, neither length-capped — finding F5. Only the shared-budget gate bounds the response (and its >64 MiB fail-open, F2, applies). Regression test `oversized_catdesk_instruction_is_externalized_not_inlined` pins the externalization contract. |
 | `read` | C+M, C+R | `files[].text`, text content | `shared-budget+pre-cap` | batch budget 512 KiB `src/workspace_tools.rs:23`, per-file cap 512 KiB `src/workspace_tools.rs:21`, batch size 32 `src/workspace_tools.rs:22`, per-file budget accounting `src/workspace_tools.rs:449-473`, flags `budgetTruncated`/`batchTruncated` `src/mcp/file_tools.rs:56-61` | Files past the batch budget return metadata only. |
 | `read_image` | C+M, C+R | image content (base64), `structuredContent` (with `analyze`) | `multimodal-exempt` | input cap 20 MiB / 40 Mpx `src/workspace_tools.rs:27-28`, resize default 1600 max 4096 `src/workspace_tools.rs:24-26`, post-encode cap `src/workspace_tools.rs:425`, exemption `src/mcp/response_budget.rs:168` with test `src/mcp/response_budget.rs:879`, size-cap test `src/mcp/tests.rs:4014-4031` | Deliberate multimodal exception: native image content bypasses the budget so clients keep vision capability. With `analyze`, `analysis.description` has no cap — finding F1. |
 | `search` | C+M, C+R | `searchResults[]` (path/line/text), text content | `shared-budget+pre-cap` | match cap default 100 hard 500 `src/workspace_tools.rs:32-33`, per-file cap `src/mcp/tool_catalog.rs:642`, deadline truncation `src/workspace_tools.rs:39-50`, fallback scan caps `src/workspace_tools.rs:62-64`, `searchTruncated` flag `src/mcp/file_tools.rs:506` | A single matched line can still be arbitrarily long (minified files); the shared budget externalizes such responses over 64 KiB. |
-| `read_result` | C+M, C+R | `dataBase64`, `text` | `store-range` | request `max_bytes` rejected above 128 KiB (`RangeTooLarge`) `src/result_store.rs:363-368`, constant `src/result_store.rs:13` | Excluded from the dispatcher gate (`src/mcp.rs:493`) because it is the retrieval instrument for the store; bounded by store-side validation. Worst case ≈ 128 KiB raw → ~171 KiB base64 inline. |
+| `read_result` | C+M, C+R | `dataBase64`, `text` | `store-range` | request `max_bytes` rejected above 128 KiB (`RangeTooLarge`) `src/result_store.rs:363-368`, constant `src/result_store.rs:13` | Excluded from the dispatcher gate (`src/mcp.rs:493`) because it is the retrieval instrument for the store; bounded by store-side validation. Worst case for one maximal range of ASCII data ≈ 306 KiB serialized (base64 ≈ 171 KiB **plus** the same range mirrored as `text` ≈ 128 KiB plus metadata); with control bytes JSON-escaped as `\u00XX` the mirrored `text` inflates the same range up to ≈ 962 KiB. Size test `read_result_max_range_serialized_size_stays_bounded`. |
 | `search_result` | C+M, C+R | `matches[]` (snippets), `query` echo | `store-range` | `max_matches` rejected above 100 `src/result_store.rs:413-418`, snippet 256 B `src/result_store.rs:17`, default 20 `src/mcp/result_tools.rs:90` | Same gate exclusion as `read_result`. The `query` echo is client-controlled and unbounded — finding F3. |
 | `write` | C+M | `bytesWritten`, message | `inherent-static` | input cap 512 KiB `src/workspace_tools.rs:29`, response `src/mcp/file_tools.rs:213-226` | Response is scalars + short message. |
 | `edit` | C+M | operation counters, message | `inherent-static` | atomic batch, rendered summary `src/mcp/file_tools.rs:406-423` | Response is scalars + short message. |
@@ -88,6 +90,17 @@ upstream by the DevTools transport cap.
 - Problem: the `_meta` enrichment can push a budgeted response a few hundred bytes over the 64 KiB inline limit. Purely cosmetic today (fixed-size scalars).
 - Suggested direction: attach metadata before the budget gate, or accept the documented overhead.
 
+### F5 — `catdesk_instruction` embeds uncapped AGENTS.md text and Binagotchy card images — severity: medium
+
+- Tool: `catdesk_instruction`
+- Location:
+  - `src/mcp/agents_state.rs:203-211` — `read_agents_text_result` calls `std::fs::read_to_string` with no length cap; `cached_agents_text` inherits it.
+  - `src/mcp/instruction.rs:82-123,232-236` — `instruction_agents_layers` collects up to three AGENTS.md layers (config-resolved, workspace, active project) and `catdesk_instruction_text_for_project` splices their full text into `instructionText`, which lands in both `structuredContent` and the text content of every response.
+  - `src/mascot.rs:520-553` — `load_archived_binagotchy_cards` reads every directory under `~/.catdesk/binagotchy` with no cap on count or PNG size and embeds each image as inline base64 in `ArchivedBinagotchyCard.image`.
+  - `src/mcp/instruction.rs:323-336,313` — the cards are attached to the widget `_meta` of the instruction response (`binagotchyCards`).
+- Problem: a large AGENTS.md (or many/oversized archived cards) inflates the response arbitrarily; today only the shared-budget gate bounds it, so the response is externalized above 64 KiB — but above the store's 64 MiB entry cap the F2 fail-open returns the whole thing inline. The base64 card images also permanently inflate the widget `_meta` that travels with the (usually tiny) instruction response.
+- Suggested direction: cap `read_agents_text_result` (e.g. head preview at 64 KiB with an explicit truncation marker) and cap the card feed (max card count and max PNG bytes; skip oversized entries) so the tool's own sources are bounded instead of relying solely on the dispatcher gate.
+
 ## Discoveries (no action required)
 
 - `poll_command` clips each poll to 128 KiB, but the clip never splits a single event (`src/command_jobs.rs:356` `!events.is_empty()` guard), so one oversized output line passes whole; the shared budget still bounds the final inline response.
@@ -98,9 +111,27 @@ upstream by the DevTools transport cap.
 
 `tool_payload_audit_covers_every_exposed_tool` (in `src/mcp/tests.rs`) drives
 `handle_tools_list` across the full mode/tool-mode matrix with the DevTools
-bridge absent (deterministic local set) and asserts the exposed set equals the
-audited inventory exactly — in both directions. Adding a tool to the catalog
-without an inventory entry fails the test; a stale inventory entry whose tool
-was removed fails too. Companion tests validate that every mechanism string is
-one of the audited bounding classes, and that this document lists every audited
-tool (and no phantom ones), keeping the table and the test data in lockstep.
+bridge absent (deterministic local set) and asserts, **per (Mode, ToolMode)
+combination**, that the exposed tool list equals that combination's expected
+exact set — order included. A tool drifting out of one combination (or leaking
+into a mode where it must not appear) fails; so does a stale inventory entry.
+
+`tool_payload_audit_document_lists_every_audited_tool` parses the full record of
+every local-tool row in this document — tool name, `Exposed in` tokens, and
+bounding class — and compares all three against the audited list and the
+enumerated exposure: an edited bounding class or a changed exposure column
+fails, not just a removed row. `tool_payload_audit_mechanisms_use_audited_classes`
+keeps every mechanism string inside the recognized class set.
+
+Two tests pin the dynamic DevTools passthrough contract (names are not
+statically enumerable, so the audit pins behavior instead):
+`devtools_passthrough_lists_dynamic_tools_and_filters_read_only` drives
+`handle_tools_list` through a fake bridge process with arbitrary tool names and
+asserts listing plus the read-only filter; `devtools_passthrough_big_result_goes_through_shared_budget`
+forwards a large tool result through the same fake bridge and asserts the
+shared-budget manifest and inline limit apply.
+
+`oversized_catdesk_instruction_is_externalized_not_inlined` pins the F5 state:
+a megabyte-scale AGENTS.md must produce a budget manifest, never an oversized
+inline response, and `read_result_max_range_serialized_size_stays_bounded` pins
+the documented worst-case size of one maximal retrieval range.
