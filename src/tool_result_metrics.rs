@@ -96,8 +96,8 @@ fn registry() -> MutexGuard<'static, Registry> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Account one tool result in the fixed-slot aggregates. Unknown tool names
-/// fold into "other".
+/// Account one tool result: bump the fixed-slot aggregates and emit the
+/// numeric-only diagnostics event. Unknown tool names fold into "other".
 pub(crate) fn observe(tool: Option<&str>, measurement: ToolResultMeasurement) {
     let slot = tool_index(tool);
     let class = measurement.classify();
@@ -123,6 +123,14 @@ pub(crate) fn observe(tool: Option<&str>, measurement: ToolResultMeasurement) {
             }
         }
     }
+    crate::diagnostics::tool_result_bytes(
+        slot,
+        class.as_str(),
+        measurement.raw_bytes,
+        measurement.inline_bytes,
+        measurement.externalized_bytes,
+        measurement.is_error,
+    );
 }
 
 /// Copy of the cumulative registry; rows pair with `perf_metrics::tool_name`.

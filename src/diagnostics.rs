@@ -49,6 +49,10 @@ mod tests {
             request_metadata(&json!({"method":"tools/call", "params":{"name":"start_command"}}))["rpc_tool"],
             "start_command"
         );
+        assert_eq!(
+            request_metadata(&json!({"method":"tools/call", "params":{"name":"read_result"}}))["rpc_tool"],
+            "read_result"
+        );
         assert!(!value.to_string().contains("secret"));
         let unknown = request_metadata(&json!({"method": "secret-method"}));
         assert_eq!(unknown["rpc_method"], "other");
@@ -102,6 +106,75 @@ mod tests {
         }));
         assert!(invalid.get("requested_wait_ms").is_none());
         assert!(!invalid.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn tool_result_bytes_records_numbers_only_aggregates() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let log = Diagnostics {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
+            write_dropped: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicU64::new(0)),
+            active_requests: Arc::new(StdMutex::new(HashMap::new())),
+            stopping_since: Arc::new(StdMutex::new(None)),
+        };
+        let trace = RequestLog {
+            log,
+            id: "request-under-test".to_string(),
+            started: Instant::now(),
+            complete: AtomicBool::new(false),
+            tool: AtomicU8::new(0),
+        };
+        REQUEST
+            .scope(trace, async {
+                tool_result_bytes(
+                    crate::perf_metrics::tool_index(Some("run_command")),
+                    "externalized",
+                    123_456,
+                    4_096,
+                    123_456,
+                    false,
+                );
+                // A slot beyond the whitelist degrades to "other": numeric slots
+                // can never carry caller-controlled text into the log.
+                tool_result_bytes(usize::MAX, "small", 1, 1, 0, true);
+            })
+            .await;
+
+        let record = receiver.recv().unwrap().unwrap();
+        assert_eq!(record["event"], "tool_result_bytes");
+        assert_eq!(record["request_id"], "request-under-test");
+        assert_eq!(record["rpc_tool"], "run_command");
+        assert_eq!(record["class"], "externalized");
+        assert_eq!(record["raw_bytes"], 123_456);
+        assert_eq!(record["inline_bytes"], 4_096);
+        assert_eq!(record["externalized_bytes"], 123_456);
+        assert_eq!(record["is_error"], false);
+        let fallback = receiver.recv().unwrap().unwrap();
+        assert_eq!(fallback["rpc_tool"], "other");
+        assert_eq!(fallback["is_error"], true);
+        let expected_keys = [
+            "event",
+            "timestamp_ms",
+            "pid",
+            "dropped_records",
+            "diagnostic_write_failures",
+            "diagnostic_write_dropped",
+            "request_id",
+            "rpc_tool",
+            "class",
+            "raw_bytes",
+            "inline_bytes",
+            "externalized_bytes",
+            "is_error",
+        ];
+        assert_eq!(
+            record.as_object().map(|object| object.len()),
+            Some(expected_keys.len()),
+            "the record must carry exactly the aggregate fields, never payload keys"
+        );
     }
 
     #[test]
@@ -1275,7 +1348,9 @@ fn request_metadata(body: &Value) -> Value {
                 | "write"
                 | "edit"
                 | "delete"
-                | "create_handoff"),
+                | "create_handoff"
+                | "read_result"
+                | "search_result"),
             ) => name,
             _ => "other",
         };
@@ -1326,6 +1401,31 @@ pub(crate) fn rpc_request(body: &Value) {
             let index = crate::perf_metrics::tool_index(tool);
             request.tool.store(index as u8 + 1, Ordering::Relaxed);
         }
+    });
+}
+
+/// Numeric-only per-call byte accounting for one tool result (see
+/// `tool_result_metrics`). The tool name resolves from the fixed perf-metrics
+/// whitelist by slot, so caller-controlled text can never reach the log.
+pub(crate) fn tool_result_bytes(
+    slot: usize,
+    class: &'static str,
+    raw: u64,
+    inline: u64,
+    externalized: u64,
+    is_error: bool,
+) {
+    let _ = REQUEST.try_with(|request| {
+        request.log.record(json!({
+            "event": "tool_result_bytes",
+            "request_id": request.id,
+            "rpc_tool": crate::perf_metrics::tool_name(slot),
+            "class": class,
+            "raw_bytes": raw,
+            "inline_bytes": inline,
+            "externalized_bytes": externalized,
+            "is_error": is_error,
+        }));
     });
 }
 
