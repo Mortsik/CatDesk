@@ -31,13 +31,14 @@ impl OmissionTracker {
         kind: &'static str,
         original_bytes: usize,
         preview_bytes: usize,
+        omitted_bytes: usize,
     ) {
         self.push(json!({
             "path": path,
             "kind": kind,
             "originalBytes": original_bytes,
             "previewBytes": preview_bytes,
-            "omittedBytes": original_bytes.saturating_sub(preview_bytes)
+            "omittedBytes": omitted_bytes
         }));
     }
 
@@ -204,7 +205,7 @@ fn compact_value(
             };
             if text.len() > limit {
                 let original_bytes = text.len();
-                let preview = head_tail_preview(text, limit);
+                let (preview, omitted_bytes) = head_tail_preview_with_omitted(text, limit);
                 let preview_bytes = preview.len();
                 let kind = if is_blob_field(field_name) {
                     "blob"
@@ -212,7 +213,7 @@ fn compact_value(
                     "text"
                 };
                 *text = preview;
-                omissions.text(path, kind, original_bytes, preview_bytes);
+                omissions.text(path, kind, original_bytes, preview_bytes, omitted_bytes);
             }
         }
         Value::Array(items) => {
@@ -293,7 +294,8 @@ fn reduce_to_essentials(value: &mut Value, is_error: bool, omissions: &mut Omiss
             if let Value::String(text) = child {
                 if text.len() > FALLBACK_TEXT_PREVIEW_BYTES {
                     let original_bytes = text.len();
-                    let preview = head_tail_preview(text, FALLBACK_TEXT_PREVIEW_BYTES);
+                    let (preview, omitted_bytes) =
+                        head_tail_preview_with_omitted(text, FALLBACK_TEXT_PREVIEW_BYTES);
                     let preview_bytes = preview.len();
                     let path = json_pointer_child("/structuredContent", key);
                     let kind = if is_blob_field(Some(key)) {
@@ -302,7 +304,7 @@ fn reduce_to_essentials(value: &mut Value, is_error: bool, omissions: &mut Omiss
                         "text"
                     };
                     *text = preview;
-                    omissions.text(&path, kind, original_bytes, preview_bytes);
+                    omissions.text(&path, kind, original_bytes, preview_bytes, omitted_bytes);
                 }
             }
         }
@@ -404,7 +406,7 @@ fn compact_error_content(
         return;
     }
 
-    let preview = head_tail_preview(&text, limit);
+    let (preview, omitted_bytes) = head_tail_preview_with_omitted(&text, limit);
     let preview_bytes = preview.len();
     if let Some(text_value) = content
         .first_mut()
@@ -413,7 +415,13 @@ fn compact_error_content(
     {
         *text_value = Value::String(preview);
     }
-    omissions.text("/content/0/text", "text", text.len(), preview_bytes);
+    omissions.text(
+        "/content/0/text",
+        "text",
+        text.len(),
+        preview_bytes,
+        omitted_bytes,
+    );
 }
 
 fn has_native_non_text_content(result: &Value) -> bool {
@@ -493,8 +501,12 @@ fn value_is_small_scalar(value: &Value) -> bool {
 }
 
 fn head_tail_preview(text: &str, max_bytes: usize) -> String {
+    head_tail_preview_with_omitted(text, max_bytes).0
+}
+
+fn head_tail_preview_with_omitted(text: &str, max_bytes: usize) -> (String, usize) {
     if text.len() <= max_bytes {
-        return text.to_string();
+        return (text.to_string(), 0);
     }
 
     let mut marker = "\n… <omitted bytes; see responseBudget.outputRef> …\n".to_string();
@@ -521,12 +533,15 @@ fn head_tail_preview(text: &str, max_bytes: usize) -> String {
 
     while preview.len() > max_bytes && head_end > 0 {
         head_end = previous_char_boundary(text, head_end);
+        let omitted = tail_start.saturating_sub(head_end);
+        marker = format!("\n… <omitted {omitted} bytes; see responseBudget.outputRef> …\n");
         preview.clear();
         preview.push_str(&text[..head_end]);
         preview.push_str(&marker);
         preview.push_str(&text[tail_start..]);
     }
-    preview
+
+    (preview, tail_start.saturating_sub(head_end))
 }
 
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {
@@ -575,6 +590,55 @@ mod tests {
 
     fn oversized_text(prefix: &str, suffix: &str) -> String {
         format!("{prefix}{}{}", "中🙂".repeat(24_000), suffix)
+    }
+
+    fn marker_omitted_bytes(preview: &str) -> u64 {
+        let marker_start = preview.find("<omitted ").expect("missing omission marker");
+        let count_start = marker_start + "<omitted ".len();
+        let count_end = preview[count_start..]
+            .find(" bytes;")
+            .map(|offset| count_start + offset)
+            .expect("missing omission byte suffix");
+        preview[count_start..count_end]
+            .parse()
+            .expect("invalid omission byte count")
+    }
+
+    #[test]
+    fn text_omission_metadata_counts_removed_source_bytes_not_preview_marker_bytes() {
+        let full = oversized_text("HEAD-SENTINEL\n", "\nTAIL-SENTINEL");
+        let result = json!({
+            "content": [],
+            "structuredContent": {
+                "toolName": "run_command",
+                "success": true,
+                "exitCode": 0,
+                "stdout": full,
+                "stderr": ""
+            }
+        });
+
+        let candidate = prepare_response_budget(&result, false).expect("must budget");
+        let preview = candidate.finish("lr_exact_omission");
+        let stdout = preview
+            .pointer("/structuredContent/stdout")
+            .and_then(Value::as_str)
+            .expect("stdout preview");
+        let omission = manifest(&preview)
+            .pointer("/preview/omissions")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("path").and_then(Value::as_str) == Some("/structuredContent/stdout")
+                })
+            })
+            .expect("stdout omission");
+
+        assert_eq!(
+            omission.get("omittedBytes").and_then(Value::as_u64),
+            Some(marker_omitted_bytes(stdout)),
+            "omittedBytes must count source bytes removed from the middle, excluding marker bytes"
+        );
     }
 
     #[test]

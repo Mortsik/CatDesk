@@ -1460,6 +1460,215 @@ async fn run_command_success_keeps_content_empty() {
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn run_command_large_stdout_and_stderr_are_compact_inline_and_fully_retrievable() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-run-large-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = LargeResultStore::new_default().expect("create result store");
+    let command = concat!(
+        "printf 'STDOUT-HEAD\\n'; ",
+        "head -c 1100000 /dev/zero | tr '\\0' x; ",
+        "printf '\\nSTDOUT-TAIL\\n'; ",
+        "{ printf 'STDERR-HEAD\\n'; ",
+        "head -c 1100000 /dev/zero | tr '\\0' e; ",
+        "printf '\\nSTDERR-TAIL\\n'; } >&2"
+    );
+    let req = tool_call_request("run_command", json!({ "command": command }));
+
+    let response = handle_tools_call_with_result_store(
+        &req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+
+    let inline = response
+        .result
+        .as_ref()
+        .expect("missing run_command result");
+    let inline_bytes = serde_json::to_vec(inline).expect("serialize inline result");
+    assert!(
+        inline_bytes.len() <= 64 * 1024,
+        "run_command response must fit the shared inline budget, got {} bytes",
+        inline_bytes.len()
+    );
+
+    let structured = inline
+        .get("structuredContent")
+        .expect("missing structuredContent");
+    let stdout = structured
+        .get("stdout")
+        .and_then(Value::as_str)
+        .expect("missing stdout preview");
+    let stderr = structured
+        .get("stderr")
+        .and_then(Value::as_str)
+        .expect("missing stderr preview");
+    assert!(stdout.starts_with("STDOUT-HEAD\n"), "stdout head missing");
+    assert!(stdout.ends_with("\nSTDOUT-TAIL\n"), "stdout tail missing");
+    assert!(stderr.starts_with("STDERR-HEAD\n"), "stderr head missing");
+    assert!(stderr.ends_with("\nSTDERR-TAIL\n"), "stderr tail missing");
+    assert_eq!(
+        structured.get("stdoutTruncated").and_then(Value::as_bool),
+        Some(false),
+        "response budgeting is not source-stream truncation"
+    );
+    assert_eq!(
+        structured.get("stderrTruncated").and_then(Value::as_bool),
+        Some(false),
+        "response budgeting is not source-stream truncation"
+    );
+
+    let budget = inline
+        .get("responseBudget")
+        .expect("missing responseBudget metadata");
+    let output_ref = budget
+        .get("outputRef")
+        .and_then(Value::as_str)
+        .expect("missing outputRef")
+        .to_string();
+    let omissions = budget
+        .pointer("/preview/omissions")
+        .and_then(Value::as_array)
+        .expect("missing omission details");
+    for path in ["/structuredContent/stdout", "/structuredContent/stderr"] {
+        let omission = omissions
+            .iter()
+            .find(|item| item.get("path").and_then(Value::as_str) == Some(path))
+            .unwrap_or_else(|| panic!("missing omission for {path}"));
+        let original = omission
+            .get("originalBytes")
+            .and_then(Value::as_u64)
+            .expect("missing originalBytes");
+        let preview = omission
+            .get("previewBytes")
+            .and_then(Value::as_u64)
+            .expect("missing previewBytes");
+        let omitted = omission
+            .get("omittedBytes")
+            .and_then(Value::as_u64)
+            .expect("missing omittedBytes");
+        assert!(omitted > 0, "{path} should omit bytes inline");
+        assert!(
+            omitted > original - preview,
+            "{path} omittedBytes must exclude the inserted preview marker"
+        );
+        let stream_preview = structured
+            .pointer(
+                path.strip_prefix("/structuredContent")
+                    .expect("structured path"),
+            )
+            .and_then(Value::as_str)
+            .expect("missing stream preview");
+        let count_start = stream_preview
+            .find("<omitted ")
+            .map(|index| index + "<omitted ".len())
+            .expect("missing omission marker");
+        let count_end = stream_preview[count_start..]
+            .find(" bytes;")
+            .map(|offset| count_start + offset)
+            .expect("missing omission byte suffix");
+        let marker_omitted = stream_preview[count_start..count_end]
+            .parse::<u64>()
+            .expect("invalid omission count");
+        assert_eq!(omitted, marker_omitted, "{path} omitted byte count");
+    }
+
+    let mut rebuilt = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let read_req = tool_call_request(
+            "read_result",
+            json!({
+                "result_id": output_ref,
+                "offset": offset,
+                "max_bytes": crate::result_store::DEFAULT_MAX_RANGE_BYTES
+            }),
+        );
+        let read_response = handle_tools_call_with_result_store(
+            &read_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+            ShowDetailMode::Disable,
+            &store,
+            Some("session-a"),
+            None,
+        )
+        .await;
+        let range = read_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing read_result structuredContent");
+        let encoded = range
+            .get("dataBase64")
+            .and_then(Value::as_str)
+            .expect("missing range bytes");
+        rebuilt.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .expect("decode range"),
+        );
+        offset = range
+            .get("nextOffset")
+            .and_then(Value::as_u64)
+            .expect("missing nextOffset");
+        if range.get("eof").and_then(Value::as_bool) == Some(true) {
+            break;
+        }
+    }
+
+    let full: Value = serde_json::from_slice(&rebuilt).expect("parse retained full result");
+    let full_structured = full
+        .get("structuredContent")
+        .expect("retained result missing structuredContent");
+    let full_stdout = full_structured
+        .get("stdout")
+        .and_then(Value::as_str)
+        .expect("retained stdout missing");
+    let full_stderr = full_structured
+        .get("stderr")
+        .and_then(Value::as_str)
+        .expect("retained stderr missing");
+    assert!(full_stdout.len() > 1_000_000);
+    assert!(full_stdout.starts_with("STDOUT-HEAD\n"));
+    assert!(full_stdout.ends_with("\nSTDOUT-TAIL\n"));
+    assert!(full_stderr.len() > 1_000_000);
+    assert!(full_stderr.starts_with("STDERR-HEAD\n"));
+    assert!(full_stderr.ends_with("\nSTDERR-TAIL\n"));
+    assert_eq!(
+        full_structured
+            .get("stdoutTruncated")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        full_structured
+            .get("stderrTruncated")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
 #[tokio::test]
 async fn command_tool_descriptors_keep_silent_waits_stream_safe() {
     let req = JsonRpcRequest {
