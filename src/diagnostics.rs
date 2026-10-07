@@ -476,27 +476,40 @@ mod tests {
     }
 
     /// A holder that releases inside the retry budget must be acquired — the
-    /// flake resistance this helper exists for. The holder thread owns the
-    /// lock file through a blocking rendezvous before the retry starts (so
-    /// the release provably happens while `try_lock_bounded` is running, not
-    /// before it), and the holding window spans the first retry delay so the
-    /// acquisition comes from the retry loop rather than a lucky first
-    /// attempt. No wall-clock assertion: correctness follows from the
-    /// rendezvous, not from timing.
+    /// flake resistance this helper exists for. The synchronization is fully
+    /// structural; no wall-clock assumption anywhere:
+    /// 1. the holder thread owns the lock file through a blocking rendezvous
+    ///    before the retry starts, so the first attempt provably runs against
+    ///    a held lock;
+    /// 2. the injectable wait callback fires only after a blocked attempt, so
+    ///    its single invocation proves the first attempt failed with
+    ///    `WouldBlock`;
+    /// 3. that invocation requests the release and returns only after the
+    ///    holder's zero-capacity ack, sent after the lock file was dropped —
+    ///    so the next attempt provably runs against a released lock, and with
+    ///    no other contender it must succeed there. Hence exactly one blocked
+    ///    attempt.
     #[test]
     fn held_log_lock_is_acquired_once_the_holder_releases() {
         let root =
             std::env::temp_dir().join(format!("catdesk-lock-retry-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let (handover, handover_rx) = mpsc::sync_channel::<File>(0);
-        let (released, released_rx) = mpsc::sync_channel::<()>(0);
+        let (release_request, release_request_rx) = mpsc::sync_channel::<()>(0);
+        let (released_ack, released_ack_rx) = mpsc::sync_channel::<()>(0);
         let holder = std::thread::spawn(move || {
             let held = handover_rx
                 .recv()
                 .expect("handover must deliver the lock file");
-            std::thread::sleep(Duration::from_millis(50));
+            // Release only on request: the lock stays held until the retry
+            // loop has provably observed its first blocked attempt.
+            release_request_rx
+                .recv()
+                .expect("the retry loop must request the release");
             drop(held);
-            released.send(()).expect("release ack must be received");
+            released_ack
+                .send(())
+                .expect("the retry loop must await the release ack");
         });
         let lock = private_file(&root.join("connections.lock")).unwrap();
         lock.try_lock()
@@ -505,16 +518,26 @@ mod tests {
         // thread has received — and therefore owns and still holds — the lock.
         handover.send(lock).unwrap();
 
-        let retry_lock = private_file(&root.join("connections.lock")).unwrap();
-        try_lock_bounded(
-            &retry_lock,
-            LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(LOCK_RETRY_DELAY_MS),
-        )
-        .expect("a lock released inside the retry budget must be acquired");
-        released_rx
-            .recv()
-            .expect("the holder must confirm the release");
+        let mut blocked_attempts = 0_u32;
+        {
+            let retry_lock = private_file(&root.join("connections.lock")).unwrap();
+            let acquired = try_lock_bounded_with(&retry_lock, LOCK_RETRY_ATTEMPTS, || {
+                blocked_attempts += 1;
+                release_request
+                    .send(())
+                    .expect("the holder must still be waiting for the release request");
+                // Returns only after the holder dropped the lock file.
+                released_ack_rx
+                    .recv()
+                    .expect("the holder must confirm the release");
+            });
+            acquired.expect("a lock released inside the retry budget must be acquired");
+        }
+        assert_eq!(
+            blocked_attempts, 1,
+            "exactly the first attempt may observe the held lock; the next one \
+             runs after the acknowledged release and must acquire"
+        );
         holder.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1908,12 +1931,25 @@ const LOCK_RETRY_DELAY_MS: u64 = 25;
 /// final `WouldBlock` through `io::Error::other` exactly as before, so the
 /// failure shape in logs and tests stays the same.
 fn try_lock_bounded(lock: &File, attempts: u32, retry_delay: Duration) -> Result<(), io::Error> {
+    try_lock_bounded_with(lock, attempts, || std::thread::sleep(retry_delay))
+}
+
+/// The retry loop behind `try_lock_bounded`, parameterized over the
+/// inter-attempt wait. Production passes the fixed sleep; tests pass a
+/// synchronizing callback instead, which makes the loop's ordering — blocked
+/// attempt, then wait, then attempt again — provable without any wall-clock
+/// assumption.
+fn try_lock_bounded_with(
+    lock: &File,
+    attempts: u32,
+    mut wait_between_attempts: impl FnMut(),
+) -> Result<(), io::Error> {
     for attempt in 0..attempts {
         match lock.try_lock() {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
             Err(std::fs::TryLockError::WouldBlock) if attempt + 1 < attempts => {
-                std::thread::sleep(retry_delay);
+                wait_between_attempts();
             }
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(io::Error::other(std::fs::TryLockError::WouldBlock));
