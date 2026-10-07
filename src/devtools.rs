@@ -155,10 +155,6 @@ impl DevtoolsBridge {
         Ok(bridge)
     }
 
-    fn from_child(child: Child) -> Result<Arc<Mutex<Self>>, String> {
-        Ok(Arc::new(Mutex::new(Self::from_child_inner(child, None)?)))
-    }
-
     fn from_child_inner(mut child: Child, launch: Option<LaunchSpec>) -> Result<Self, String> {
         let child_stdin = child.stdin.take().ok_or("No stdin")?;
         let child_stdout = child.stdout.take().ok_or("No stdout")?;
@@ -435,7 +431,9 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        DevtoolsBridge::from_child(child).unwrap()
+        Arc::new(Mutex::new(
+            DevtoolsBridge::from_child_inner(child, None).unwrap(),
+        ))
     }
 
     fn restartable_peer(script: &str) -> Arc<Mutex<DevtoolsBridge>> {
