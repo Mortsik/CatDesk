@@ -3211,6 +3211,103 @@ fn catdesk_instruction_keeps_richer_divergent_content() {
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
+#[test]
+fn oversized_agents_text_layer_is_delivered_as_bounded_head_preview() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-agents-text-cap-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let agents_path = workspace_root.join("AGENTS.md");
+    let mut oversized = String::from("HEAD-SENTINEL\n");
+    while oversized.len() < 100_000 {
+        oversized.push_str("mid-padding-rule\n");
+    }
+    oversized.push_str("MIDDLE-SENTINEL\n");
+    while oversized.len() < 200_000 {
+        oversized.push_str("tail-padding-rule\n");
+    }
+    oversized.push_str("\nTAIL-SENTINEL");
+    std::fs::write(&agents_path, &oversized).expect("write agents");
+
+    let preview = super::agents_state::cached_agents_text(&agents_path)
+        .expect("a non-empty oversized layer must still deliver a preview");
+
+    assert!(preview.contains("HEAD-SENTINEL"));
+    assert!(
+        !preview.contains("MIDDLE-SENTINEL"),
+        "bytes past the reader cap must never ride the instruction payload"
+    );
+    assert!(
+        !preview.contains("TAIL-SENTINEL"),
+        "the file tail is deliberately unread: no synthetic tail may appear"
+    );
+    assert!(
+        preview.contains("full text not retained"),
+        "the omission note must be self-contained: this surface has no outputRef: {preview:.200}"
+    );
+    assert!(
+        preview.len() <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "preview must stay on the shared inline-budget scale, got {} bytes",
+        preview.len()
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn small_agents_text_layer_is_kept_verbatim_without_a_truncation_note() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-agents-text-small-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let agents_path = workspace_root.join("AGENTS.md");
+    std::fs::write(&agents_path, "short-layer-rule\n").expect("write agents");
+
+    let text = super::agents_state::cached_agents_text(&agents_path)
+        .expect("non-empty layer must resolve");
+
+    assert_eq!(text, "short-layer-rule");
+    assert!(
+        !text.contains("full text not retained"),
+        "files within the cap must not gain a truncation note"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn oversized_agents_layer_never_rides_catdesk_instruction_inline() {
+    let workspace_root = std::env::temp_dir().join(format!(
+        "catdesk-mcp-agents-instruction-cap-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let mut oversized = String::from("HEAD-SENTINEL\n");
+    while oversized.len() < 300_000 {
+        oversized.push_str("padding-rule\n");
+    }
+    oversized.push_str("\nTAIL-SENTINEL");
+    std::fs::write(workspace_root.join("AGENTS.md"), &oversized)
+        .expect("write oversized agents layer");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+    let instruction =
+        catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
+            .expect("build instruction");
+
+    assert!(instruction.contains("HEAD-SENTINEL"));
+    assert!(
+        !instruction.contains("TAIL-SENTINEL"),
+        "an arbitrarily large AGENTS.md must not be inlined into the instruction"
+    );
+    assert!(instruction.contains("full text not retained"));
+    assert!(
+        instruction.len() < 128 * 1024,
+        "instruction must stay near the template plus one bounded layer, got {} bytes",
+        instruction.len()
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
 #[tokio::test]
 async fn edit_file_applies_atomic_batch_and_reports_changed_file() {
     let workspace_root =

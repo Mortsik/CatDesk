@@ -1504,6 +1504,7 @@ mod tests {
         save_archived_binagotchy_folder_from_roots,
     };
     use crate::binagotchy_gen;
+    use std::path::Path;
 
     #[test]
     fn widget_mascot_outline_is_non_empty_and_in_bounds() {
@@ -1649,6 +1650,89 @@ mod tests {
         assert!(saved_dir.join(super::ANIMATION_GIF_FILE_NAME).is_file());
 
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    fn write_test_card(archive_root: &Path, folder: &str, seed: u64, png_bytes: &[u8]) {
+        let card_dir = archive_root.join(folder);
+        std::fs::create_dir_all(&card_dir).expect("create card dir");
+        std::fs::write(
+            card_dir.join(super::METADATA_FILE_NAME),
+            format!(
+                "seed = \"{seed:016x}\"\ncreated_at = \"20260101T000000000Z\"\n\
+                 generator_version = \"0.1.0\"\nframe_ms = 50\nspirit = false\n\n\
+                 [traits]\nfur = \"black\"\neyes = \"green\"\nheadwear = \"none\"\nspecial = \"none\"\n"
+            ),
+        )
+        .expect("write metadata");
+        std::fs::write(card_dir.join(super::CHARACTER_PNG_FILE_NAME), png_bytes)
+            .expect("write character png");
+    }
+
+    #[test]
+    fn archived_card_feed_keeps_only_the_newest_cards() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let archive_root = std::env::temp_dir().join(format!("catdesk-binagotchy-cards-{unique}"));
+        for index in 0..12 {
+            write_test_card(
+                &archive_root,
+                &format!("card-{index:02}"),
+                index as u64,
+                b"png-bytes",
+            );
+        }
+
+        let cards = super::load_archived_binagotchy_cards_from(&archive_root).expect("load cards");
+
+        assert_eq!(cards.len(), super::MAX_ARCHIVED_CARDS);
+        assert!(
+            cards
+                .iter()
+                .all(|card| card.image.starts_with("data:image/png;base64,"))
+        );
+        // Folder names sort descending, so the newest folders win the cap.
+        let kept_folders = cards
+            .iter()
+            .map(|card| card.folder.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept_folders,
+            [
+                "card-11", "card-10", "card-09", "card-08", "card-07", "card-06", "card-05",
+                "card-04"
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&archive_root);
+    }
+
+    #[test]
+    fn archived_card_feed_skips_oversized_cards_instead_of_inlining_them() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let archive_root = std::env::temp_dir().join(format!("catdesk-binagotchy-big-{unique}"));
+        write_test_card(&archive_root, "card-02", 2, b"small-png");
+        write_test_card(
+            &archive_root,
+            "card-01",
+            1,
+            &vec![0_u8; (super::MAX_ARCHIVED_CARD_BYTES + 1) as usize],
+        );
+        write_test_card(&archive_root, "card-00", 0, b"small-png-2");
+
+        let cards = super::load_archived_binagotchy_cards_from(&archive_root).expect("load cards");
+
+        let folders = cards
+            .iter()
+            .map(|card| card.folder.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(folders, ["card-02", "card-00"]);
+
+        let _ = std::fs::remove_dir_all(&archive_root);
     }
 }
 
