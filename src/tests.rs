@@ -455,6 +455,155 @@ fn main_dashboard_renders_unknown_usage_bucket_without_panicking() {
 }
 
 #[test]
+fn tool_timeout_streak_counts_identical_504s_and_resets_on_other_outcomes() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let workspace = std::env::temp_dir().join(format!("catdesk-streak-unit-{unique}"));
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let config_path = workspace.join("config.toml");
+    let mut app =
+        AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+            .expect("create app");
+
+    let timeout = |reason| crate::state::ServerUiEvent::RecordToolCallOutcome {
+        tool: "run_command".to_string(),
+        gateway_timeout_reason: Some(reason),
+    };
+
+    // A single 504 is not yet a storm: the metric stays hidden.
+    app.apply_server_ui_event(timeout("deadline_timeout@execution"));
+    assert!(
+        app.worst_tool_timeout_streak().is_none(),
+        "one failure must not surface the streak"
+    );
+
+    // Repeats of the identical failure class grow the streak.
+    app.apply_server_ui_event(timeout("deadline_timeout@execution"));
+    app.apply_server_ui_event(timeout("deadline_timeout@execution"));
+    let streak = app
+        .worst_tool_timeout_streak()
+        .expect("identical 504s must surface the streak");
+    assert_eq!(streak.tool, "run_command");
+    assert_eq!(streak.reason, "deadline_timeout@execution");
+    assert_eq!(streak.count, 3);
+
+    // A different failure class restarts the streak at one.
+    app.apply_server_ui_event(timeout("deadline_timeout@queue"));
+    let streak = app
+        .tool_timeout_streaks
+        .get("run_command")
+        .expect("the new class keeps a tracked streak");
+    assert_eq!(streak.reason, "deadline_timeout@queue");
+    assert_eq!(streak.count, 1);
+    assert!(
+        app.worst_tool_timeout_streak().is_none(),
+        "a single failure of the new class must hide the metric again"
+    );
+
+    // Any non-timeout outcome clears the tool's streak.
+    app.apply_server_ui_event(timeout("deadline_timeout@execution"));
+    app.apply_server_ui_event(timeout("deadline_timeout@execution"));
+    app.apply_server_ui_event(crate::state::ServerUiEvent::RecordToolCallOutcome {
+        tool: "run_command".to_string(),
+        gateway_timeout_reason: None,
+    });
+    assert!(
+        app.worst_tool_timeout_streak().is_none(),
+        "a success must reset the streak"
+    );
+
+    // Streaks stay per tool: another tool failing never touches run_command.
+    app.apply_server_ui_event(crate::state::ServerUiEvent::RecordToolCallOutcome {
+        tool: "read".to_string(),
+        gateway_timeout_reason: Some("deadline_timeout@execution"),
+    });
+    assert!(
+        app.worst_tool_timeout_streak().is_none(),
+        "a single failure on a different tool must stay hidden"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn dashboard_req_session_line_warns_on_consecutive_504_storm() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let workspace = std::env::temp_dir().join(format!("catdesk-streak-storm-{unique}"));
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let config_path = workspace.join("config.toml");
+    let mut app =
+        AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+            .expect("create app");
+    app.request_count = 7;
+
+    // Simulated retry storm: four identical run_command 504s in a row.
+    for _ in 0..4 {
+        app.apply_server_ui_event(crate::state::ServerUiEvent::RecordToolCallOutcome {
+            tool: "run_command".to_string(),
+            gateway_timeout_reason: Some("deadline_timeout@execution"),
+        });
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
+    let draw = |terminal: &mut Terminal<TestBackend>, app: &AppState| {
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    app,
+                    0,
+                    Duration::from_secs(120),
+                    0,
+                    true,
+                    &mut None,
+                    None,
+                    None,
+                    &HashMap::new(),
+                )
+            })
+            .expect("draw dashboard");
+    };
+    draw(&mut terminal, &app);
+
+    let text = terminal_buffer_text(&terminal);
+    let req_session_line = text
+        .lines()
+        .find(|line| line.contains("REQ SESSION"))
+        .expect("REQ SESSION line");
+    assert!(
+        req_session_line.contains("504×4"),
+        "the storm count must surface on the REQ SESSION line: {req_session_line}"
+    );
+    assert!(
+        req_session_line.contains("run_command@deadline_timeout@execution"),
+        "the streak must name the tool and failure class: {req_session_line}"
+    );
+
+    // The warning disappears as soon as the tool answers within its deadline.
+    app.apply_server_ui_event(crate::state::ServerUiEvent::RecordToolCallOutcome {
+        tool: "run_command".to_string(),
+        gateway_timeout_reason: None,
+    });
+    draw(&mut terminal, &app);
+    let text = terminal_buffer_text(&terminal);
+    let req_session_line = text
+        .lines()
+        .find(|line| line.contains("REQ SESSION"))
+        .expect("REQ SESSION line after reset");
+    assert!(
+        !req_session_line.contains("504×"),
+        "a successful call must clear the warning: {req_session_line}"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
 fn main_dashboard_marks_partially_priced_usage_with_unpriced_tail() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
