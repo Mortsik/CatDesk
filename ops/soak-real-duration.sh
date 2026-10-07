@@ -78,8 +78,8 @@ ngrokAuthtoken = "soak-dummy-never-used"
 ngrokDomain = "soak.invalid"
 chatgptConnectorRevision = 999999
 theme = "concise"
-mode = "Computer"
-toolMode = "MultiTools"
+mode = "computer"
+toolMode = "multiTools"
 EOF
 
 echo "== starting CatDesk under a pty (port $PORT) =="
