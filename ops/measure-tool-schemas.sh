@@ -74,8 +74,10 @@ fi
 
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 2; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 2; }
-command -v npx >/dev/null || { echo "npx (Node.js) is required for the DevTools profile" >&2; exit 2; }
-command -v timeout >/dev/null || { echo "a POSIX timeout utility is required (coreutils)" >&2; exit 2; }
+if [[ " ${PROFILES[*]} " == *" DevTools "* ]]; then
+    command -v npx >/dev/null || { echo "npx (Node.js) is required for the DevTools profile" >&2; exit 2; }
+    command -v timeout >/dev/null || { echo "a POSIX timeout utility is required (coreutils)" >&2; exit 2; }
+fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/catdesk-measure.XXXXXX")"
 PTQ_LOG="$TMP/pty.log"
@@ -188,15 +190,19 @@ print(f"result envelope beyond the serialized tools array: {summary['result_enve
 PYEOF
 
 # Direct measurement of the browser toolset CatDesk forwards verbatim. The
-# handshake reproduces src/devtools.rs initialize_protocol() exactly (same
-# protocolVersion, clientInfo, id), and a second probe with a newer protocol
-# version must return a byte-identical catalog before the numbers count as
+# probe sends the same initialize parameters and the same protocol sequence
+# as CatDesk's bridge (src/devtools.rs: same protocolVersion, clientInfo,
+# notifications/initialized then tools/list). The bridge itself rewrites
+# request IDs to fresh UUIDs on the wire, so IDs are deliberately local to
+# this probe and not part of the equivalence claim. A second probe with a
+# newer protocol version — negotiated and verified, not just requested —
+# must return a byte-identical catalog before the numbers count as
 # representative.
 cat >"$TMP/devtools_measure.py" <<'PYEOF'
 import json, os, subprocess, sys
 
 # Mirror src/devtools.rs constants so the probe speaks the same handshake
-# CatDesk's bridge speaks.
+# parameters CatDesk's bridge sends.
 PROTOCOL_VERSIONS = ["2025-03-26", "2025-06-18"]
 CLIENT_INFO = {"name": "catdesk-bridge", "version": "4.0.0"}
 INIT_ID = "dt-init"
@@ -229,7 +235,7 @@ def read_response(proc, want_id):
             fail(f"chrome-devtools-mcp returned an error for id {want_id!r}: {message['error']}")
         if not isinstance(message.get("result"), dict):
             fail(f"chrome-devtools-mcp returned no result for id {want_id!r}")
-        return message["result"]
+        return message
 
 def measure(protocol_version):
     proc = subprocess.Popen(
@@ -248,7 +254,7 @@ def measure(protocol_version):
             },
         }) + "\n")
         proc.stdin.flush()
-        init = read_response(proc, INIT_ID)
+        init = read_response(proc, INIT_ID)["result"]
         server_info = init.get("serverInfo")
         if not isinstance(server_info, dict) \
                 or not isinstance(server_info.get("name"), str) \
@@ -256,6 +262,10 @@ def measure(protocol_version):
             fail(f"initialize (protocol {protocol_version}) returned no usable "
                  f"serverInfo (name/version strings): {server_info!r}")
         negotiated = init.get("protocolVersion")
+        if negotiated != protocol_version:
+            fail(f"initialize requested protocol {protocol_version} but the "
+                 f"server negotiated {negotiated!r}; the catalog cannot be "
+                 "attributed to the requested protocol era")
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
         proc.stdin.flush()
         proc.stdin.write(json.dumps({
@@ -263,7 +273,7 @@ def measure(protocol_version):
         }) + "\n")
         proc.stdin.flush()
         listing = read_response(proc, LIST_ID)
-        tools = listing.get("tools")
+        tools = listing.get("result", {}).get("tools")
         if not isinstance(tools, list) or not tools:
             fail(f"tools/list (protocol {protocol_version}) returned no non-empty tools array")
         return {
@@ -272,6 +282,7 @@ def measure(protocol_version):
             "resolved_version": server_info["version"],
             "server_name": server_info["name"],
             "tools": tools,
+            "raw_list_message": listing,
         }
     finally:
         proc.terminate()
@@ -280,9 +291,10 @@ primary = measure(PROTOCOL_VERSIONS[0])
 secondary = measure(PROTOCOL_VERSIONS[1])
 if compact(primary["tools"]) != compact(secondary["tools"]):
     fail("catalogs differ between protocol probes "
-         f"({PROTOCOL_VERSIONS[0]} vs {PROTOCOL_VERSIONS[1]}): the direct "
-         "measurement is not protocol-stable, so it cannot stand in for what "
-         "CatDesk forwards; record both raw catalogs and document the delta")
+         f"({PROTOCOL_VERSIONS[0]} vs {PROTOCOL_VERSIONS[1]}, both negotiated "
+         "as requested): the direct measurement is not protocol-stable, so it "
+         "cannot stand in for what CatDesk forwards; record both responses "
+         "and document the delta")
 
 tools = primary["tools"]
 rows = []
@@ -313,7 +325,9 @@ summary = {
     "total_tokens_chars_over_4": round(tool_objects_chars / 4.0, 1),
 }
 json.dump(summary, open(sys.argv[1], "w"), indent=2, ensure_ascii=False)
-json.dump(tools, open(sys.argv[2], "w"), indent=2, ensure_ascii=False)
+# The full tools/list JSON-RPC response as received (re-serialized from the
+# parsed message, every field preserved).
+json.dump(primary["raw_list_message"], open(sys.argv[2], "w"), indent=2, ensure_ascii=False)
 print(f"chrome-devtools-mcp resolved version: {primary['resolved_version']} "
       f"(negotiated protocol {primary['negotiated_protocol']}; "
       f"{PROTOCOL_VERSIONS[0]}/{PROTOCOL_VERSIONS[1]} catalogs byte-identical)")
