@@ -555,12 +555,10 @@ pub(crate) fn load_archived_binagotchy_cards_from(
                 .map(|value| value.to_string_lossy().to_string())?;
             let metadata_text = fs::read_to_string(entry.join(METADATA_FILE_NAME)).ok()?;
             let metadata: StoredMascotMetadata = toml::from_str(&metadata_text).ok()?;
-            let card_path = entry.join(CHARACTER_PNG_FILE_NAME);
-            let card_size = fs::metadata(&card_path).map(|meta| meta.len()).ok()?;
-            if card_size > MAX_ARCHIVED_CARD_BYTES {
-                return None;
-            }
-            let bytes = fs::read(&card_path).ok()?;
+            let bytes = read_bounded_card(
+                &entry.join(CHARACTER_PNG_FILE_NAME),
+                MAX_ARCHIVED_CARD_BYTES,
+            )?;
             Some(ArchivedBinagotchyCard {
                 folder,
                 seed: metadata.seed,
@@ -571,6 +569,19 @@ pub(crate) fn load_archived_binagotchy_cards_from(
             })
         })
         .collect())
+}
+
+/// Bounded card read: the file is opened exactly once and at most `limit`
+/// bytes (plus one sentinel byte) ever reach memory, with the skip decided
+/// from those bytes. A metadata-then-read pair would race a card swapped or
+/// grown between the two calls and let an arbitrary file ride the response
+/// as base64.
+fn read_bounded_card(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    let read_len = file.take(limit + 1).read_to_end(&mut bytes).ok()?;
+    (read_len as u64 <= limit).then_some(bytes)
 }
 
 pub(crate) fn save_archived_binagotchy_folder(folder: &str) -> std::io::Result<PathBuf> {
@@ -1733,6 +1744,39 @@ mod tests {
         assert_eq!(folders, ["card-02", "card-00"]);
 
         let _ = std::fs::remove_dir_all(&archive_root);
+    }
+
+    #[test]
+    fn card_reader_is_bounded_and_decides_from_what_it_reads() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let card_path = std::env::temp_dir().join(format!("catdesk-card-bounded-{unique}.png"));
+        let limit = 1024_u64;
+
+        // Exactly at the limit: accepted, byte for byte.
+        std::fs::write(&card_path, vec![7_u8; limit as usize]).expect("write at-limit card");
+        let accepted = super::read_bounded_card(&card_path, limit).expect("at-limit card");
+        assert_eq!(accepted.len(), limit as usize);
+
+        // One byte past the limit: rejected without reading further.
+        std::fs::write(&card_path, vec![7_u8; (limit + 1) as usize]).expect("write over card");
+        assert!(
+            super::read_bounded_card(&card_path, limit).is_none(),
+            "the sentinel byte past the limit must classify the card as oversized"
+        );
+
+        // A swap (the race the single-open reader defends against): every
+        // read decides from the file it actually opened, never from a stale
+        // metadata lookup taken beside another read.
+        std::fs::write(&card_path, vec![7_u8; (limit * 4) as usize]).expect("write swapped card");
+        assert!(
+            super::read_bounded_card(&card_path, limit).is_none(),
+            "a card grown past the cap after an earlier read must still be skipped"
+        );
+
+        let _ = std::fs::remove_file(&card_path);
     }
 }
 
