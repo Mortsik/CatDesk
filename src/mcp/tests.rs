@@ -3274,6 +3274,61 @@ fn small_agents_text_layer_is_kept_verbatim_without_a_truncation_note() {
 }
 
 #[test]
+fn invalid_utf8_agents_layer_cannot_expand_past_the_cap() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-agents-text-utf8-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let agents_path = workspace_root.join("AGENTS.md");
+    // One lone continuation byte per line: every byte decodes into a 3-byte
+    // U+FFFD, so the lossy result is ~3x the raw file size.
+    let invalid = vec![0x80_u8; super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES];
+    std::fs::write(&agents_path, &invalid).expect("write invalid utf8 agents");
+
+    let preview = super::agents_state::cached_agents_text(&agents_path)
+        .expect("a non-empty invalid-utf8 layer must still deliver a preview");
+
+    assert!(
+        preview.len() <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "the cap must hold on the FINAL UTF-8 text, got {} bytes from a {}-byte file",
+        preview.len(),
+        invalid.len()
+    );
+    assert!(
+        preview.contains("full text not retained"),
+        "a file whose decoded text exceeds the cap must carry the truncation note"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn invalid_utf8_within_the_cap_stays_lossy_without_a_note() {
+    let workspace_root = std::env::temp_dir().join(format!(
+        "catdesk-mcp-agents-text-utf8-small-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let agents_path = workspace_root.join("AGENTS.md");
+    let invalid = vec![0x80_u8; 1024];
+    std::fs::write(&agents_path, &invalid).expect("write small invalid utf8 agents");
+
+    let text = super::agents_state::cached_agents_text(&agents_path)
+        .expect("non-empty layer must resolve");
+
+    assert_eq!(text.len(), 3 * 1024, "lossy decode expands 1 KiB to 3 KiB");
+    assert!(
+        text.len() <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "sub-cap files stay within the cap"
+    );
+    assert!(
+        !text.contains("full text not retained"),
+        "a sub-cap file must not gain a truncation note merely for invalid UTF-8"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
 fn oversized_agents_layer_never_rides_catdesk_instruction_inline() {
     let workspace_root = std::env::temp_dir().join(format!(
         "catdesk-mcp-agents-instruction-cap-{}",
