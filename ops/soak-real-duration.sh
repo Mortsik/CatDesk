@@ -98,20 +98,26 @@ if pid == 0:
     os.execv(bin_path, [bin_path])
 print(pid, flush=True)
 mode_presses = 0
+last_quit_press = -1
 with open(pty_log, "wb") as log:
     end = time.time() + 3600
     while time.time() < end:
+        # 'q' is the ordinary quit path: clean shutdown drains diagnostics.
+        # Press it once per second while quit is requested — but never stop
+        # reading the pty: EOF is the only reliable signal that CatDesk has
+        # exited, and skipping the read used to leave the reaped child waiting
+        # and the exited marker unwritten for the whole run budget.
         if os.path.exists(quit_file):
-            # 'q' is the ordinary quit path: clean shutdown drains diagnostics.
-            try:
-                os.write(fd, b"q")
-            except OSError:
-                break
-            time.sleep(1)
-            continue
+            now = int(time.time())
+            if now != last_quit_press:
+                last_quit_press = now
+                try:
+                    os.write(fd, b"q")
+                except OSError:
+                    break
         # Press '1' (Computer mode) until the mode screen is satisfied; the
         # key is unbound in the main TUI loop, so extra presses are harmless.
-        if mode_presses < 40 and int(time.time() * 2) % 4 == 0:
+        elif mode_presses < 40 and int(time.time() * 2) % 4 == 0:
             try:
                 os.write(fd, b"1")
                 mode_presses += 1
@@ -316,6 +322,31 @@ call "tools/call" "poll_command" "{\"job_id\":\"$JOB_A\",\"after\":$CURSOR_A,\"w
 [[ "$STATUS" == 200 ]] || fail "15s poll returned $STATUS (expected 200)"
 echo "  poll returned without approaching the 45s control deadline (HTTP $STATUS)"
 assert_ok "poll15"
+
+# The phase-A sleep job outlives its assertions; the later phases only take
+# ~30-40 s, so at quit time the job would still be running and the shutdown's
+# job drain blows the quit-exit budget. Cancel it now and poll to a terminal
+# state so quitting never races the drain.
+call "tools/call" "cancel_command" "{\"job_id\":\"$JOB_A\"}" 30
+[[ "$STATUS" == 200 ]] || fail "phase-A job cancel returned $STATUS"
+for _ in $(seq 1 30); do
+    call "tools/call" "poll_command" "{\"job_id\":\"$JOB_A\",\"after\":$CURSOR_A,\"wait_ms\":0}" 10
+    [[ "$STATUS" == 200 ]] || fail "phase-A drain poll returned $STATUS"
+    STATE_A="$(state_of)"
+    case "$STATE_A" in
+        succeeded | failed | cancelled | timed_out | abandoned | interrupted) break ;;
+    esac
+    sleep 1
+done
+case "$STATE_A" in
+    succeeded | failed | cancelled | timed_out | abandoned | interrupted)
+        echo "  phase-A job drained before quit (state=$STATE_A)"
+        ;;
+    *)
+        body_json >&2
+        fail "phase-A job never reached a terminal state (state=$STATE_A)"
+        ;;
+esac
 
 # ── phase B: concurrency burst (24 parallel calls) ──
 echo "== phase: 24 concurrent tool calls =="
