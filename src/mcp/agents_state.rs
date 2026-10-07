@@ -209,8 +209,13 @@ pub(crate) fn agents_widget_state_payload(workspace_root: &str) -> std::io::Resu
 /// deliberately not read, so no budget head+tail preview (or stored
 /// remainder) applies here.
 const AGENTS_TEXT_PREVIEW_BYTES: usize = crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES;
-/// Reserved room for the truncation note so the preview stays within the cap.
-const AGENTS_TEXT_NOTE_ROOM: usize = 96;
+/// Reserved room for the truncation note so the preview stays within the cap
+/// for the largest possible file size. The note's skeleton is a fixed 80
+/// bytes; "at X" never exceeds 5 digits (X < the 64 KiB cap) and "of N"
+/// never exceeds 20 digits (u64::MAX), so the note tops out at 105 bytes and
+/// 112 leaves slack. A size-dependent note length must never be allowed to
+/// push the assembled preview past the cap.
+const AGENTS_TEXT_NOTE_ROOM: usize = 112;
 
 fn read_agents_text_result(path: &Path) -> std::io::Result<Option<String>> {
     use std::io::Read;

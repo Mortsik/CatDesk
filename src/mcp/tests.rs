@@ -3329,6 +3329,48 @@ fn invalid_utf8_within_the_cap_stays_lossy_without_a_note() {
 }
 
 #[test]
+fn oversized_agents_preview_stays_within_the_cap_for_huge_file_sizes() {
+    let workspace_root = std::env::temp_dir().join(format!(
+        "catdesk-mcp-agents-text-huge-size-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let agents_path = workspace_root.join("AGENTS.md");
+    let mut content = String::from("HEAD-SENTINEL\n");
+    while content.len() < 70 * 1024 {
+        content.push_str("rule\n");
+    }
+    std::fs::write(&agents_path, &content).expect("write oversized agents");
+    // A sparse extension reports a ~100 GB metadata length: the note's size
+    // digits grow with the reported size, so the reserved note room must
+    // already account for the largest possible note.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&agents_path)
+        .expect("open agents for sparse extension");
+    file.set_len(100_000_000_000)
+        .expect("extend file to 100 GB");
+    drop(file);
+
+    let preview = super::agents_state::cached_agents_text(&agents_path)
+        .expect("a non-empty oversized layer must still deliver a preview");
+
+    assert!(
+        preview.len() <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "the cap must hold even with a 12-digit size in the note, got {} bytes",
+        preview.len()
+    );
+    assert!(preview.contains("HEAD-SENTINEL"));
+    assert!(preview.contains("full text not retained"));
+    assert!(
+        preview.contains("100000000000"),
+        "the note must name the real size bound it saw: {preview:.200}"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
 fn oversized_agents_layer_never_rides_catdesk_instruction_inline() {
     let workspace_root = std::env::temp_dir().join(format!(
         "catdesk-mcp-agents-instruction-cap-{}",
