@@ -13,10 +13,12 @@ duplicating host-side deferred discovery?
   `tools/list`, validates the response (a JSON-RPC error, a missing result, or
   an empty `result.tools` fails the run instead of reporting an empty
   catalog), and reports per-tool sizes plus a per-field breakdown. With
-  `--out`, every profile leaves its raw `tools/list` capture (the DevTools
-  catalog included) next to the summaries for later auditing. Command:
-  `ops/measure-tool-schemas.sh --out /tmp/catdesk-ojt8-r3`
-  (binary/tag: main @ 96af79f, worktree catdesk-ojt-8).
+  `--out`, every profile leaves its `tools/list` response next to the
+  summaries for later auditing: native profiles store the raw HTTP response,
+  the DevTools profile stores the full `tools/list` JSON-RPC message as
+  received (every field preserved, re-serialized). Command:
+  `ops/measure-tool-schemas.sh --out /tmp/catdesk-ojt8-r5`
+  (binary/tag: post-rebase main @ ca01902, worktree catdesk-ojt-8).
 - Sizes are UTF-8 **bytes**; char counts are reported alongside because token
   figures use the compact-JSON chars/4 heuristic (a GPT-family tokenizer lands
   within roughly ±10–15% of it). An earlier revision of this document reported
@@ -27,15 +29,19 @@ duplicating host-side deferred discovery?
   array adds bracket and comma bytes and is quoted separately wherever it
   matters (14 tools add 15 bytes, 30 tools add 31).
 - The browser toolset CatDesk forwards verbatim is measured by the same
-  script over stdio JSON-RPC. The probe reproduces CatDesk's bridge handshake
-  from `src/devtools.rs` exactly (protocolVersion `2025-03-26`, clientInfo
-  `catdesk-bridge/4.0.0`), validates the `initialize` response (id-scoped,
-  error-free, string `serverInfo.name`/`version`; the negotiated protocol is
-  recorded — `2025-03-26`, echoed back), and then issues a second probe with
-  protocolVersion `2025-06-18` whose catalog must be byte-identical to the
-  first, so the direct measurement can stand in for what CatDesk forwards.
-  Resolved package version on 2026-10-07: 1.10.1. That set is
-  version-floating.
+  script over stdio JSON-RPC. The probe sends the same `initialize`
+  parameters and the same protocol sequence as CatDesk's bridge
+  (`src/devtools.rs`: protocolVersion `2025-03-26`, clientInfo
+  `catdesk-bridge/4.0.0`, then `notifications/initialized` + `tools/list`);
+  request IDs are local to the probe, since the bridge rewrites them to
+  fresh UUIDs on the wire, so ID equality is not part of the claim. The
+  `initialize` response is validated (id-scoped, error-free, string
+  `serverInfo.name`/`version`) and the negotiated protocol must equal the
+  requested one (echoed back: `2025-03-26`). A second probe requests
+  protocolVersion `2025-06-18`, must itself negotiate `2025-06-18`, and its
+  catalog must be byte-identical to the first, so the direct measurement can
+  stand in for what CatDesk forwards. Resolved package version on
+  2026-10-07: 1.10.1. That set is version-floating.
 - Driving CatDesk's full Both path (native + browser tools in one
   `tools/list`) headlessly requires a detected browser and a multi-step TUI
   wizard; in this environment the app did not reach a healthy server on that
@@ -52,8 +58,8 @@ duplicating host-side deferred discovery?
 
 ### Native tools, default tool mode (`toolMode = "multiTools"`), widget detail on
 
-14 tools, **25,373 bytes ≈ 6,343 tokens** of tool objects per `tools/list`
-(the serialized `tools` array is 25,388 bytes; the `result` envelope beyond
+14 tools, **25,415 bytes ≈ 6,354 tokens** of tool objects per `tools/list`
+(the serialized `tools` array is 25,430 bytes; the `result` envelope beyond
 that array: 151 bytes).
 
 | tool | bytes | ~tokens | desc | in | out | anno | meta |
@@ -65,16 +71,16 @@ that array: 151 bytes).
 | poll_command | 2,311 | 578 | 573 | 451 | 807 | 68 | 296 |
 | edit | 2,265 | 566 | 271 | 1,162 | 380 | 67 | 280 |
 | start_command | 2,183 | 546 | 374 | 519 | 808 | 66 | 298 |
-| search_result | 1,769 | 442 | 216 | 471 | 894 | 67 | 0 |
+| search_result | 1,811 | 453 | 216 | 513 | 894 | 67 | 0 |
 | cancel_command | 1,533 | 383 | 92 | 145 | 809 | 67 | 300 |
 | read_image | 1,389 | 347 | 104 | 830 | 0 | 67 | 292 |
 | read_result | 1,344 | 336 | 174 | 351 | 634 | 67 | 0 |
 | write | 960 | 240 | 42 | 201 | 261 | 67 | 282 |
 | catdesk_instruction | 887 | 222 | 136 | 33 | 208 | 67 | 310 |
 | delete | 870 | 218 | 40 | 155 | 215 | 67 | 284 |
-| **TOTAL** | **25,373** | **6,343** | 2,974 | 7,156 | 9,206 | 937 | 3,500 |
+| **TOTAL** | **25,415** | **6,354** | 2,974 | 7,198 | 9,206 | 937 | 3,500 |
 
-Field shares: outputSchema 36.3%, inputSchema 28.2%, widget `_meta` 13.8%
+Field shares: outputSchema 36.2%, inputSchema 28.3%, widget `_meta` 13.8%
 (twelve tools carry ≈292 B of `openai/outputTemplate`/`ui.resourceUri` each;
 `read_result`/`search_result` carry none), descriptions 11.7%, annotations
 3.7%. `read_image` intentionally has no outputSchema so ChatGPT keeps exposing
@@ -82,8 +88,8 @@ native image content (comment at src/mcp/tool_catalog.rs:25).
 
 ### Read-only tool mode (`toolMode = "readOnly"`)
 
-7 tools, **12,606 bytes ≈ 3,152 tokens** of tool objects (serialized array:
-12,614 bytes; envelope: 151 bytes) (read, search, create_handoff,
+7 tools, **12,648 bytes ≈ 3,162 tokens** of tool objects (serialized array:
+12,656 bytes; envelope: 151 bytes) (read, search, create_handoff,
 search_result, read_image, read_result, catdesk_instruction). The command-job
 trio and the write/delete trio are absent by construction
 (`ToolMode::read_only`, src/state.rs:683).
@@ -104,7 +110,7 @@ catalog" in the issue: 14 native + 28 DevTools).
 
 ### Combined default session (default config: `Mode::Both` + `MultiTools`)
 
-**44 tools, 51,730 bytes ≈ 12,932 tokens** as tool objects (**51,776 bytes**
+**44 tools, 51,772 bytes ≈ 12,943 tokens** as tool objects (**51,818 bytes**
 serialized as arrays) — a **computed sum** of the two measured profiles
 (MultiTools + DevTools), not a single `tools/list` capture (see Method). The
 DevTools passthrough is roughly half (51%) of the footprint and is owned
@@ -156,7 +162,7 @@ baked into tool descriptions.
   the Responses-API MCP page does not cover ChatGPT web connectors) states
   whether the full cached schemas are injected into model context in every
   conversation where the connector is active, or a reduced representation.
-  The measured 51,730 bytes ≈ 12,932 tokens is therefore a serialized
+  The measured 51,772 bytes ≈ 12,943 tokens is therefore a serialized
   registry/schema footprint and an upper bound on per-conversation schema
   cost, not a measured context injection. ChatGPT consumes `outputSchema` for
   structured projection regardless (in-repo evidence: the `read_image`
@@ -171,7 +177,7 @@ baked into tool descriptions.
   disabled). A spec-compliant 2026-07-28 client probes with a modern request
   and reads the modern error bodies (spec "Backward Compatibility");
   initialize-era clients fall through to the disabled GET stream and fail.
-- Host-side deferred loading already exists and is mature on this harness: the
+- Host-side deferred loading is documented by the vendor for this harness: the
   Anthropic Tool Search Tool defers tool definitions out of the context window
   (`defer_loading` per tool; for MCP, `default_config`/`configs` on the
   `mcp_toolset` entry), with reported reductions of ~46–85% of schema tokens
@@ -214,10 +220,13 @@ first revision of this document:
     CatDesk tools" step was not exercised; the MCP-layer results above are
     from the server-side logs. Sourced-but-not-end-to-end-verified for the
     deferral behavior itself.
-- Net effect for the deferral question: a Codex user who enables the
-  experimental flag gets CatDesk's schemas deferred host-side (tool search);
-  with default flags they get no CatDesk tools at all, not eager ones. Either
-  way CatDesk-side deferral has nothing to add.
+- Net effect for the deferral question: with the experimental flag enabled,
+  the vendor's documented behavior is that CatDesk's schemas would be deferred
+  host-side (tool search) — the deferred discovery of the CatDesk catalog
+  itself was not exercised end-to-end (the test runs failed at the OpenAI API
+  layer before the model responded); with default flags the measured outcome
+  is no CatDesk tools at all, not eager ones. Either way CatDesk-side
+  deferral has nothing to add on the evidence gathered.
 
 ## What is already deferred by CatDesk (no host help needed)
 
@@ -241,15 +250,18 @@ first revision of this document:
    descriptor (src/mcp/widget.rs:118): −3,500 B ≈ −875 tokens of the native
    footprint, an existing user setting.
 
-Nothing on the schema side is deferred by CatDesk itself, and no delivery
-mechanism for server-driven deferral is known on the harnesses that can
-connect: ChatGPT's mid-conversation behavior is UNVERIFIED with no documented
-update channel, while Claude and Codex defer host-side (see below).
+Nothing on the schema side is deferred by CatDesk itself. Delivery mechanisms
+for server-driven deferral are known on none of the three harnesses: ChatGPT's
+mid-conversation behavior is UNVERIFIED with no documented update channel;
+Claude's and Codex's host-side deferral is documented by their vendors but
+was not exercised end-to-end against CatDesk (see below for what exactly was
+measured).
 
-Host-side deferred loading already covers the harnesses that can speak to
-CatDesk:
+Host-side deferred loading, as documented by each vendor, would cover the
+harnesses that could speak to CatDesk:
 
-- **Claude** harnesses: Anthropic's Tool Search Tool defers tool definitions
+- **Claude** harnesses (documentation only — Claude connectivity to CatDesk is
+  UNVERIFIED): Anthropic's Tool Search Tool defers tool definitions
   out of the context window (`defer_loading` per tool; for MCP,
   `default_config`/`configs` on the `mcp_toolset` entry), with reported
   reductions of ~46–85% of schema tokens (platform.claude.com tool-search-tool
@@ -257,9 +269,10 @@ CatDesk:
   at ≥10 tools or >10k schema tokens — the combined CatDesk catalog (44 tools,
   ~12.9k tokens) sits just past it; the native-only catalog (14 tools, ~6.3k)
   does not.
-- **Codex CLI**: tool search is always enabled and "MCP tools are always
-  deferred when tool_search is available" (first-party feature definitions,
-  retrieved 2026-10-07; see the Codex section above for the live test).
+- **Codex CLI** (feature flags and connection measured; deferred discovery
+  itself not exercised — see the Codex section): tool search is always
+  enabled per first-party feature definitions ("MCP tools are always deferred
+  when tool_search is available", retrieved 2026-10-07).
 
 ## Recommendation: keep exposure as-is for now; no deferred-exposure follow-up today
 
@@ -274,20 +287,24 @@ stated with its evidence base per harness:
   documented anywhere this evaluation could reach. The schema bytes are also
   already near-minimal for what the model must decide: 36% of the native
   footprint is outputSchema that ChatGPT projects results through.
-- **Claude**: host-native Tool Search already provides deferral, and
-  CatDesk-side deferral would duplicate host discovery — precisely what the
-  epic's design excludes ("prefer host-native deferred loading when already
-  present"). Claude Code additionally ignores mid-session list-changed
-  notifications (open issues #62058, #77314), so a dynamic scheme would not be
-  honored.
-- **Codex**: with default flags there are no CatDesk tools to defer
-  (modern-only server, measured); with the experimental 2026-07-28 flag the
-  client defers MCP tools host-side by default. Building CatDesk-side
+- **Claude** (documentation only): host-native Tool Search is documented to
+  provide deferral, and CatDesk-side deferral would duplicate host discovery —
+  precisely what the epic's design excludes ("prefer host-native deferred
+  loading when already present"). Claude Code additionally reportedly ignores
+  mid-session list-changed notifications (open issues #62058, #77314), so a
+  dynamic scheme would not be honored there.
+- **Codex** (connection measured at the MCP layer; deferral documented, not
+  exercised end-to-end): with default flags there are no CatDesk tools to
+  defer (modern-only server, measured); with the experimental 2026-07-28 flag
+  the connection succeeds and the vendor's own documentation says MCP tools
+  are deferred host-side when tool search is available. Building CatDesk-side
   deferral would again duplicate the host.
 
-So the recommendation rests on: two harnesses already deferring host-side
-(measured), and one harness for which no delivery mechanism is known
-(documented flow, behavior UNVERIFIED). Re-open this evaluation if any of
+So the recommendation rests on: one harness with no known delivery mechanism
+(ChatGPT; flow documented, mid-conversation behavior UNVERIFIED) and two
+harnesses whose vendors document host-side deferral (Claude documentation
+only; Codex connection measured to CatDesk at the MCP layer, deferred
+discovery not exercised end-to-end). Re-open this evaluation if any of
 the following lands: ChatGPT documenting or demonstrably honoring mid-session
 tool-list updates (`subscriptions/listen`), a CatDesk-connected harness
 without host-side deferral, or the native catalog growing past the point
@@ -302,9 +319,15 @@ Measured ceiling of the alternatives, for the record:
 | trim outputSchema descriptions/fields | bounded by 9,206 B ≈ −2,302 tok | high risk: ChatGPT projects structuredContent through outputSchema; spec makes conforming output a MUST when the schema is declared |
 | merge start/poll/cancel into one `command_job` tool | ≈ −2 descriptors ≈ −3.8k B ≈ −960 tok | harms tool-selection ergonomics, breaks the widget attach list and annotations mapping, triggers the connector re-add dance |
 
-Every schema-byte change on the ChatGPT harness costs a user-visible
-remove-and-re-add connector round trip (revision gate), which dwarfs a
-2–14% token saving. Not worth it at the current catalog size.
+The refresh cost on the ChatGPT harness is per-case, not uniform: the
+in-repo guidance (comment at `CURRENT_CHATGPT_CONNECTOR_REVISION`,
+src/state.rs:83) is to bump the revision — and thereby force the
+remove-and-re-add modal — only for releases whose visible behavior actually
+changes; smaller text-only edits ride the settings refresh, which README and
+community reports describe as less reliable. Any of the descriptor edits
+above would be a visible schema change, so the honest planning assumption
+for them is the re-add round trip, which dwarfs a 2–14% token saving. Not
+worth it at the current catalog size.
 
 ### Follow-up candidates worth recording (not implemented here)
 
