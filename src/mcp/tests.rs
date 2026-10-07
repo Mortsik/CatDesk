@@ -6761,4 +6761,152 @@ print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'content':[{'type':'t
     assert!(body.len() > super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES);
 
     let _ = std::fs::remove_dir_all(workspace_root);
+
+// ── Tool payload audit inventory (catdesk-ojt.5) ────────────────────────────
+//
+// Single source of truth pairing every locally exposed tool with its audited
+// bounding class. The companion document is
+// docs/findings/2026-10-07-tool-payload-audit.md; these tests keep the
+// catalog, this list, and that document in lockstep so a new tool cannot ship
+// without a payload audit.
+
+/// (tool, bounding class) for every tool the local catalog can expose. Must
+/// match the local tool inventory table in the audit document exactly.
+const TOOL_PAYLOAD_AUDIT: &[(&str, &str)] = &[
+    ("run_command", "shared-budget+pre-cap"),
+    ("start_command", "shared-budget+pre-cap"),
+    ("poll_command", "shared-budget+pre-cap"),
+    ("cancel_command", "shared-budget+pre-cap"),
+    ("catdesk_instruction", "inherent-static"),
+    ("read", "shared-budget+pre-cap"),
+    ("read_image", "multimodal-exempt"),
+    ("search", "shared-budget+pre-cap"),
+    ("read_result", "store-range"),
+    ("search_result", "store-range"),
+    ("write", "inherent-static"),
+    ("edit", "inherent-static"),
+    ("create_handoff", "shared-budget+pre-cap"),
+    ("delete", "inherent-static"),
+];
+
+/// The bounding classes the audit recognizes. A mechanism string outside this
+/// list means the inventory entry was hand-waved, not audited.
+const AUDITED_BOUNDING_CLASSES: &[&str] = &[
+    "shared-budget",
+    "shared-budget+pre-cap",
+    "store-range",
+    "inherent-static",
+    "multimodal-exempt",
+    "devtools-passthrough",
+];
+
+/// Names the catalog exposes for one (mode, tool_mode) pair with the DevTools
+/// bridge absent, so the local set is fully deterministic.
+async fn audit_tools_list_names(mode: Mode, tool_mode: ToolMode) -> Vec<String> {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!("req-tool-payload-audit")),
+        method: "tools/list".into(),
+        params: json!({}),
+    };
+    handle_tools_list(&req, mode, tool_mode, &None)
+        .await
+        .result
+        .as_ref()
+        .and_then(|result| result.get("tools"))
+        .and_then(Value::as_array)
+        .expect("missing tools")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn tool_payload_audit_covers_every_exposed_tool() {
+    let mut exposed_union = std::collections::BTreeSet::new();
+    for (mode, tool_mode) in [
+        (Mode::Both, ToolMode::MultiTools),
+        (Mode::Both, ToolMode::ReadOnly),
+        (Mode::Computer, ToolMode::MultiTools),
+        (Mode::Computer, ToolMode::ReadOnly),
+        (Mode::Browser, ToolMode::MultiTools),
+        (Mode::Browser, ToolMode::ReadOnly),
+    ] {
+        for name in audit_tools_list_names(mode, tool_mode).await {
+            assert!(
+                TOOL_PAYLOAD_AUDIT
+                    .iter()
+                    .any(|(audited, _)| audited == &name),
+                "tool `{name}` is exposed by tools/list in {}/{} but is not covered \
+                 by the payload audit inventory; audit its payload surfaces, then add \
+                 it to TOOL_PAYLOAD_AUDIT and to the table in \
+                 docs/findings/2026-10-07-tool-payload-audit.md",
+                mode.label(),
+                tool_mode.label(),
+            );
+            exposed_union.insert(name);
+        }
+    }
+
+    let audited: std::collections::BTreeSet<String> = TOOL_PAYLOAD_AUDIT
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    let stale: Vec<String> = audited.difference(&exposed_union).cloned().collect();
+    assert!(
+        stale.is_empty(),
+        "payload audit inventory lists tools that the catalog never exposes: {stale:?}"
+    );
+}
+
+#[test]
+fn tool_payload_audit_mechanisms_use_audited_classes() {
+    for (tool, mechanism) in TOOL_PAYLOAD_AUDIT {
+        assert!(
+            AUDITED_BOUNDING_CLASSES.contains(mechanism),
+            "tool `{tool}` claims bounding class `{mechanism}`, which is not one of \
+             the audited classes {AUDITED_BOUNDING_CLASSES:?}"
+        );
+    }
+}
+
+#[test]
+fn tool_payload_audit_document_lists_every_audited_tool() {
+    let document = include_str!("../../docs/findings/2026-10-07-tool-payload-audit.md");
+
+    for (tool, _) in TOOL_PAYLOAD_AUDIT {
+        let row = format!("| `{tool}` |");
+        assert_eq!(
+            document.matches(&row).count(),
+            1,
+            "audit document must list `{tool}` exactly once in the local tool table"
+        );
+    }
+
+    let mut listed = std::collections::BTreeSet::new();
+    for line in document.lines().filter(|line| line.starts_with("| `")) {
+        let name = line
+            .strip_prefix("| `")
+            .and_then(|rest| rest.split('`').next())
+            .unwrap_or_default();
+        assert!(
+            !name.is_empty(),
+            "audit document has an unparseable table row: {line}"
+        );
+        listed.insert(name.to_string());
+    }
+    // The bounding-class table documents `devtools-passthrough` even though no
+    // statically enumerable local tool uses it; every other backticked row is
+    // a bounding class or an audited tool name.
+    let expected: std::collections::BTreeSet<String> = AUDITED_BOUNDING_CLASSES
+        .iter()
+        .chain(TOOL_PAYLOAD_AUDIT.iter().map(|(name, _)| name))
+        .map(|name| name.to_string())
+        .collect();
+
+    assert_eq!(
+        listed, expected,
+        "audit document rows and audited inventory drifted out of sync"
+    );
 }
