@@ -17,6 +17,7 @@ mod file_tools;
 mod instruction;
 mod jsonrpc;
 mod resources;
+mod response_budget;
 mod result_tools;
 mod token_usage;
 mod tool_catalog;
@@ -489,12 +490,27 @@ async fn handle_tools_call_with_result_store(
         }
     }
 
-    if let Some(result) = response.result.as_mut() {
-        if widget_payload_meta_mut(result).is_some() {
-            let turn_token_usage = estimate_turn_token_usage(req, &tool_name, result);
-            attach_turn_token_usage(result, &turn_token_usage);
-            attach_tool_call_count(result, 1);
-        }
+    if !matches!(tool_name.as_str(), "read_result" | "search_result")
+        && let Some(result) = response.result.as_mut()
+    {
+        // Store first and replace only after a successful lossless write. If the
+        // store is unavailable or rejects the payload, the original response is
+        // left untouched rather than silently losing capability.
+        let _ = response_budget::apply_response_budget(
+            result,
+            is_error,
+            result_store,
+            session_namespace,
+            Path::new(workspace_root),
+        );
+    }
+
+    if let Some(result) = response.result.as_mut()
+        && widget_payload_meta_mut(result).is_some()
+    {
+        let turn_token_usage = estimate_turn_token_usage(req, &tool_name, result);
+        attach_turn_token_usage(result, &turn_token_usage);
+        attach_tool_call_count(result, 1);
     }
 
     response

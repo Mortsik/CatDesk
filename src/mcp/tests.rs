@@ -5757,6 +5757,78 @@ fn result_retrieval_hides_foreign_refs_and_reports_bounded_errors() {
 }
 
 #[tokio::test]
+async fn shared_tools_call_boundary_externalizes_oversized_result_losslessly() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-budget-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let full_text = format!("HEAD\n{}\nTAIL", "ż中🙂".repeat(30_000));
+    std::fs::write(workspace_root.join("big.txt"), &full_text).expect("write file");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = LargeResultStore::new_default().expect("create result store");
+    let req = tool_call_request("read", json!({ "paths": ["big.txt"] }));
+
+    let response = handle_tools_call_with_result_store(
+        &req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+
+    let inline = response.result.as_ref().expect("missing result");
+    assert!(
+        serde_json::to_vec(inline).unwrap().len()
+            <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES
+    );
+    let output_ref = inline
+        .pointer("/responseBudget/outputRef")
+        .and_then(Value::as_str)
+        .expect("missing outputRef");
+    assert_eq!(
+        inline
+            .pointer("/responseBudget/retrieval/tool")
+            .and_then(Value::as_str),
+        Some("read_result")
+    );
+
+    let mut rebuilt = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let range = store
+            .read_range(
+                Some("session-a"),
+                &workspace_root,
+                output_ref,
+                offset,
+                store.max_range_bytes(),
+            )
+            .expect("read stored result");
+        rebuilt.extend_from_slice(&range.bytes);
+        offset = range.next_offset;
+        if range.eof {
+            break;
+        }
+    }
+    let original_result: Value = serde_json::from_slice(&rebuilt).expect("stored result json");
+    assert_eq!(
+        original_result
+            .pointer("/structuredContent/files/0/text")
+            .and_then(Value::as_str),
+        Some(full_text.as_str())
+    );
+
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
+#[tokio::test]
 async fn result_retrieval_reconstructs_multi_megabyte_payload_through_bounded_mcp_calls() {
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-result-rebuild-{}", Uuid::new_v4()));
