@@ -2827,6 +2827,46 @@ mod tests {
     }
 
     #[test]
+    fn turn_token_usage_fallback_stays_bounded_for_oversize_exempt_result() {
+        // Audit F6: exempt tools (read_result/search_result) carry no widget
+        // meta, so every one of their responses takes this fallback — which
+        // used to o200k-tokenize the full payload. A long unbroken pre-token
+        // (newline-free base64) makes BPE quadratic: measured at 90+ seconds
+        // for a single max-range read before the bytes/4 limit. The bound is
+        // an order-of-magnitude assertion on purpose, jitter-tolerant.
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "read_result",
+                "arguments": { "result_id": "probe", "offset": 0 }
+            }),
+        };
+        let result = json!({
+            "content": [],
+            "structuredContent": {
+                "dataBase64": "x".repeat(180_000)
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let usage = turn_token_usage_for_response(&req, Some(&result));
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed.as_secs_f64() < 2.0,
+            "oversize exempt result must not block on full-payload tokenization, \
+             took {elapsed:?}"
+        );
+        let (input_tokens, output_tokens) = usage.expect("missing usage");
+        assert!(input_tokens > 0);
+        // The heuristic estimate: serialized bytes / 4 (order of magnitude,
+        // not exact billing).
+        assert!(output_tokens >= 45_000, "got {output_tokens}");
+    }
+
+    #[test]
     fn attach_history_usage_updates_widget_payload_meta() {
         let mut result = Some(json!({
             "structuredContent": {

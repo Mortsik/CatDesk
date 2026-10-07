@@ -1462,6 +1462,109 @@ async fn run_command_success_keeps_content_empty() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn read_result_max_range_token_estimate_stays_bounded() {
+    // Audit F6: read_result is exempt from the response budget, so the turn
+    // usage estimate used to o200k-tokenize the FULL range. A max-range read
+    // (128 KiB -> ~175 KB of newline-free base64, effectively one giant BPE
+    // pre-token) blocked tools/call for tens of seconds per request.
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-read-timing-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = LargeResultStore::new_default().expect("create result store");
+    // Over a mebibyte of 'x' so run_command's budget must externalize it.
+    let command = concat!(
+        "printf 'HEAD\\n'; ",
+        "head -c 1048576 /dev/zero | tr '\\0' x; ",
+        "printf '\\nTAIL\\n'"
+    );
+    let run_req = tool_call_request("run_command", json!({ "command": command }));
+    let run_response = handle_tools_call_with_result_store(
+        &run_req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+    let output_ref = run_response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("responseBudget"))
+        .and_then(|budget| budget.get("outputRef"))
+        .and_then(Value::as_str)
+        .expect("externalized outputRef")
+        .to_string();
+
+    // The regression probe: a full max-range read of exempt bytes.
+    let read_req = tool_call_request(
+        "read_result",
+        json!({
+            "result_id": output_ref,
+            "offset": 0,
+            "max_bytes": crate::result_store::DEFAULT_MAX_RANGE_BYTES
+        }),
+    );
+    let started = std::time::Instant::now();
+    let read_response = handle_tools_call_with_result_store(
+        &read_req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    // Order-of-magnitude bound, jitter-tolerant by design: the regression
+    // this guards against measured in tens of seconds, a healthy run stays
+    // far below one second. Assert seconds, never exact milliseconds.
+    assert!(
+        elapsed.as_secs_f64() < 2.0,
+        "max-range read_result must not block tools/call on full-payload \
+         tokenization, took {elapsed:?}"
+    );
+
+    // Sanity: the probe measured the real full-range path.
+    let range_bytes = read_response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("structuredContent"))
+        .and_then(|structured| structured.get("dataBase64"))
+        .and_then(Value::as_str)
+        .and_then(|encoded| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .map(|bytes| bytes.len())
+        .expect("decoded range bytes");
+    assert_eq!(
+        range_bytes,
+        crate::result_store::DEFAULT_MAX_RANGE_BYTES,
+        "the probe must read the full max range"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn run_command_large_stdout_and_stderr_are_compact_inline_and_fully_retrievable() {
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-run-large-{}", Uuid::new_v4()));
