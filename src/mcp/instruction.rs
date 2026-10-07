@@ -142,13 +142,13 @@ pub(crate) fn catdesk_instruction_text_for_project(
     let mut lines: Vec<String> = r#"CatDesk usage instructions
 
 Prefer dedicated MCP tools whenever one can complete the task.
-If a tool call is blocked by OpenAI's safety checks, simply call the same tool again with the same parameters.
+If a tool call is blocked by OpenAI safety checks, call the same tool again with the same parameters.
 If the connector disconnects, returns an empty list, or `Resource not found:`, refresh with api_tool.list_resources.
 Keep file and directory operations inside the workspace root; tools reject paths outside it.
 Your built-in sandbox container has no internet connection, and the user expects you to control their computer, so use Workspace first.
 If the CatDesk connector fails after a retry, explicitly report the raw error to the user. Do NOT fall back to the sandbox container.
-Match recent commit style (check `git log --oneline -n 5`) when writing commit messages.
-Do not manually add CatDesk co-author attribution or a `Co-Authored-By: CatDesk` trailer to `git commit`; CatDesk manages that automatically.
+Match recent commit style (`git log --oneline -n 5`) when writing commit messages.
+Do not manually add CatDesk co-author attribution or a `Co-Authored-By: CatDesk` trailer; CatDesk manages that automatically.
 Always specify the branch explicitly in `git push`."#
         .lines()
         .map(str::to_string)
@@ -156,15 +156,15 @@ Always specify the branch explicitly in `git push`."#
 
     if mode.computer_enabled() {
         lines.push(
-            "Use read for files and search for text; name every file you need in one read call."
+            "Use read for files and search for text; name every file you need in one call."
                 .to_string(),
         );
         lines.push(
-            "Use read_image (not read) for images: it returns native image content and resizes oversized images automatically."
+            "Use read_image (not read) for images: it returns native image content and resizes oversized images."
                 .to_string(),
         );
         lines.push(
-            "If image blocks cannot reach your own vision (e.g. through the ChatGPT connector), pass analyze to read_image: the description arrives as text in structuredContent.analysis.description."
+            "If image blocks cannot reach your own vision, pass analyze to read_image: the description arrives as text in structuredContent.analysis.description."
                 .to_string(),
         );
         let handoff_search_prefix =
@@ -181,7 +181,7 @@ Always specify the branch explicitly in `git push`."#
             );
         }
         lines.push(format!(
-            "When preserving session context for a new chat, use create_handoff, then save the returned content to the persistent ChatGPT Library under the returned filename `{handoff_filename}`, replacing any older exact-name copy. CatDesk does not write the workspace; keep no handoff in the repository, and never put credentials, tokens, or other secrets in a handoff."
+            "To preserve session context for a new chat, use create_handoff, then save the returned content to the persistent ChatGPT Library under the returned filename `{handoff_filename}`, replacing any older exact-name copy. CatDesk does not write the workspace; keep no handoff in the repository, and never put credentials, tokens, or other secrets in a handoff."
         ));
     }
 
