@@ -475,6 +475,69 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A held `connections.lock` must be retried: a writer that releases the
+    /// lock within the retry budget is acquired instead of failing, which is
+    /// the flake resistance this helper exists for.
+    #[test]
+    fn held_log_lock_is_acquired_once_the_holder_releases() {
+        let root =
+            std::env::temp_dir().join(format!("catdesk-lock-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let lock = private_file(&root.join("connections.lock")).unwrap();
+        lock.try_lock()
+            .expect("the first holder must take the lock");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(lock);
+        });
+
+        let started = Instant::now();
+        let retry_lock = private_file(&root.join("connections.lock")).unwrap();
+        try_lock_bounded(
+            &retry_lock,
+            LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(LOCK_RETRY_DELAY_MS),
+        )
+        .expect("a released lock must be acquired within the retry budget");
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "the acquisition must have waited for the holder, not raced it"
+        );
+        releaser.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A holder that outlasts the retry budget still fails the open, keeping
+    /// the `WouldBlock` failure shape (and `Diagnostics::start`'s concurrent
+    /// slot fallback) exactly as before the retry existed.
+    #[test]
+    fn held_log_lock_still_fails_after_the_retry_budget() {
+        let root =
+            std::env::temp_dir().join(format!("catdesk-lock-budget-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let lock = private_file(&root.join("connections.lock")).unwrap();
+        lock.try_lock().expect("the holder must take the lock");
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            drop(lock);
+        });
+
+        let started = Instant::now();
+        let retry_lock = private_file(&root.join("connections.lock")).unwrap();
+        let error = try_lock_bounded(&retry_lock, 2, Duration::from_millis(10))
+            .expect_err("an outlasted budget must fail");
+        assert!(
+            started.elapsed() >= Duration::from_millis(10),
+            "the retry delay must have run before giving up"
+        );
+        assert!(
+            format!("{error:?}").contains("WouldBlock"),
+            "the exhausted budget must keep the WouldBlock failure shape: {error:?}"
+        );
+        holder.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn real_http_requests_keep_status_and_correlation_without_payloads() {
         use crate::{command_jobs::CommandJobManager, state::AppState};
@@ -1818,6 +1881,37 @@ struct LogWriter {
     _lock: File,
 }
 
+/// How long `LogWriter::open` keeps re-attempting a held `connections.lock`.
+/// `WouldBlock` is the lock's normal "held by another writer" answer, and a
+/// holder often releases within milliseconds (a draining overlapping process,
+/// a racing writer reopen), so a bounded wait absorbs that contention instead
+/// of failing on the first try. After the budget the error surfaces unchanged
+/// and `Diagnostics::start` keeps its designed fallback to the `concurrent/`
+/// slot, so long-lived holders (another live process) behave exactly as
+/// before.
+const LOCK_RETRY_ATTEMPTS: u32 = 5;
+const LOCK_RETRY_DELAY_MS: u64 = 25;
+
+/// Try to take the log's advisory lock, briefly re-attempting while it is
+/// still held. Other errors surface immediately; an exhausted budget maps the
+/// final `WouldBlock` through `io::Error::other` exactly as before, so the
+/// failure shape in logs and tests stays the same.
+fn try_lock_bounded(lock: &File, attempts: u32, retry_delay: Duration) -> Result<(), io::Error> {
+    for attempt in 0..attempts {
+        match lock.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) if attempt + 1 < attempts => {
+                std::thread::sleep(retry_delay);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::other(std::fs::TryLockError::WouldBlock));
+            }
+        }
+    }
+    unreachable!("the final attempt returns inside the loop")
+}
+
 fn private_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     // Windows File::try_lock requires read or write access, not append-only.
@@ -1879,7 +1973,11 @@ impl LogWriter {
     fn open(root: &Path, limit: u64) -> io::Result<Self> {
         std::fs::create_dir_all(root)?;
         let lock = private_file(&root.join("connections.lock"))?;
-        lock.try_lock().map_err(io::Error::other)?;
+        try_lock_bounded(
+            &lock,
+            LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(LOCK_RETRY_DELAY_MS),
+        )?;
         let file = private_file(&root.join("connections.jsonl"))?;
         let bytes = file.metadata()?.len();
         Ok(Self {
