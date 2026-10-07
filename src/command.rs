@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 use tree_sitter_bash::LANGUAGE as BASH_LANGUAGE;
 
-const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+// The MCP response budget externalizes oversized payloads after capture. Keep
+// foreground capture aligned with the store ceiling so >1 MiB output is not lost
+// before it can be retained, while stdout/stderrTruncated remain the safety signal.
+const MAX_BUFFER_BYTES: usize = crate::result_store::DEFAULT_MAX_ENTRY_BYTES as usize;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 pub const CATDESK_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: CatDesk";
@@ -1126,6 +1129,62 @@ mod tests {
 
         assert!(result.success, "stderr: {}", result.stderr);
         assert_eq!(result.stdout.trim(), leaf);
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_preserves_both_ends_of_stdout_larger_than_one_mibibyte() {
+        let workspace_root = test_workspace("run-large-stdout");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let command = "printf 'HEAD-MARKER\\n'; head -c 1100000 /dev/zero | tr '\\0' x; printf '\\nTAIL-MARKER\\n'";
+
+        let result = run_command(command, &workspace_root, &workspace_root, 10_000).await;
+
+        assert!(result.success, "stderr: {}", result.stderr);
+        assert!(
+            result.stdout.starts_with("HEAD-MARKER\n"),
+            "missing beginning of stdout"
+        );
+        assert!(
+            result.stdout.ends_with("\nTAIL-MARKER\n"),
+            "missing end of stdout; bytes={}, truncated={}",
+            result.stdout.len(),
+            result.stdout_truncated
+        );
+        assert!(
+            !result.stdout_truncated,
+            "lossless run_command capture must not discard stdout before response budgeting"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_preserves_both_ends_of_stderr_larger_than_one_mibibyte() {
+        let workspace_root = test_workspace("run-large-stderr");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let command = "{ printf 'ERR-HEAD-MARKER\\n'; head -c 1100000 /dev/zero | tr '\\0' e; printf '\\nERR-TAIL-MARKER\\n'; } >&2";
+
+        let result = run_command(command, &workspace_root, &workspace_root, 10_000).await;
+
+        assert!(result.success, "stderr capture command failed");
+        assert!(
+            result.stderr.starts_with("ERR-HEAD-MARKER\n"),
+            "missing beginning of stderr"
+        );
+        assert!(
+            result.stderr.ends_with("\nERR-TAIL-MARKER\n"),
+            "missing end of stderr; bytes={}, truncated={}",
+            result.stderr.len(),
+            result.stderr_truncated
+        );
+        assert!(
+            !result.stderr_truncated,
+            "lossless run_command capture must not discard stderr before response budgeting"
+        );
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
