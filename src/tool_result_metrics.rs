@@ -59,6 +59,7 @@ pub(crate) struct ToolResultMeasurement {
 
 impl ToolResultMeasurement {
     /// An untouched result whose serialized size is known; raw equals inline.
+    #[cfg(test)]
     pub(crate) fn inline_only(inline_bytes: u64, is_error: bool) -> Self {
         Self {
             raw_bytes: inline_bytes,
@@ -134,6 +135,9 @@ pub(crate) fn observe(tool: Option<&str>, measurement: ToolResultMeasurement) {
 }
 
 /// Copy of the cumulative registry; rows pair with `perf_metrics::tool_name`.
+/// The production aggregate surface is the diagnostics event; this copy is
+/// the read API for tests asserting before/after deltas.
+#[cfg(test)]
 pub(crate) fn snapshot() -> [ToolResultTotals; TOOL_COUNT] {
     registry().tools
 }
