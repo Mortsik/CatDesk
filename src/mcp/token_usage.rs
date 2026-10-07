@@ -2,6 +2,18 @@ use serde_json::{Value, json};
 use tiktoken_rs::o200k_base_singleton;
 
 use crate::mcp::jsonrpc::{JsonRpcRequest, tool_arguments, tool_name_from_request};
+use crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES;
+
+/// Serialized payloads up to this size are tokenized exactly; anything larger
+/// falls back to a cheap bytes/4 estimate. Budgeted results are cut to the
+/// inline budget itself, so every bounded payload keeps its exact o200k
+/// estimate — only tools exempt from the budget gate (read_result /
+/// search_result) can exceed the limit, and their full payloads must not
+/// block the tools/call worker: one long unbroken pre-token (e.g. newline-free
+/// base64) makes BPE quadratic, measured at 90+ seconds for a single
+/// max-range read. o200k averages ~4 bytes/token on prose and code, so the
+/// fallback stays in the right order of magnitude for usage accounting.
+const EXACT_TOKENIZATION_LIMIT_BYTES: usize = 2 * DEFAULT_INLINE_RESPONSE_BYTES;
 
 #[derive(Clone, Default)]
 pub(crate) struct TokenUsage {
@@ -37,7 +49,13 @@ pub(crate) fn estimate_tokens_o200k(text: &str) -> u64 {
 
 pub(crate) fn estimate_value_tokens_o200k(value: &Value) -> u64 {
     match serde_json::to_string(value) {
-        Ok(serialized) => estimate_tokens_o200k(&serialized),
+        Ok(serialized) => {
+            if serialized.len() > EXACT_TOKENIZATION_LIMIT_BYTES {
+                serialized.len() as u64 / 4
+            } else {
+                estimate_tokens_o200k(&serialized)
+            }
+        }
         Err(_) => 0,
     }
 }
@@ -76,4 +94,40 @@ pub(crate) fn sanitize_result_for_turn_token_count(result: &Value) -> Value {
         }
     }
     sanitized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversize_payload_estimate_uses_bytes_per_four() {
+        // Above the exact-tokenization limit the estimate is the cheap
+        // bytes/4 heuristic over the whole serialized payload — no BPE pass,
+        // so a max-range exempt result can never block tools/call on one
+        // giant quadratic pre-token.
+        let oversize = json!({ "dataBase64": "x".repeat(EXACT_TOKENIZATION_LIMIT_BYTES + 1) });
+        let serialized = serde_json::to_string(&oversize).expect("serialize");
+        assert!(serialized.len() > EXACT_TOKENIZATION_LIMIT_BYTES);
+        assert_eq!(
+            estimate_value_tokens_o200k(&oversize),
+            serialized.len() as u64 / 4
+        );
+    }
+
+    #[test]
+    fn bounded_payload_estimate_stays_exact_o200k() {
+        // Small (and every budget-cut) result keeps the exact o200k count;
+        // the heuristic only engages beyond twice the inline budget.
+        let bounded = json!({
+            "content": [],
+            "structuredContent": { "toolName": "read", "text": "hello tokens" }
+        });
+        let serialized = serde_json::to_string(&bounded).expect("serialize");
+        assert!(serialized.len() <= EXACT_TOKENIZATION_LIMIT_BYTES);
+        assert_eq!(
+            estimate_value_tokens_o200k(&bounded),
+            estimate_tokens_o200k(&serialized)
+        );
+    }
 }
