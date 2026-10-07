@@ -3869,6 +3869,14 @@ mod tests {
     #[tokio::test]
     async fn three_named_sessions_keep_independent_projects_across_command_read_and_search_signals()
     {
+        // `rg` is resolved through the process-global `PATH` at spawn time,
+        // while the linux_sandbox tests rewrite `PATH` to their stubs while
+        // they run; interleaving leaves the spawn with ENOENT ("ripgrep
+        // disappeared"). This test holds the env lock so it never runs
+        // alongside an env rewrite. #[tokio::test] is current-thread, so
+        // holding a std MutexGuard across awaits cannot deadlock (same idiom
+        // as mcp/tests.rs).
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = unique_temp_path("catdesk-three-session-project-workspace");
         let config_root = unique_temp_path("catdesk-three-session-project-config");
         let config_path = config_root.join("config.toml");
