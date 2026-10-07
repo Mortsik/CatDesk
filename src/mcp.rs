@@ -61,7 +61,7 @@ pub(crate) use agents_state::agents_widget_state_payload;
 use agents_state::cached_app_config;
 
 pub(crate) use token_usage::estimate_turn_token_counts;
-use token_usage::estimate_turn_token_usage;
+use token_usage::{estimate_turn_token_usage, exempt_from_response_budget};
 
 #[cfg(test)]
 use jsonrpc::tool_error_response_with_structured;
@@ -492,7 +492,7 @@ async fn handle_tools_call_with_result_store(
     }
 
     let mut budget_outcome: Option<response_budget::BudgetOutcome> = None;
-    if !matches!(tool_name.as_str(), "read_result" | "search_result")
+    if !exempt_from_response_budget(&tool_name)
         && let Some(result) = response.result.as_mut()
     {
         // Store first and replace only after a successful lossless write. If the

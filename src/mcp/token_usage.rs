@@ -5,15 +5,21 @@ use crate::mcp::jsonrpc::{JsonRpcRequest, tool_arguments, tool_name_from_request
 use crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES;
 
 /// Serialized payloads up to this size are tokenized exactly; anything larger
-/// falls back to a cheap bytes/4 estimate. Budgeted results are cut to the
-/// inline budget itself, so every bounded payload keeps its exact o200k
-/// estimate — only tools exempt from the budget gate (read_result /
-/// search_result) can exceed the limit, and their full payloads must not
-/// block the tools/call worker: one long unbroken pre-token (e.g. newline-free
-/// base64) makes BPE quadratic, measured at 90+ seconds for a single
-/// max-range read. o200k averages ~4 bytes/token on prose and code, so the
-/// fallback stays in the right order of magnitude for usage accounting.
+/// falls back to the cheap bytes/4 estimate. This is a defense-in-depth size
+/// cap only: BPE encode cost depends on the payload's pre-token shape, not
+/// its size, so size alone is never a safety guarantee (see
+/// [`exempt_from_response_budget`] for the shape that must never be encoded).
 const EXACT_TOKENIZATION_LIMIT_BYTES: usize = 2 * DEFAULT_INLINE_RESPONSE_BYTES;
+
+/// Results these tools return are exempt from the response budget gate
+/// (src/mcp.rs keeps them uncut), so whatever size the caller asked for
+/// reaches the estimator in full. Their ranges are newline-free base64, and
+/// an unbroken homogeneous run (e.g. zero padding encoding to `AAAA…`) makes
+/// the BPE encode quadratic AT ANY SIZE: measured at 36 s for a legal 109 KiB
+/// serialized range that sits well under the size cap, and 93 s at 180 KiB.
+pub(crate) fn exempt_from_response_budget(tool_name: &str) -> bool {
+    matches!(tool_name, "read_result" | "search_result")
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct TokenUsage {
@@ -51,13 +57,20 @@ pub(crate) fn estimate_value_tokens_o200k(value: &Value) -> u64 {
     match serde_json::to_string(value) {
         Ok(serialized) => {
             if serialized.len() > EXACT_TOKENIZATION_LIMIT_BYTES {
-                serialized.len() as u64 / 4
+                estimate_bytewise(&serialized)
             } else {
                 estimate_tokens_o200k(&serialized)
             }
         }
         Err(_) => 0,
     }
+}
+
+/// Serialized-bytes/4 estimate: o200k averages ~4 bytes per token on prose
+/// and code, which keeps usage accounting in the right order of magnitude
+/// wherever the exact encode would be unbounded or pathological.
+fn estimate_bytewise(serialized: &str) -> u64 {
+    serialized.len() as u64 / 4
 }
 
 pub(crate) fn estimate_turn_token_usage(
@@ -68,7 +81,17 @@ pub(crate) fn estimate_turn_token_usage(
     let tool_input_payload = build_turn_token_payload(req, tool_name);
     let tool_input_tokens = estimate_value_tokens_o200k(&tool_input_payload);
     let tool_output_payload = sanitize_result_for_turn_token_count(result);
-    let tool_output_tokens = estimate_value_tokens_o200k(&tool_output_payload);
+    // Path decision, not size: exempt retrieval results are estimated purely
+    // bytewise at ANY size — their full uncut payload reaches this estimator,
+    // and a pathological pre-token shape costs tens of seconds regardless of
+    // whether the payload fits under the size cap.
+    let tool_output_tokens = if exempt_from_response_budget(tool_name) {
+        serde_json::to_string(&tool_output_payload)
+            .map(|serialized| estimate_bytewise(&serialized))
+            .unwrap_or(0)
+    } else {
+        estimate_value_tokens_o200k(&tool_output_payload)
+    };
     TokenUsage::from_counts(tool_input_tokens, tool_output_tokens)
 }
 
@@ -113,6 +136,37 @@ mod tests {
             estimate_value_tokens_o200k(&oversize),
             serialized.len() as u64 / 4
         );
+    }
+
+    #[test]
+    fn exempt_retrieval_results_estimate_bytewise_at_any_size() {
+        // Path decision: an exempt tool's result goes bytewise even BELOW the
+        // size cap — a homogeneous zero-padding range measured 36 s under the
+        // cap — while the same payload for a budgeted tool stays exact.
+        let small_result = json!({
+            "structuredContent": { "dataBase64": "QUJDREVG" }
+        });
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "read_result",
+                "arguments": { "result_id": "probe", "offset": 0 }
+            }),
+        };
+        let exempt_usage = estimate_turn_token_usage(&req, "read_result", &small_result);
+        let bytewise = serde_json::to_string(&sanitize_result_for_turn_token_count(&small_result))
+            .expect("serialize")
+            .len() as u64
+            / 4;
+        assert_eq!(exempt_usage.tool_output_tokens, bytewise);
+
+        let budgeted_usage = estimate_turn_token_usage(&req, "read", &small_result);
+        let exact =
+            estimate_value_tokens_o200k(&sanitize_result_for_turn_token_count(&small_result));
+        assert_eq!(budgeted_usage.tool_output_tokens, exact);
+        assert_ne!(bytewise, exact, "the two paths must be observably distinct");
     }
 
     #[test]
