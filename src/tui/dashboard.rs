@@ -227,39 +227,18 @@ pub(crate) fn draw_ui(
             ),
             Span::styled(active_job_count.to_string(), value_style),
         ]),
-        Line::from({
-            // Retry-storm warning: a per-tool streak of consecutive identical
-            // 504s, shown only once the same failure class repeats (>1).
-            let mut spans = vec![
-                status_label(ui_language.text("REQ SESSION", "工作階段請求")),
-                Span::styled(app.request_count.to_string(), value_style),
-                Span::styled(
-                    format!("  {} ", ui_language.text("last call", "最後呼叫")),
-                    muted_style,
-                ),
-                Span::styled(
-                    format_last_tool_call_elapsed(app.last_tool_call_ms, now_millis),
-                    value_style,
-                ),
-            ];
-            if let Some(streak) = app.worst_tool_timeout_streak() {
-                spans.push(Span::raw("      "));
-                spans.push(Span::styled(
-                    format!("504×{} ", streak.count),
-                    Style::default()
-                        .fg(palette.danger_fg)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                spans.push(Span::styled(
-                    streak.tool.clone(),
-                    Style::default()
-                        .fg(palette.warning_fg)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                spans.push(Span::styled(format!("@{}", streak.reason), muted_style));
-            }
-            spans
-        }),
+        Line::from(vec![
+            status_label(ui_language.text("REQ SESSION", "工作階段請求")),
+            Span::styled(app.request_count.to_string(), value_style),
+            Span::styled(
+                format!("  {} ", ui_language.text("last call", "最後呼叫")),
+                muted_style,
+            ),
+            Span::styled(
+                format_last_tool_call_elapsed(app.last_tool_call_ms, now_millis),
+                value_style,
+            ),
+        ]),
         Line::from(vec![
             status_label(ui_language.text("REQ TOTAL", "累計請求")),
             Span::styled(app.total_request_count.to_string(), value_style),
@@ -392,6 +371,35 @@ pub(crate) fn draw_ui(
             Span::styled(tool_mode_label, value_style),
         ]),
     ];
+
+    // Retry-storm warning on its own line, shown only once the same failure
+    // class repeats (>1). It must be a separate line, not appended to REQ
+    // SESSION: at the narrowest mascot layout (120 columns) the status
+    // content is ~66 cells and an inlined `504×N tool@class` (81+) loses its
+    // class suffix — @execution vs @queue must stay distinguishable. Like
+    // the flow row below, it claims vertical space only while a storm is
+    // live, so idle dashboards are unchanged.
+    if let Some(streak) = app.worst_tool_timeout_streak() {
+        status_lines.insert(
+            2,
+            Line::from(vec![
+                status_label(ui_language.text("504 STREAK", "504 連續")),
+                Span::styled(
+                    format!("504×{} ", streak.count),
+                    Style::default()
+                        .fg(palette.danger_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    streak.tool.clone(),
+                    Style::default()
+                        .fg(palette.warning_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("@{}", streak.reason), muted_style),
+            ]),
+        );
+    }
 
     let visible_flow_slots = if show_flow_panel {
         status_content_height.saturating_sub(status_lines.len() + 1) / flow_block_lines.max(1)

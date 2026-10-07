@@ -528,7 +528,62 @@ fn tool_timeout_streak_counts_identical_504s_and_resets_on_other_outcomes() {
 }
 
 #[test]
-fn dashboard_req_session_line_warns_on_consecutive_504_storm() {
+fn dashboard_504_streak_stays_fully_visible_at_120_columns() {
+    // Sol rework: at the narrowest mascot layout (120 columns), the status
+    // content is only ~66 cells wide, so an inlined streak warning on the REQ
+    // SESSION line lost its class suffix — users could not tell @execution
+    // from @queue. The full `504xN tool@class` must survive the render.
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let workspace = std::env::temp_dir().join(format!("catdesk-streak-120-{unique}"));
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let config_path = workspace.join("config.toml");
+    let mut app =
+        AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+            .expect("create app");
+    for _ in 0..4 {
+        app.apply_server_ui_event(crate::state::ServerUiEvent::RecordToolCallOutcome {
+            tool: "run_command".to_string(),
+            gateway_timeout_reason: Some("deadline_timeout@execution"),
+        });
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("create terminal");
+    terminal
+        .draw(|frame| {
+            draw_ui(
+                frame,
+                &app,
+                0,
+                Duration::from_secs(120),
+                0,
+                true,
+                &mut None,
+                None,
+                None,
+                &HashMap::new(),
+            )
+        })
+        .expect("draw 120-column dashboard");
+
+    let text = terminal_buffer_text(&terminal);
+    assert!(
+        text.contains("504×4"),
+        "the storm count must be visible at 120 columns: {text}"
+    );
+    assert!(
+        text.contains("run_command@deadline_timeout@execution"),
+        "the full failure class must survive the 120-column mascot layout, \
+         not be clipped mid-class: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn dashboard_warns_on_consecutive_504_storm_with_dedicated_line() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -571,17 +626,17 @@ fn dashboard_req_session_line_warns_on_consecutive_504_storm() {
     draw(&mut terminal, &app);
 
     let text = terminal_buffer_text(&terminal);
-    let req_session_line = text
+    let streak_line = text
         .lines()
-        .find(|line| line.contains("REQ SESSION"))
-        .expect("REQ SESSION line");
+        .find(|line| line.contains("504 STREAK"))
+        .expect("dedicated 504 STREAK line");
     assert!(
-        req_session_line.contains("504×4"),
-        "the storm count must surface on the REQ SESSION line: {req_session_line}"
+        streak_line.contains("504×4"),
+        "the storm count must surface on its own line: {streak_line}"
     );
     assert!(
-        req_session_line.contains("run_command@deadline_timeout@execution"),
-        "the streak must name the tool and failure class: {req_session_line}"
+        streak_line.contains("run_command@deadline_timeout@execution"),
+        "the streak must name the tool and failure class: {streak_line}"
     );
 
     // The warning disappears as soon as the tool answers within its deadline.
@@ -591,13 +646,9 @@ fn dashboard_req_session_line_warns_on_consecutive_504_storm() {
     });
     draw(&mut terminal, &app);
     let text = terminal_buffer_text(&terminal);
-    let req_session_line = text
-        .lines()
-        .find(|line| line.contains("REQ SESSION"))
-        .expect("REQ SESSION line after reset");
     assert!(
-        !req_session_line.contains("504×"),
-        "a successful call must clear the warning: {req_session_line}"
+        !text.contains("504×"),
+        "a successful call must clear the warning: {text}"
     );
 
     let _ = std::fs::remove_dir_all(workspace);
