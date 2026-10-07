@@ -864,6 +864,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_sandboxed_process_survives_blocking_pool_thread_retirement() {
+        let _env = crate::test_serialization::lock_env();
         let root = workspace("sandbox-parent-lifetime");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -915,6 +916,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_shell_command_captures_output_and_exit_status() {
+        let _env = crate::test_serialization::lock_env();
         let root = workspace("success");
         let command = if cfg!(windows) {
             "Write-Output 'hello'"
@@ -931,6 +933,7 @@ mod tests {
 
     #[tokio::test]
     async fn large_stdout_and_stderr_are_drained_without_deadlock_and_bounded() {
+        let _env = crate::test_serialization::lock_env();
         let root = workspace("bounded-output");
         let command = if cfg!(windows) {
             "[Console]::Out.Write(('x' * 200000)); [Console]::Error.Write(('y' * 200000))"
@@ -953,6 +956,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn signalled_command_reports_signal_in_stderr() {
+        let _env = crate::test_serialization::lock_env();
         let root = workspace("signal-diagnostic");
         let result = run_shell_command("kill -KILL $$", &root, &root, 5_000, 1024).await;
         assert!(!result.success);
@@ -967,6 +971,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_command_cannot_continue_after_return() {
+        let _env = crate::test_serialization::lock_env();
         let root = workspace("timeout");
         let sentinel = root.join("sentinel.txt");
         let command = if cfg!(windows) {
@@ -987,6 +992,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_terminates_descendant_process_tree() {
+        let _env = crate::test_serialization::lock_env();
         let root = workspace("descendant-timeout");
         let sentinel = root.join("descendant.txt");
         let command = if cfg!(windows) {
@@ -1006,6 +1012,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_root_exit_cannot_leave_detached_descendant_alive() {
+        let _env = crate::test_serialization::lock_env();
         let root = workspace("detached-success");
         let sentinel = root.join("detached.txt");
         let command = if cfg!(windows) {
@@ -1026,6 +1033,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_run_future_terminates_the_process() {
+        let _env = crate::test_serialization::lock_env();
         let root = workspace("drop");
         let sentinel = root.join("sentinel.txt");
         let command = if cfg!(windows) {

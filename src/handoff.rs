@@ -421,6 +421,7 @@ mod tests {
 
     #[test]
     fn create_handoff_prepares_library_artifact_without_writing_workspace() {
+        let _env = env_lock();
         let root = workspace("library");
         let root_string = root.to_string_lossy().into_owned();
         let output = create_handoff(

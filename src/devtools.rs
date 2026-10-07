@@ -433,6 +433,7 @@ mod tests {
 
     #[test]
     fn stderr_classification_does_not_persist_raw_messages() {
+        let _env = crate::test_serialization::lock_env();
         assert_eq!(
             stderr_event(b"FATAL ERROR: heap out of memory secret-url"),
             Some("devtools_stderr_memory_error")
@@ -476,6 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_exit_fails_pending_request_promptly() {
+        let _env = crate::test_serialization::lock_env();
         let bridge = peer("read line; exit 0");
         let mut bridge = bridge.lock().await;
         let req = json!({"id": "exit", "method": "tools/list"});
@@ -488,6 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_request_does_not_leave_pending_sender() {
+        let _env = crate::test_serialization::lock_env();
         let bridge = peer("while read line; do :; done");
         let mut bridge = bridge.lock().await;
         let req = json!({"id": "cancel", "method": "tools/list"});
@@ -504,6 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn immediate_responses_keep_the_callers_id() {
+        let _env = crate::test_serialization::lock_env();
         let bridge = peer("while IFS= read -r line; do printf '%s\\n' \"$line\"; done");
         for _ in 0..50 {
             let request = json!({"id": "reused-client-id", "method": "ping"});
@@ -530,6 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_call_restarts_a_disconnected_bridge_without_replaying_failed_work() {
+        let _env = crate::test_serialization::lock_env();
         let marker =
             std::env::temp_dir().join(format!("catdesk-devtools-restart-{}", uuid::Uuid::new_v4()));
         let script = format!(
@@ -563,6 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_calls_queue_behind_the_serial_bridge_instead_of_failing_busy() {
+        let _env = crate::test_serialization::lock_env();
         let bridge = peer("while IFS= read -r line; do printf '%s\\n' \"$line\"; done");
         let busy = bridge.lock().await;
         let request = json!({"id": 1, "method": "ping"});

@@ -170,6 +170,7 @@ fn metadata_cache_counts_hits_and_misses_for_perf_metrics() {
 
 #[test]
 fn workspace_root_command_scope_skips_recursive_change_tracking() {
+    let _env = env_lock();
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -202,6 +203,7 @@ fn workspace_root_command_scope_skips_recursive_change_tracking() {
 
 #[test]
 fn project_command_scope_still_tracks_project_changes() {
+    let _env = env_lock();
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -428,6 +430,7 @@ fn server_discover_advertises_only_2026_07_28() {
 
 #[tokio::test]
 async fn command_job_tools_start_poll_and_report_terminal_success() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-command-job-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -547,6 +550,7 @@ async fn command_job_tools_start_poll_and_report_terminal_success() {
 
 #[tokio::test]
 async fn start_command_idempotency_is_namespaced_by_client_session() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-session-dedupe-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -625,6 +629,7 @@ async fn start_command_idempotency_is_namespaced_by_client_session() {
 
 #[tokio::test]
 async fn command_jobs_cannot_be_polled_or_cancelled_across_client_sessions() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-session-job-owner-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -753,6 +758,7 @@ async fn command_jobs_cannot_be_polled_or_cancelled_across_client_sessions() {
 
 #[tokio::test]
 async fn reused_json_rpc_id_with_different_start_arguments_creates_distinct_jobs() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-id-reuse-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -851,6 +857,7 @@ fn abandoned_snapshot_text_explains_missing_polls() {
 
 #[test]
 fn command_job_widget_state_matrix_preserves_command_ui_contract() {
+    let _env = env_lock();
     let cases = [
         ("start_command", "queued", "Command Queued", "waiting"),
         ("start_command", "running", "Command Started", "waiting"),
@@ -914,6 +921,7 @@ fn command_job_widget_state_matrix_preserves_command_ui_contract() {
 
 #[test]
 fn command_job_widget_formats_stderr_and_truncation_without_new_styles() {
+    let _env = env_lock();
     let result = json!({
         "structuredContent": {
             "toolName": "poll_command",
@@ -954,6 +962,7 @@ fn command_job_widget_formats_stderr_and_truncation_without_new_styles() {
 
 #[test]
 fn original_run_command_widget_shape_is_unchanged_by_new_runtime_metadata() {
+    let _env = env_lock();
     let req = tool_call_request("run_command", json!({ "command": "cargo check" }));
     let raw = json!({
         "content": [],
@@ -1038,6 +1047,7 @@ async fn read_only_mode_blocks_all_command_job_calls_even_if_invoked_directly() 
 
 #[tokio::test]
 async fn failed_background_command_is_pollable_without_mcp_error() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-command-fail-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -1118,6 +1128,7 @@ async fn failed_background_command_is_pollable_without_mcp_error() {
 
 #[tokio::test]
 async fn foreground_run_command_works_while_many_background_commands_run() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-run-budget-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -1180,6 +1191,7 @@ async fn foreground_run_command_works_while_many_background_commands_run() {
 
 #[tokio::test]
 async fn twenty_five_concurrent_named_sessions_complete_without_concurrency_rejection() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-sessions-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -1284,6 +1296,7 @@ async fn run_command_rejects_long_timeout_and_points_to_start_command() {
 
 #[tokio::test]
 async fn run_command_failure_returns_error_text_content() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-run-failure-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -1329,6 +1342,7 @@ async fn run_command_failure_returns_error_text_content() {
 
 #[tokio::test]
 async fn run_command_silent_failure_returns_exit_code_content() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-run-silent-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -1370,6 +1384,7 @@ async fn run_command_silent_failure_returns_exit_code_content() {
 
 #[test]
 fn silent_timeout_error_uses_timed_out_metadata_in_content() {
+    let _env = env_lock();
     let req = tool_call_request("run_command", json!({ "command": "sleep forever" }));
     let response = tool_error_response_with_structured(
         &req,
@@ -1390,6 +1405,7 @@ fn silent_timeout_error_uses_timed_out_metadata_in_content() {
 
 #[tokio::test]
 async fn run_command_timeout_with_stdout_keeps_timeout_reason_in_content() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-run-timeout-output-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -1436,6 +1452,7 @@ async fn run_command_timeout_with_stdout_keeps_timeout_reason_in_content() {
 
 #[tokio::test]
 async fn run_command_success_keeps_content_empty() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-run-success-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -1572,6 +1589,7 @@ async fn read_result_max_range_token_estimate_stays_bounded() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_command_large_stdout_and_stderr_are_compact_inline_and_fully_retrievable() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-run-large-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -1780,6 +1798,7 @@ async fn run_command_large_stdout_and_stderr_are_compact_inline_and_fully_retrie
 
 #[tokio::test]
 async fn command_tool_descriptors_keep_silent_waits_stream_safe() {
+    let _env = env_lock();
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(json!("req-tools-list-stream-safe")),
@@ -1821,6 +1840,7 @@ async fn command_tool_descriptors_keep_silent_waits_stream_safe() {
 
 #[tokio::test]
 async fn command_job_tools_document_restart_durability() {
+    let _env = env_lock();
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(json!("req-tools-list-durable-jobs")),
@@ -1857,6 +1877,7 @@ async fn command_job_tools_document_restart_durability() {
 
 #[tokio::test]
 async fn multi_tools_list_exposes_run_command_mv_without_move_path_tool() {
+    let _env = env_lock();
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(json!("req-tools-list")),
@@ -3625,6 +3646,7 @@ async fn edit_file_rejects_multiple_matches_without_replace_all() {
 
 #[tokio::test]
 async fn run_command_listing_intercept_uses_list_widget_payload() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-run-command-list-{}", Uuid::new_v4()));
     std::fs::create_dir_all(workspace_root.join("src")).expect("create workspace");
@@ -3700,6 +3722,7 @@ async fn run_command_listing_intercept_uses_list_widget_payload() {
 
 #[tokio::test]
 async fn run_command_ls_listing_intercept_uses_run_command_widget_payload() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-run-command-ls-{}", Uuid::new_v4()));
     std::fs::create_dir_all(workspace_root.join("src")).expect("create workspace");
@@ -3774,6 +3797,7 @@ async fn run_command_ls_listing_intercept_uses_run_command_widget_payload() {
 
 #[tokio::test]
 async fn run_command_mv_intercept_moves_into_directory_and_reports_changed_files() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-run-command-mv-{}", Uuid::new_v4()));
     std::fs::create_dir_all(workspace_root.join("dest")).expect("create workspace");
@@ -3855,6 +3879,7 @@ async fn run_command_mv_intercept_moves_into_directory_and_reports_changed_files
 
 #[tokio::test]
 async fn run_command_mv_intercept_no_clobber_skips_existing_destination() {
+    let _env = env_lock();
     let workspace_root = std::env::temp_dir().join(format!(
         "catdesk-mcp-run-command-mv-no-clobber-{}",
         Uuid::new_v4()
@@ -4822,6 +4847,7 @@ async fn poll_command_rejects_wait_above_stream_safe_ceiling() {
 
 #[tokio::test]
 async fn poll_command_waits_for_progress_unless_told_not_to() {
+    let _env = env_lock();
     let jobs = CommandJobManager::new();
     let workspace_root = read_workspace("poll-default");
     let command = if cfg!(windows) {
@@ -5116,6 +5142,7 @@ async fn delete_tool_returns_structured_message_without_text_content() {
 
 #[test]
 fn run_command_keeps_full_model_output_but_bounds_widget_preview() {
+    let _env = env_lock();
     let req = tool_call_request("run_command", json!({ "command": "verbose-test" }));
     let full_output = "x".repeat(20_000);
     let expected_output = full_output.clone();
@@ -5215,6 +5242,7 @@ fn changed_file_widget_keeps_metadata_but_bounds_diff_preview() {
 
 #[test]
 fn list_files_widget_keeps_full_counts_but_bounds_rendered_entries() {
+    let _env = env_lock();
     let entries = (0..250)
         .map(|index| {
             json!({
@@ -5800,6 +5828,7 @@ fn show_detail_modes_are_injectable_for_widget_enrichment() {
 
 #[tokio::test]
 async fn run_command_change_tracking_excludes_vcs_admin_paths() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-vcs-diff-{}", Uuid::new_v4()));
     let project = workspace_root.join("repo");
@@ -5846,6 +5875,7 @@ async fn run_command_change_tracking_excludes_vcs_admin_paths() {
 
 #[tokio::test]
 async fn background_command_reports_cumulative_changes_without_vcs_admin_noise() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-job-diff-{}", Uuid::new_v4()));
     let project = workspace_root.join("repo");
@@ -5942,6 +5972,7 @@ async fn background_command_reports_cumulative_changes_without_vcs_admin_noise()
 
 #[tokio::test]
 async fn disabled_show_detail_mode_skips_background_change_tracking() {
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-disable-job-diff-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");

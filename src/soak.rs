@@ -324,6 +324,7 @@ fn timestamp_ms(record: &Value) -> u64 {
 /// pollable — a timeout never proves the work stopped.
 #[tokio::test]
 async fn soak_long_request_deadline_leaves_surviving_pollable_work() {
+    let _env = crate::test_serialization::lock_env();
     let root = std::env::temp_dir().join(format!("catdesk-soak-deadline-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let side_effect = root.join("side-effect.txt");
@@ -414,6 +415,7 @@ async fn soak_long_request_deadline_leaves_surviving_pollable_work() {
 /// visible in the registry, and nothing leaks.
 #[tokio::test]
 async fn soak_concurrent_tool_calls_across_scheduler_classes_stay_correlated() {
+    let _env = crate::test_serialization::lock_env();
     let root =
         std::env::temp_dir().join(format!("catdesk-soak-concurrent-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
@@ -521,6 +523,7 @@ async fn soak_concurrent_tool_calls_across_scheduler_classes_stay_correlated() {
 /// the job is still pollable afterwards.
 #[tokio::test]
 async fn soak_client_disconnect_during_side_effectful_work_survives() {
+    let _env = crate::test_serialization::lock_env();
     let root =
         std::env::temp_dir().join(format!("catdesk-soak-disconnect-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
@@ -578,6 +581,7 @@ async fn soak_client_disconnect_during_side_effectful_work_survives() {
 /// under load, every request gets exactly one terminal, and nothing leaks.
 #[tokio::test]
 async fn soak_failure_storm_keeps_attributions_separated() {
+    let _env = crate::test_serialization::lock_env();
     let root = std::env::temp_dir().join(format!("catdesk-soak-storm-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     warm_up_instruction_path(&root).await;
@@ -699,6 +703,7 @@ async fn soak_failure_storm_keeps_attributions_separated() {
 /// supervisor emits around a mid-stream failure and reconnect cycle.
 #[test]
 fn soak_tunnel_reconnect_window_classifies_as_tunnel_event() {
+    let _env = crate::test_serialization::lock_env();
     let records = vec![
         json!({"event": "http_started", "request_id": "in-flight", "timestamp_ms": 9_000}),
         json!({"event": "tunnel_started", "timestamp_ms": 9_100}),

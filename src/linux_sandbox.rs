@@ -2370,6 +2370,7 @@ mod tests {
 
     #[test]
     fn workspace_git_paths_rejects_worktree_through_symlinked_common_git() {
+        let _env = EnvGuards::read();
         let tree = TempTree::new();
         let workspace = tree.path().join("linked");
         let real_common = tree.path().join("evil/.git");

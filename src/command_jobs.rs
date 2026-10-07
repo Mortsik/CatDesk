@@ -1183,6 +1183,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_persists_queued_then_running_record_and_finish_updates_it() {
+        let _env = env_lock();
         let (manager, dir) = manager_with_store();
         let started = manager
             .start("printf 'done\\n'".into(), dir.clone(), 5_000, None)
@@ -1336,6 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_restores_terminal_records_as_pollable() {
+        let _env = env_lock();
         let (manager, dir) = manager_with_store();
         let started = manager
             .start("printf 'x'".into(), dir.clone(), 5_000, None)
@@ -1358,6 +1360,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_restores_abandoned_records_as_pollable() {
+        let _env = env_lock();
         let root = workspace("abandon-recovery");
         let (manager, dir) = manager_with_store();
         let manager = manager.with_abandon_after_ms(150);
@@ -1396,6 +1399,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_eviction_removes_store_file() {
+        let _env = env_lock();
         let (manager, dir) = manager_with_store();
         let started = manager
             .start("printf 'x'".into(), dir.clone(), 5_000, None)
@@ -1424,6 +1428,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_all_persists_cancelled_state() {
+        let _env = env_lock();
         let (manager, dir) = manager_with_store();
         let _started = manager
             .start("sleep 5".into(), dir.clone(), 60_000, None)
@@ -1512,6 +1517,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_job_returns_immediately_and_completes() {
+        let _env = env_lock();
         let root = workspace("complete");
         let manager = CommandJobManager::new();
         let command = if cfg!(windows) {
@@ -1543,6 +1549,7 @@ mod tests {
 
     #[tokio::test]
     async fn polling_is_incremental_by_cursor() {
+        let _env = env_lock();
         let root = workspace("cursor");
         let manager = CommandJobManager::new();
         let command = if cfg!(windows) {
@@ -1599,6 +1606,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_prevents_later_side_effects() {
+        let _env = env_lock();
         let root = workspace("cancel");
         let ready = root.join("ready.txt");
         let sentinel = root.join("sentinel.txt");
@@ -1659,6 +1667,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_waits_for_terminal_state_despite_output_notifications() {
+        let _env = env_lock();
         let root = workspace("cancel-terminal");
         let ready = root.join("ready.txt");
         let manager = CommandJobManager::new();
@@ -1686,6 +1695,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_terminates_descendant_process_tree() {
+        let _env = env_lock();
         let root = workspace("descendant-cancel");
         let sentinel = root.join("descendant.txt");
         let manager = CommandJobManager::new();
@@ -1716,6 +1726,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn signalled_background_job_reports_conventional_exit_code_and_signal() {
+        let _env = env_lock();
         let root = workspace("signal-diagnostic");
         let manager = CommandJobManager::new();
         let started = manager
@@ -1739,6 +1750,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_timeout_terminates_process_tree() {
+        let _env = env_lock();
         let root = workspace("timeout");
         let sentinel = root.join("sentinel.txt");
         let manager = CommandJobManager::new();
@@ -1764,6 +1776,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_job_without_polls_is_abandoned_and_terminates_process_tree() {
+        let _env = env_lock();
         let root = workspace("abandoned");
         let sentinel = root.join("sentinel.txt");
         let (manager, store_dir) = manager_with_store();
@@ -1825,6 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_refreshes_the_abandon_deadline() {
+        let _env = env_lock();
         let root = workspace("abandon-refresh");
         let (manager, store_dir) = manager_with_store();
         let manager = manager.with_abandon_after_ms(300);
@@ -1875,6 +1889,7 @@ mod tests {
 
     #[tokio::test]
     async fn regular_polling_keeps_a_job_alive_until_it_finishes() {
+        let _env = env_lock();
         let root = workspace("abandon-heartbeat");
         let manager = CommandJobManager::new().with_abandon_after_ms(200);
         let command = if cfg!(windows) {
@@ -1993,6 +2008,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_all_terminates_active_jobs() {
+        let _env = env_lock();
         let root = workspace("cancel-all");
         let ready = root.join("ready.txt");
         let sentinel = root.join("sentinel.txt");
@@ -2023,6 +2039,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_all_permanently_rejects_future_starts() {
+        let _env = env_lock();
         let root = workspace("shutdown-reject");
         let manager = CommandJobManager::new();
         manager.cancel_all().await;
@@ -2037,6 +2054,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_racing_with_shutdown_cannot_escape_cancellation() {
+        let _env = env_lock();
         use tokio::sync::Barrier;
 
         let root = workspace("shutdown-race");
@@ -2174,6 +2192,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_prunes_expired_idempotency_keys_without_job_eviction() {
+        let _env = env_lock();
         let root = workspace("dedupe-cleanup");
         let manager = CommandJobManager::new();
         let command = if cfg!(windows) {
@@ -2219,6 +2238,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_request_key_reuses_existing_job() {
+        let _env = env_lock();
         let root = workspace("dedup");
         let manager = CommandJobManager::new();
         let command = if cfg!(windows) {
@@ -2293,6 +2313,7 @@ mod tests {
 
     #[tokio::test]
     async fn more_than_twelve_background_commands_are_admitted_and_run_concurrently() {
+        let _env = env_lock();
         let root = workspace("concurrent-background");
         let manager = CommandJobManager::new();
         let command = if cfg!(windows) {
@@ -2342,6 +2363,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_job_count_tracks_running_jobs() {
+        let _env = env_lock();
         let root = workspace("active-count");
         let manager = CommandJobManager::new();
         let command = if cfg!(windows) {
@@ -2460,6 +2482,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_terminal_job_is_idempotent() {
+        let _env = env_lock();
         let root = workspace("terminal-cancel");
         let manager = CommandJobManager::new();
         let command = if cfg!(windows) {
@@ -2483,6 +2506,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_wait_returns_near_requested_deadline_when_nothing_changes() {
+        let _env = env_lock();
         let root = workspace("poll-wait");
         let manager = CommandJobManager::new();
         let command = if cfg!(windows) {

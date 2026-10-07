@@ -574,6 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_http_requests_keep_status_and_correlation_without_payloads() {
+        let _env = crate::test_serialization::lock_env();
         use crate::{command_jobs::CommandJobManager, state::AppState};
         use tokio::sync::{Mutex, mpsc::channel};
         let root =
@@ -761,6 +762,7 @@ mod tests {
 
     #[tokio::test]
     async fn perf_metrics_observe_http_requests_end_to_end() {
+        let _env = crate::test_serialization::lock_env();
         use crate::{command_jobs::CommandJobManager, perf_metrics, state::AppState};
         use tokio::sync::{Mutex, mpsc::channel};
         let root = std::env::temp_dir().join(format!("catdesk-perf-http-{}", uuid::Uuid::new_v4()));
@@ -1038,6 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_scheduled_requests_keep_correlated_lifecycle_records() {
+        let _env = crate::test_serialization::lock_env();
         let root =
             std::env::temp_dir().join(format!("catdesk-concurrent-http-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();

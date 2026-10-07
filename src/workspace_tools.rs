@@ -2388,6 +2388,7 @@ mod tests {
 
     #[test]
     fn collect_search_files_stops_at_deadline() {
+        let _env = env_lock();
         let workspace_root = test_workspace("search-deadline-collect");
         fs::create_dir_all(&workspace_root).expect("create workspace");
         fs::write(workspace_root.join("a.txt"), "needle\n").expect("write file");

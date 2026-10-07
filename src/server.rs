@@ -2071,6 +2071,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_mcp_reports_runtime_widget_set_from_tools_list() {
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = unique_temp_path("catdesk-bootstrap-tools-workspace");
         let config_root = unique_temp_path("catdesk-bootstrap-tools-config");
         let config_path = config_root.join("config.toml");
@@ -3124,6 +3125,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_command_survives_separate_stateless_http_requests() {
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = unique_temp_path("catdesk-post-mcp-command-job");
         let config_root = unique_temp_path("catdesk-post-mcp-command-job-config");
         let config_path = config_root.join("config.toml");
@@ -3713,6 +3715,7 @@ mod tests {
 
     #[tokio::test]
     async fn named_session_reuses_project_selected_by_successful_explicit_command_cwd() {
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = unique_temp_path("catdesk-session-project-workspace");
         let config_root = unique_temp_path("catdesk-session-project-config");
         let config_path = config_root.join("config.toml");
@@ -3869,6 +3872,7 @@ mod tests {
     #[tokio::test]
     async fn three_named_sessions_keep_independent_projects_across_command_read_and_search_signals()
     {
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = unique_temp_path("catdesk-three-session-project-workspace");
         let config_root = unique_temp_path("catdesk-three-session-project-config");
         let config_path = config_root.join("config.toml");
@@ -3992,6 +3996,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_start_command_idempotency_is_scoped_to_mcp_session() {
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = unique_temp_path("catdesk-http-session-job-workspace");
         let config_root = unique_temp_path("catdesk-http-session-job-config");
         let config_path = config_root.join("config.toml");
@@ -4074,6 +4079,7 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_named_sessions_with_reused_rpc_ids_keep_workloads_isolated() {
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = unique_temp_path("catdesk-parallel-session-stress-workspace");
         let config_root = unique_temp_path("catdesk-parallel-session-stress-config");
         let config_path = config_root.join("config.toml");
@@ -4487,6 +4493,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_mcp_accumulates_usage_from_widget_payload_meta() {
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = unique_temp_path("catdesk-post-mcp-workspace");
         let config_root = unique_temp_path("catdesk-post-mcp-config");
         let config_path = config_root.join("config.toml");
