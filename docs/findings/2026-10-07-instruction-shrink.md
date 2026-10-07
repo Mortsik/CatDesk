@@ -16,10 +16,17 @@ prefix/filename included). Tokens ≈ bytes/4 (English-prose heuristic).
 
 | Payload | Before | After | Δ bytes | Δ % | ~tokens before | ~tokens after |
 | --- | --- | --- | --- | --- | --- | --- |
-| Instruction, `Both` + multi-tools | 5548 B | 3578 B | −1970 B | −35.5% | ~1387 | ~895 |
-| Instruction, `Both` + read-only | 3645 B | 2412 B | −1233 B | −33.8% | ~911 | ~603 |
-| Instruction, `Browser` + multi-tools | 1472 B | 933 B | −539 B | −36.6% | ~368 | ~233 |
+| Instruction, `Both` + multi-tools | 5548 B | 3507 B | −2041 B | −36.8% | ~1387 | ~877 |
+| Instruction, `Both` + read-only | 3645 B | 2341 B | −1304 B | −35.8% | ~911 | ~585 |
+| Instruction, `Computer` + multi-tools | 5458 B * | 3507 B | −1951 B | −35.7% | ~1365 | ~877 |
+| Instruction, `Computer` + read-only | 3555 B * | 2341 B | −1214 B | −34.1% | ~889 | ~585 |
+| Instruction, `Browser` + multi-tools | 1472 B | 889 B | −583 B | −39.6% | ~368 | ~222 |
+| Instruction, `Browser` + read-only | 1472 B * | 889 B | −583 B | −39.6% | ~368 | ~222 |
 | `tools/list` (context, Both + multi-tools) | 25398 B | 25331 B | −67 B | −0.3% | ~6349 | ~6332 |
+
+\* Derived, not measured: the pre-shrink Computer payloads equal their Both
+counterparts minus the 90-byte browser-only guidance they never carried, and
+Browser/read-only shares the static Browser header of Browser/multi-tools.
 
 The pinned budget lives in
 `instruction_payload_stays_materially_below_baseline` (`src/mcp/tests.rs`):
@@ -56,7 +63,7 @@ Legend: **runtime** = a code path enforces it; **test** = pinned by a test.
 | Prefer dedicated tools over `run_command` | instruction text (single deduplicated rule) + guarantee test |
 | Images through `read_image`; native content; server-side vision fallback | instruction text + tests `catdesk_instruction_mentions_read_image_for_image_reading`, runtime caps in `workspace_tools::read_image` |
 | Handoff discovery: search → read → verify → delete-after-read; ask when ambiguous; untrusted; never overrides user/AGENTS.md; never invent | instruction text (all semantic steps kept) + tests `catdesk_instruction_points_new_sessions_to_library_handoff_search`, `project_instruction_layers_workspace_then_project_agents_and_uses_project_handoff_identity` + guarantee test |
-| Save handoff to Library under returned filename, replace exact-name copy, no repo copy, no secrets | instruction text + tool description + guarantee test |
+| Save handoff to Library under returned filename, replace exact-name copy, leave no copy in the repository or workspace, no secrets | instruction text (agent-level prohibition) + tool description + guarantee test |
 | Short work → `run_command` last resort; >20 s → `start_command`; 120 s hard ceiling | runtime `command::clamp_timeout` / `MAX_TIMEOUT_MS` + instruction text + test `catdesk_instruction_steers_long_commands_to_start_and_poll` + tool descriptions (`command_tool_descriptors_keep_silent_waits_stream_safe`) |
 | Poll cursor (`after`/`nextCursor`), drain on `hasMoreOutput` | instruction text + runtime cursor mechanics `src/command_jobs.rs` + tool descriptions |
 | Job durability across restarts (`interrupted`, exit codes) | instruction text + runtime job store `src/command_jobs.rs` + test `command_job_tools_document_restart_durability` |

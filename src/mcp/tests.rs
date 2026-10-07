@@ -6613,16 +6613,23 @@ fn analyzed_read_image_short_description_passes_through_untouched() {
 // kept in the text (the rest moved to runtime enforcement or tool schemas —
 // see docs/findings/2026-10-07-instruction-shrink.md).
 
-/// Pre-shrink instruction payload baselines, measured 2026-10-07 and recorded
-/// in docs/findings/2026-10-07-instruction-shrink.md (workspace-scoped
+/// Browser-only guidance that the pre-shrink Both payloads carried and the
+/// Computer payloads never did (89 B sentence + its separator), so each
+/// Computer baseline is its Both counterpart minus this delta.
+const PRE_SHRINK_BROWSER_ONLY_DELTA: usize = 90;
+
+/// Pre-shrink instruction payload baselines for every (Mode, ToolMode)
+/// pair, measured 2026-10-07 and recorded in
+/// docs/findings/2026-10-07-instruction-shrink.md (workspace-scoped
 /// fragments included; ~±150 B variance from the dynamic handoff
 /// prefix/filename between runs).
 fn instruction_baseline_bytes(mode: Mode, tool_mode: ToolMode) -> usize {
     match (mode, tool_mode) {
         (Mode::Both, ToolMode::MultiTools) => 5548,
         (Mode::Both, ToolMode::ReadOnly) => 3645,
-        (Mode::Browser, ToolMode::MultiTools) => 1472,
-        _ => 0,
+        (Mode::Computer, ToolMode::MultiTools) => 5548 - PRE_SHRINK_BROWSER_ONLY_DELTA,
+        (Mode::Computer, ToolMode::ReadOnly) => 3645 - PRE_SHRINK_BROWSER_ONLY_DELTA,
+        (Mode::Browser, ToolMode::MultiTools) | (Mode::Browser, ToolMode::ReadOnly) => 1472,
     }
 }
 
@@ -6681,11 +6688,14 @@ const INSTRUCTION_GUARANTEE_PHRASES: &[(&str, &str)] = &[
     ),
     ("computer", "Library Search must be enabled"),
     ("computer", "use create_handoff"),
-    // Save workflow: exact-name replacement in the Library, no workspace or
-    // repository copy.
+    // Save workflow: exact-name replacement in the Library; the agent-level
+    // prohibition covers both the repository and the workspace (the tool
+    // itself not writing the workspace is only a tool fact, not the ban).
     ("computer", "replacing any older exact-name copy"),
-    ("computer", "does not write the workspace"),
-    ("computer", "keep no handoff in the repository"),
+    (
+        "computer",
+        "Do not leave a handoff in the repository or workspace",
+    ),
     // Safety: no secrets in handoffs.
     (
         "computer",
@@ -6736,25 +6746,23 @@ fn instruction_payload_stays_materially_below_baseline() {
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
     let workspace_root_str = workspace_root.to_string_lossy().into_owned();
 
-    for (mode, tool_mode) in [
-        (Mode::Both, ToolMode::MultiTools),
-        (Mode::Both, ToolMode::ReadOnly),
-        (Mode::Browser, ToolMode::MultiTools),
-    ] {
-        let text = catdesk_instruction_text(&workspace_root_str, mode, tool_mode)
-            .expect("build instruction");
-        let baseline = instruction_baseline_bytes(mode, tool_mode);
-        let budget = instruction_budget_bytes(mode, tool_mode);
-        assert!(
-            text.len() < budget,
-            "{}/{} instruction payload must stay materially below the {}-byte \
-             pre-shrink baseline (budget {} bytes), got {} bytes",
-            mode.label(),
-            tool_mode.label(),
-            baseline,
-            budget,
-            text.len()
-        );
+    for mode in [Mode::Both, Mode::Computer, Mode::Browser] {
+        for tool_mode in [ToolMode::MultiTools, ToolMode::ReadOnly] {
+            let text = catdesk_instruction_text(&workspace_root_str, mode, tool_mode)
+                .expect("build instruction");
+            let baseline = instruction_baseline_bytes(mode, tool_mode);
+            let budget = instruction_budget_bytes(mode, tool_mode);
+            assert!(
+                text.len() < budget,
+                "{}/{} instruction payload must stay materially below the {}-byte \
+                 pre-shrink baseline (budget {} bytes), got {} bytes",
+                mode.label(),
+                tool_mode.label(),
+                baseline,
+                budget,
+                text.len()
+            );
+        }
     }
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -6766,36 +6774,34 @@ fn instruction_payload_keeps_every_enforceable_guarantee() {
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
     let workspace_root_str = workspace_root.to_string_lossy().into_owned();
 
-    for (mode, tool_mode) in [
-        (Mode::Both, ToolMode::MultiTools),
-        (Mode::Both, ToolMode::ReadOnly),
-        (Mode::Browser, ToolMode::MultiTools),
-    ] {
-        let text = catdesk_instruction_text(&workspace_root_str, mode, tool_mode)
-            .expect("build instruction");
-        for (scope, phrase) in INSTRUCTION_GUARANTEE_PHRASES {
-            if !instruction_scope_matches(scope, mode, tool_mode) {
-                continue;
+    for mode in [Mode::Both, Mode::Computer, Mode::Browser] {
+        for tool_mode in [ToolMode::MultiTools, ToolMode::ReadOnly] {
+            let text = catdesk_instruction_text(&workspace_root_str, mode, tool_mode)
+                .expect("build instruction");
+            for (scope, phrase) in INSTRUCTION_GUARANTEE_PHRASES {
+                if !instruction_scope_matches(scope, mode, tool_mode) {
+                    continue;
+                }
+                assert!(
+                    text.contains(phrase),
+                    "{}/{} instruction lost the guarantee `{phrase}` during shrinking: {text}",
+                    mode.label(),
+                    tool_mode.label(),
+                );
             }
-            assert!(
-                text.contains(phrase),
-                "{}/{} instruction lost the guarantee `{phrase}` during shrinking: {text}",
-                mode.label(),
-                tool_mode.label(),
-            );
-        }
-        for (scope, rule) in INSTRUCTION_UNIQUE_RULES {
-            if !instruction_scope_matches(scope, mode, tool_mode) {
-                continue;
+            for (scope, rule) in INSTRUCTION_UNIQUE_RULES {
+                if !instruction_scope_matches(scope, mode, tool_mode) {
+                    continue;
+                }
+                let occurrences = text.matches(rule).count();
+                assert_eq!(
+                    occurrences,
+                    1,
+                    "{}/{} instruction rule `{rule}` must appear exactly once, found {occurrences}: {text}",
+                    mode.label(),
+                    tool_mode.label(),
+                );
             }
-            let occurrences = text.matches(rule).count();
-            assert_eq!(
-                occurrences,
-                1,
-                "{}/{} instruction rule `{rule}` must appear exactly once, found {occurrences}: {text}",
-                mode.label(),
-                tool_mode.label(),
-            );
         }
     }
     let _ = std::fs::remove_dir_all(workspace_root);
