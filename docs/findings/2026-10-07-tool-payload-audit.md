@@ -36,7 +36,7 @@ compares it against the enumerated catalog exposure per (Mode, ToolMode).
 | `read` | C+M, C+R | `files[].text`, text content | `shared-budget+pre-cap` | batch budget 512 KiB `src/workspace_tools.rs:23`, per-file cap 512 KiB `src/workspace_tools.rs:21`, batch size 32 `src/workspace_tools.rs:22`, per-file budget accounting `src/workspace_tools.rs:449-473`, flags `budgetTruncated`/`batchTruncated` `src/mcp/file_tools.rs:56-61` | Files past the batch budget return metadata only. |
 | `read_image` | C+M, C+R | image content (base64), `structuredContent` (with `analyze`) | `multimodal-exempt` | input cap 20 MiB / 40 Mpx `src/workspace_tools.rs:27-28`, resize default 1600 max 4096 `src/workspace_tools.rs:24-26`, post-encode cap `src/workspace_tools.rs:425`, exemption `src/mcp/response_budget.rs:168` with test `src/mcp/response_budget.rs:879`, size-cap test `src/mcp/tests.rs:4014-4031` | Deliberate multimodal exception: native image content bypasses the budget so clients keep vision capability. With `analyze`, `analysis.description` has no cap — finding F1. |
 | `search` | C+M, C+R | `searchResults[]` (path/line/text), text content | `shared-budget+pre-cap` | match cap default 100 hard 500 `src/workspace_tools.rs:32-33`, per-file cap `src/mcp/tool_catalog.rs:642`, deadline truncation `src/workspace_tools.rs:39-50`, fallback scan caps `src/workspace_tools.rs:62-64`, `searchTruncated` flag `src/mcp/file_tools.rs:506` | A single matched line can still be arbitrarily long (minified files); the shared budget externalizes such responses over 64 KiB. |
-| `read_result` | C+M, C+R | `dataBase64`, `text` | `store-range` | request `max_bytes` rejected above 128 KiB (`RangeTooLarge`) `src/result_store.rs:363-368`, constant `src/result_store.rs:13` | Excluded from the dispatcher gate (`src/mcp.rs:493`) because it is the retrieval instrument for the store; bounded by store-side validation. Worst case for one maximal range of ASCII data ≈ 306 KiB serialized (base64 ≈ 171 KiB **plus** the same range mirrored as `text` ≈ 128 KiB plus metadata); with control bytes JSON-escaped as `\u00XX` the mirrored `text` inflates the same range up to ≈ 962 KiB. Size test `read_result_max_range_serialized_size_stays_bounded`. |
+| `read_result` | C+M, C+R | `dataBase64`, `text` | `store-range` | request `max_bytes` rejected above 128 KiB (`RangeTooLarge`) `src/result_store.rs:363-368`, constant `src/result_store.rs:13` | Excluded from the dispatcher gate (`src/mcp.rs:493`) because it is the retrieval instrument for the store; bounded by store-side validation. Worst case for one maximal range of ASCII data ≈ 306 KiB serialized (base64 ≈ 171 KiB **plus** the same range mirrored as `text` ≈ 128 KiB plus metadata); with control bytes JSON-escaped as `\u00XX` the mirrored `text` inflates the same range up to ≈ 962 KiB. Pinned by `read_result_bypasses_dispatcher_budget_gate` (dispatcher-level exemption + ASCII size), `read_result_max_range_serialized_size_stays_bounded` (ASCII size), and `read_result_control_byte_range_serializes_bounded_escaped_text` (escaped worst case). See F6 for the latency cost of this exemption. |
 | `search_result` | C+M, C+R | `matches[]` (snippets), `query` echo | `store-range` | `max_matches` rejected above 100 `src/result_store.rs:413-418`, snippet 256 B `src/result_store.rs:17`, default 20 `src/mcp/result_tools.rs:90` | Same gate exclusion as `read_result`. The `query` echo is client-controlled and unbounded — finding F3. |
 | `write` | C+M | `bytesWritten`, message | `inherent-static` | input cap 512 KiB `src/workspace_tools.rs:29`, response `src/mcp/file_tools.rs:213-226` | Response is scalars + short message. |
 | `edit` | C+M | operation counters, message | `inherent-static` | atomic batch, rendered summary `src/mcp/file_tools.rs:406-423` | Response is scalars + short message. |
@@ -101,6 +101,13 @@ upstream by the DevTools transport cap.
 - Problem: a large AGENTS.md (or many/oversized archived cards) inflates the response arbitrarily; today only the shared-budget gate bounds it, so the response is externalized above 64 KiB — but above the store's 64 MiB entry cap the F2 fail-open returns the whole thing inline. The base64 card images also permanently inflate the widget `_meta` that travels with the (usually tiny) instruction response.
 - Suggested direction: cap `read_agents_text_result` (e.g. head preview at 64 KiB with an explicit truncation marker) and cap the card feed (max card count and max PNG bytes; skip oversized entries) so the tool's own sources are bounded instead of relying solely on the dispatcher gate.
 
+### F6 — retrieval-tool responses pay full o200k tokenization inline — severity: medium (performance)
+
+- Tool: `read_result` (and `search_result`), any response with widget detail enabled
+- Location: `src/mcp.rs:508-514` (`estimate_turn_token_usage` runs after the budget gate), `src/mcp/token_usage.rs:30-42` (`o200k_base_singleton().encode` over the serialized result)
+- Problem: `apply_response_budget` shrinks every other tool's response to a ≤64 KiB preview before the turn-token estimate, but `read_result`/`search_result` are exempt from the gate — so their **full** serialized payload (306 KiB for a maximal ASCII range, ≈962 KiB with control-byte escaping) goes through tiktoken. Measured on this branch: ~54 s for the ASCII range and ~70–80 s for the control-byte range, single-core, per tools/call request. In production every large retrieval visibly stalls the request behind token estimation.
+- Suggested direction: estimate tokens cheaply for oversized payloads (bytes/4 heuristic above a threshold), or tokenize the same bounded shape the client sees (the dispatcher exemption could still skip the *budget* while feeding the estimator a preview).
+
 ## Discoveries (no action required)
 
 - `poll_command` clips each poll to 128 KiB, but the clip never splits a single event (`src/command_jobs.rs:356` `!events.is_empty()` guard), so one oversized output line passes whole; the shared budget still bounds the final inline response.
@@ -133,5 +140,9 @@ shared-budget manifest and inline limit apply.
 
 `oversized_catdesk_instruction_is_externalized_not_inlined` pins the F5 state:
 a megabyte-scale AGENTS.md must produce a budget manifest, never an oversized
-inline response, and `read_result_max_range_serialized_size_stays_bounded` pins
-the documented worst-case size of one maximal retrieval range.
+inline response. `read_result_bypasses_dispatcher_budget_gate` drives a maximal
+range through the full tools/call dispatcher and asserts the budget-gate
+exemption (removing `read_result` from `src/mcp.rs` fails it);
+`read_result_max_range_serialized_size_stays_bounded` and
+`read_result_control_byte_range_serializes_bounded_escaped_text` pin the
+documented worst-case sizes of one maximal retrieval range.

@@ -6761,6 +6761,7 @@ print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'content':[{'type':'t
     assert!(body.len() > super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES);
 
     let _ = std::fs::remove_dir_all(workspace_root);
+}
 
 // ── Tool payload audit inventory (catdesk-ojt.5) ────────────────────────────
 //
