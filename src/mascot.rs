@@ -517,9 +517,23 @@ pub(crate) fn catdesk_downloads_root() -> std::io::Result<PathBuf> {
         .join(DOWNLOADS_DIR_NAME))
 }
 
+/// Archived-card feed bounds (audit finding F5): the cards ride the
+/// instruction response's widget `_meta`, so the archive directory is never
+/// trusted at full size — at most the newest `MAX_ARCHIVED_CARDS` folders are
+/// loaded, and a card PNG above `MAX_ARCHIVED_CARD_BYTES` is skipped instead
+/// of inlined as base64. Card art is a small avatar; the cap is generous but
+/// hard.
+pub(crate) const MAX_ARCHIVED_CARDS: usize = 8;
+pub(crate) const MAX_ARCHIVED_CARD_BYTES: u64 = 512 * 1024;
+
 pub(crate) fn load_archived_binagotchy_cards() -> std::io::Result<Vec<ArchivedBinagotchyCard>> {
-    let root = catdesk_binagotchy_root()?;
-    let mut entries: Vec<PathBuf> = match fs::read_dir(&root) {
+    load_archived_binagotchy_cards_from(&catdesk_binagotchy_root()?)
+}
+
+pub(crate) fn load_archived_binagotchy_cards_from(
+    root: &Path,
+) -> std::io::Result<Vec<ArchivedBinagotchyCard>> {
+    let mut entries: Vec<PathBuf> = match fs::read_dir(root) {
         Ok(dir) => dir
             .map(|entry| entry.map(|value| value.path()))
             .collect::<Result<Vec<_>, _>>()?,
@@ -533,13 +547,20 @@ pub(crate) fn load_archived_binagotchy_cards() -> std::io::Result<Vec<ArchivedBi
 
     Ok(entries
         .into_iter()
+        // Newest first (sorted above), so the cap keeps the freshest cards.
+        .take(MAX_ARCHIVED_CARDS)
         .filter_map(|entry| {
             let folder = entry
                 .file_name()
                 .map(|value| value.to_string_lossy().to_string())?;
             let metadata_text = fs::read_to_string(entry.join(METADATA_FILE_NAME)).ok()?;
             let metadata: StoredMascotMetadata = toml::from_str(&metadata_text).ok()?;
-            let bytes = fs::read(entry.join(CHARACTER_PNG_FILE_NAME)).ok()?;
+            let card_path = entry.join(CHARACTER_PNG_FILE_NAME);
+            let card_size = fs::metadata(&card_path).map(|meta| meta.len()).ok()?;
+            if card_size > MAX_ARCHIVED_CARD_BYTES {
+                return None;
+            }
+            let bytes = fs::read(&card_path).ok()?;
             Some(ArchivedBinagotchyCard {
                 folder,
                 seed: metadata.seed,

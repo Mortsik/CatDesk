@@ -200,14 +200,48 @@ pub(crate) fn agents_widget_state_payload(workspace_root: &str) -> std::io::Resu
     }))
 }
 
+/// One AGENTS.md layer rides the instruction text verbatim, so a workspace
+/// file must never be trusted at full size (audit finding F5). The cap uses
+/// the shared inline-budget scale. An oversized layer keeps a bounded head
+/// plus a self-contained note — the file's tail is deliberately not read, so
+/// no budget head+tail preview (or stored remainder) applies here.
+const AGENTS_TEXT_PREVIEW_BYTES: usize = crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES;
+/// Reserved room for the truncation note so the preview stays within the cap.
+const AGENTS_TEXT_NOTE_ROOM: usize = 96;
+
 fn read_agents_text_result(path: &Path) -> std::io::Result<Option<String>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let trimmed = content.trim();
-    Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+    let total_len = file.metadata()?.len();
+    // Read at most one byte past the cap so oversized files stay bounded in
+    // memory as well as in the payload.
+    let mut bytes = Vec::new();
+    file.take((AGENTS_TEXT_PREVIEW_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if total_len as usize <= AGENTS_TEXT_PREVIEW_BYTES {
+        let content = String::from_utf8_lossy(&bytes);
+        if content.trim().is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(content.trim().to_string()));
+    }
+
+    let head_room = AGENTS_TEXT_PREVIEW_BYTES - AGENTS_TEXT_NOTE_ROOM;
+    bytes.truncate(head_room);
+    let mut head = String::from_utf8_lossy(&bytes).into_owned();
+    // pop() removes whole characters, so the cut can never split UTF-8.
+    while head.len() > head_room {
+        head.pop();
+    }
+    head.push_str(&format!(
+        "\n… <agents text truncated at {} of {total_len} bytes; full text not retained> …\n",
+        head.len()
+    ));
+    Ok(Some(head))
 }
 
 pub(crate) fn cached_agents_text(path: &Path) -> Option<String> {
