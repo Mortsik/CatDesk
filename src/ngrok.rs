@@ -6,6 +6,11 @@ use tokio::sync::oneshot;
 
 const RECONNECT_BASE_MS: u64 = 500;
 const RECONNECT_MAX_MS: u64 = 30_000;
+/// How often the session-identity watcher compares the ngrok-assigned session
+/// id. A 404/stream investigation window is ±30 s, so a renewal record lands
+/// inside it while staying far cheaper than an event-driven hook (the SDK
+/// exposes no reconnect callback).
+const SESSION_ID_POLL: Duration = Duration::from_secs(5);
 
 fn reconnect_delay(attempt: u32, jitter_seed: u64) -> Duration {
     let shift = attempt.min(6);
@@ -23,6 +28,19 @@ fn reconnect_jitter_seed(attempt: u32) -> u64 {
         .unwrap_or_default()
         .as_nanos() as u64;
     nanos ^ ((std::process::id() as u64) << 32) ^ attempt as u64
+}
+
+/// Whether the ngrok-assigned session identity changed since it was last
+/// seen. The SDK re-establishes the session transparently after transport
+/// failures and rebinds the same tunnel, so a changed id is the only
+/// observable trace of an internal reconnect.
+fn session_id_renewed(seen: &mut String, id: &str) -> bool {
+    if *seen == id {
+        return false;
+    }
+    seen.clear();
+    seen.push_str(id);
+    true
 }
 
 /// Start an ngrok HTTP tunnel using the embedded Rust SDK. After the first
@@ -150,7 +168,32 @@ pub async fn start(state: SharedState) -> Result<(), String> {
             }
             failures = 0;
 
+            // The ngrok SDK reconnects its session internally after transport
+            // failures (rebinding the same tunnel) without any callback and
+            // without ending the forwarder task, so those renewals are
+            // invisible to the supervisor loop. The server-assigned session id
+            // changes on every internal re-establishment; a watcher polls it
+            // and records the renewal. The supervisor aborts this task when
+            // the forwarder exits; if the supervisor itself is aborted at
+            // shutdown, process exit bounds the watcher instead.
+            let session_watcher = tokio::spawn({
+                let session = session.clone();
+                async move {
+                    let mut seen = session.id();
+                    loop {
+                        tokio::time::sleep(SESSION_ID_POLL).await;
+                        // Reconnects inside one poll window collapse into a
+                        // single record; the window is well inside the ±30 s
+                        // investigation budget.
+                        if session_id_renewed(&mut seen, &session.id()) {
+                            crate::diagnostics::event("tunnel_session_renewed");
+                        }
+                    }
+                }
+            });
+
             let result = forwarder.join().await;
+            session_watcher.abort();
             crate::diagnostics::event(match &result {
                 Ok(Ok(())) => "tunnel_stopped",
                 Ok(Err(_)) => "tunnel_failed",
@@ -207,5 +250,26 @@ mod tests {
     fn reconnect_backoff_grows_before_reaching_the_cap() {
         assert!(reconnect_delay(1, 0) > reconnect_delay(0, 0));
         assert!(reconnect_delay(2, 0) > reconnect_delay(1, 0));
+    }
+
+    #[test]
+    fn session_id_renewal_fires_only_when_the_identity_changes() {
+        let mut seen = String::from("session-initial");
+        assert!(
+            !session_id_renewed(&mut seen, "session-initial"),
+            "a stable session id must not be reported as a renewal"
+        );
+        assert_eq!(seen, "session-initial");
+
+        assert!(
+            session_id_renewed(&mut seen, "session-renewed"),
+            "a changed session id is the internal-reconnect trace"
+        );
+        assert_eq!(seen, "session-renewed");
+        // The watcher compares against the newest id, so a second poll of the
+        // renewed session stays silent and a later change fires again.
+        assert!(!session_id_renewed(&mut seen, "session-renewed"));
+        assert!(session_id_renewed(&mut seen, "session-third"));
+        assert_eq!(seen, "session-third");
     }
 }
