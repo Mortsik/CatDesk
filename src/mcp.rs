@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 use crate::change_tracking::{ChangeSession, FileChange};
@@ -127,6 +129,7 @@ pub(crate) async fn handle_request_with_show_detail_mode(
         command_jobs,
         devtools,
         show_detail_mode,
+        fallback_result_store(),
         None,
         None,
     )
@@ -145,6 +148,7 @@ pub(crate) async fn handle_request_with_session(
     command_jobs: &CommandJobManager,
     devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
     show_detail_mode: ShowDetailMode,
+    result_store: &LargeResultStore,
     session_namespace: Option<&str>,
     active_project: Option<&Path>,
 ) -> Option<JsonRpcResponse> {
@@ -170,7 +174,7 @@ pub(crate) async fn handle_request_with_session(
                 ))
             } else {
                 Some(
-                    handle_tools_call_with_session(
+                    handle_tools_call_with_result_store(
                         req,
                         workspace_root,
                         mascot_seed,
@@ -180,6 +184,7 @@ pub(crate) async fn handle_request_with_session(
                         command_jobs,
                         devtools,
                         show_detail_mode,
+                        result_store,
                         session_namespace,
                         active_project,
                     )
@@ -205,6 +210,14 @@ pub(crate) async fn handle_request_with_session(
             format!("Method not found: {}", req.method),
         )),
     }
+}
+
+#[cfg(test)]
+fn fallback_result_store() -> &'static LargeResultStore {
+    static FALLBACK_RESULT_STORE: OnceLock<LargeResultStore> = OnceLock::new();
+    FALLBACK_RESULT_STORE.get_or_init(|| {
+        LargeResultStore::new_default().expect("create fallback large-result store")
+    })
 }
 
 // ── tools/call ──────────────────────────────────────────────
@@ -262,6 +275,7 @@ async fn handle_tools_call_with_show_detail_mode(
     .await
 }
 
+#[cfg(test)]
 async fn handle_tools_call_with_session(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -275,10 +289,6 @@ async fn handle_tools_call_with_session(
     session_namespace: Option<&str>,
     active_project: Option<&Path>,
 ) -> JsonRpcResponse {
-    static FALLBACK_RESULT_STORE: OnceLock<LargeResultStore> = OnceLock::new();
-    let result_store = FALLBACK_RESULT_STORE.get_or_init(|| {
-        LargeResultStore::new_default().expect("create fallback large-result store")
-    });
     handle_tools_call_with_result_store(
         req,
         workspace_root,
@@ -289,13 +299,14 @@ async fn handle_tools_call_with_session(
         command_jobs,
         devtools,
         show_detail_mode,
-        result_store,
+        fallback_result_store(),
         session_namespace,
         active_project,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_tools_call_with_result_store(
     req: &JsonRpcRequest,
     workspace_root: &str,

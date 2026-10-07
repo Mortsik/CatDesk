@@ -87,3 +87,13 @@
 - [ ] **Step 4: Run targeted integration tests and `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, then `cargo test`.
   **Expected:** targeted tests, format and clippy PASS; full suite PASS except any independently reproduced pre-existing baseline failure, which must be reported by exact test name.
 - [ ] **Step 5: Commit** as `feat(mcp): wire large result store lifecycle`.
+
+
+## Verification outcome
+
+- Result-store suite: `8 passed; 0 failed`.
+- MCP suite: `120 passed; 0 failed`.
+- Server suite: `42 passed; 0 failed`.
+- Full suite: `557 passed; 1 failed`; the only failure is the independently reproduced baseline test `process_runner::tests::linux_sandboxed_process_survives_blocking_pool_thread_retirement` with the same bwrap `unix_wait_status(256)` seen before implementation.
+- `cargo fmt --check` and `git diff --check`: pass.
+- Global `cargo clippy --all-targets -- -D warnings` remains blocked by the repository's pre-existing lint debt (94+ errors in legacy code). The new result-store/result-retrieval paths have no observed feature-specific clippy diagnostics after local cleanup.

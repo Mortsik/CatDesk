@@ -590,15 +590,14 @@ impl LargeResultStore {
             return Err(StoreError::Unavailable);
         }
 
-        if let Some(tombstone) = state.tombstones.get(result_id) {
-            if tombstone.owner_session.as_deref() == owner_session
-                && tombstone.workspace == workspace
-            {
-                return Err(match tombstone.state {
-                    TombstoneState::Expired => StoreError::Expired,
-                    TombstoneState::Evicted => StoreError::Evicted,
-                });
-            }
+        if let Some(tombstone) = state.tombstones.get(result_id)
+            && tombstone.owner_session.as_deref() == owner_session
+            && tombstone.workspace == workspace
+        {
+            return Err(match tombstone.state {
+                TombstoneState::Expired => StoreError::Expired,
+                TombstoneState::Evicted => StoreError::Evicted,
+            });
         }
         Err(StoreError::Unavailable)
     }

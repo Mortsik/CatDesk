@@ -5476,10 +5476,12 @@ fn base_widget_payload_serializes_all_show_detail_modes() {
 }
 
 fn mcp_result_store() -> LargeResultStore {
-    let mut config = LargeResultStoreConfig::default();
-    config.max_range_bytes = 16;
-    config.max_search_matches = 4;
-    config.search_chunk_bytes = 8;
+    let config = LargeResultStoreConfig {
+        max_range_bytes: 16,
+        max_search_matches: 4,
+        search_chunk_bytes: 8,
+        ..LargeResultStoreConfig::default()
+    };
     LargeResultStore::new(config).expect("create result store")
 }
 
@@ -5751,5 +5753,84 @@ fn result_retrieval_hides_foreign_refs_and_reports_bounded_errors() {
         Some("range_too_large")
     );
 
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
+#[tokio::test]
+async fn result_retrieval_reconstructs_multi_megabyte_payload_through_bounded_mcp_calls() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-result-rebuild-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = LargeResultStore::new_default().expect("create result store");
+    let payload = (0..(3 * 1024 * 1024 + 37))
+        .map(|index| ((index * 37) % 251) as u8)
+        .collect::<Vec<_>>();
+    let stored = store
+        .put(Some("session-a"), &workspace_root, &payload, None)
+        .expect("store multi-megabyte payload");
+    let command_jobs = CommandJobManager::new();
+    let devtools = None;
+
+    let mut rebuilt = Vec::with_capacity(payload.len());
+    let mut offset = 0_u64;
+    loop {
+        let request = tool_call_request(
+            "read_result",
+            json!({
+                "result_id": stored.metadata.result_id,
+                "offset": offset,
+                "max_bytes": crate::result_store::DEFAULT_MAX_RANGE_BYTES
+            }),
+        );
+        let response = handle_tools_call_with_result_store(
+            &request,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &devtools,
+            ShowDetailMode::Disable,
+            &store,
+            Some("session-a"),
+            None,
+        )
+        .await;
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing range structured content");
+        let bytes_returned = structured
+            .get("bytesReturned")
+            .and_then(Value::as_u64)
+            .expect("missing bytesReturned") as usize;
+        assert!(
+            bytes_returned <= crate::result_store::DEFAULT_MAX_RANGE_BYTES,
+            "one retrieval returned {bytes_returned} bytes"
+        );
+        let chunk = base64::engine::general_purpose::STANDARD
+            .decode(
+                structured
+                    .get("dataBase64")
+                    .and_then(Value::as_str)
+                    .expect("missing lossless data"),
+            )
+            .expect("decode range");
+        assert_eq!(chunk.len(), bytes_returned);
+        rebuilt.extend_from_slice(&chunk);
+        offset = structured
+            .get("nextOffset")
+            .and_then(Value::as_u64)
+            .expect("missing nextOffset");
+        if structured.get("eof").and_then(Value::as_bool) == Some(true) {
+            break;
+        }
+    }
+
+    assert_eq!(offset, payload.len() as u64);
+    assert_eq!(rebuilt, payload);
     std::fs::remove_dir_all(workspace_root).ok();
 }

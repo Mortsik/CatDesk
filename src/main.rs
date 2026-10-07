@@ -22,6 +22,8 @@ mod process_runner;
 mod project_scope;
 mod request_lifecycle;
 mod request_workers;
+// The write-side store API is intentionally staged for the response externalization beads.
+#[allow(dead_code)]
 mod result_store;
 mod server;
 mod session_context;

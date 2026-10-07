@@ -27,6 +27,7 @@ use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::project_scope;
 use crate::request_lifecycle::{RequestStage, TerminalReason};
 use crate::request_workers::{RequestClass, run_timed};
+use crate::result_store::LargeResultStore;
 use crate::session_context::{ProjectStateChange, SessionContextStore};
 use crate::state::{
     AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
@@ -103,6 +104,7 @@ impl ClientSession {
 #[derive(Clone)]
 struct InstructionGate {
     contexts: SessionContextStore,
+    large_results: LargeResultStore,
     remote_connected_desired: Arc<AtomicBool>,
     remote_connected_update_pending: Arc<AtomicBool>,
 }
@@ -111,6 +113,8 @@ impl InstructionGate {
     fn with_anonymous(called: bool) -> Self {
         Self {
             contexts: SessionContextStore::with_anonymous(called),
+            large_results: LargeResultStore::new_default()
+                .expect("create server large-result store"),
             remote_connected_desired: Arc::new(AtomicBool::new(false)),
             remote_connected_update_pending: Arc::new(AtomicBool::new(false)),
         }
@@ -154,6 +158,10 @@ impl InstructionGate {
 
     fn is_called(&self, session: &ClientSession) -> bool {
         self.contexts.instruction_called(session.namespace())
+    }
+
+    fn large_results(&self) -> &LargeResultStore {
+        &self.large_results
     }
 
     fn mark_called(&self, session: &ClientSession) {
@@ -2258,6 +2266,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_mcp_reads_from_the_server_owned_large_result_store() {
+        let workspace_root = unique_temp_path("catdesk-server-result-store-workspace");
+        let config_root = unique_temp_path("catdesk-server-result-store-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            4242,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = channel(crate::state::UI_EVENT_CAPACITY);
+        let gate = InstructionGate::with_anonymous(true);
+        let stored = gate
+            .large_results()
+            .put(
+                None,
+                &workspace_root,
+                b"server-shared-result",
+                Some("text/plain"),
+            )
+            .expect("store result");
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: gate,
+        };
+
+        let response = post_mcp_json_with_show_detail_mode(
+            &server_state,
+            tool_call_body(
+                "read_result",
+                json!({
+                    "result_id": stored.metadata.result_id,
+                    "offset": 0,
+                    "max_bytes": 64
+                }),
+            ),
+            ShowDetailMode::Disable,
+        )
+        .await;
+        let structured = response
+            .get("result")
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured result");
+        assert_eq!(
+            structured.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            structured.get("text").and_then(Value::as_str),
+            Some("server-shared-result")
+        );
+        assert_eq!(structured.get("eof").and_then(Value::as_bool), Some(true));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
     async fn health_remains_responsive_while_app_state_is_locked() {
         let root = unique_temp_path("catdesk-health-busy");
         std::fs::create_dir_all(&root).unwrap();
@@ -3268,6 +3342,24 @@ mod tests {
         ));
         gate.mark_called(&session_a);
         gate.mark_called(&session_b);
+        let result_a = gate
+            .large_results()
+            .put(
+                Some("session-a"),
+                &workspace_root,
+                b"session-a-result",
+                None,
+            )
+            .expect("store session-a result");
+        let result_b = gate
+            .large_results()
+            .put(
+                Some("session-b"),
+                &workspace_root,
+                b"session-b-result",
+                None,
+            )
+            .expect("store session-b result");
 
         let command_jobs = CommandJobManager::new();
         let command = if cfg!(windows) {
@@ -3317,6 +3409,31 @@ mod tests {
         assert_eq!(delete_a.status(), StatusCode::OK);
         assert!(!gate.contains_named_session("session-a"));
         assert!(gate.contains_named_session("session-b"));
+        assert_eq!(
+            gate.large_results()
+                .read_range(
+                    Some("session-a"),
+                    &workspace_root,
+                    &result_a.metadata.result_id,
+                    0,
+                    1,
+                )
+                .expect_err("deleted session result must be evicted"),
+            crate::result_store::StoreError::Evicted
+        );
+        assert_eq!(
+            gate.large_results()
+                .read_range(
+                    Some("session-b"),
+                    &workspace_root,
+                    &result_b.metadata.result_id,
+                    0,
+                    16,
+                )
+                .expect("other session result stays live")
+                .bytes,
+            b"session-b-result"
+        );
 
         let a_terminal = loop {
             let snapshot = command_jobs
@@ -4665,6 +4782,7 @@ async fn post_mcp_inner(
         &s.command_jobs,
         &s.devtools,
         show_detail_mode,
+        s.catdesk_instruction_called.large_results(),
         client_session.namespace(),
         active_project.as_deref(),
     )
@@ -4852,6 +4970,10 @@ async fn delete_mcp(State(s): State<ServerState>, headers: HeaderMap) -> Respons
     } else {
         0
     };
+    let evicted_results = s
+        .catdesk_instruction_called
+        .large_results()
+        .remove_session(client_session.namespace());
     s.catdesk_instruction_called.forget(&client_session);
     let should_disconnect =
         client_session.namespace().is_none() || !s.catdesk_instruction_called.has_named_sessions();
@@ -4868,7 +4990,7 @@ async fn delete_mcp(State(s): State<ServerState>, headers: HeaderMap) -> Respons
     let _ = s.ui_events.try_send(ServerUiEvent::Log {
         level: "INFO",
         message: format!(
-            "DELETE mcp endpoint: session reset; signalled {cancelled_jobs} command job(s)"
+            "DELETE mcp endpoint: session reset; signalled {cancelled_jobs} command job(s); evicted {evicted_results} large result(s)"
         ),
     });
     Response::builder()
