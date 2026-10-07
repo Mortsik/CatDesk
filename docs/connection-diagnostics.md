@@ -133,10 +133,15 @@ and `http_finished` entries by generated `request_id`:
 - No matching HTTP record: the request may have failed upstream, but missing
   records alone are not proof (check writer warnings, restarts and dropped records).
 
-The ngrok SDK may reconnect internally without completing its forwarder task;
-these transient reconnects are not captured by the lifecycle events. To identify
-an upstream ngrok error, retain its HTTP response body or `ngrok-error-code`
-header at the time of failure. Never publish the secret connector URL.
+The ngrok SDK reconnects its session internally after transport failures,
+rebinding the same tunnel without ending the forwarder task. CatDesk watches
+the ngrok-assigned session identity and records `tunnel_session_renewed` when
+the SDK re-establishes the session (detected within a 5-second poll window;
+several renewals inside one window collapse into a single record). A reconnect
+that gives up surfaces as `tunnel_failed`, followed by the supervisor's
+`tunnel_reconnect_*` records. To identify an upstream ngrok error, retain its
+HTTP response body or `ngrok-error-code` header at the time of failure. Never
+publish the secret connector URL.
 
 Use `tail -n 100 ~/.catdesk/logs/connections.jsonl` to inspect recent activity.
 New logging starts only after restarting CatDesk with the updated binary.
