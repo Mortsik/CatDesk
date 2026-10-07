@@ -64,6 +64,53 @@ mod tests {
     }
 
     #[test]
+    fn request_metadata_whitelist_stays_in_sync_with_perf_metrics_tool_slots() {
+        // Direction 1: every perf-metrics tool slot (except the trailing
+        // "other") must survive the diagnostics whitelist; otherwise the tool
+        // is silently counted as "other" in the connection log.
+        for name in &crate::perf_metrics::TOOLS[..crate::perf_metrics::TOOL_OTHER] {
+            let metadata = request_metadata(&json!({
+                "method": "tools/call",
+                "params": {"name": name}
+            }));
+            assert_eq!(
+                metadata["rpc_tool"],
+                json!(name),
+                "perf-metrics tool slot {name:?} is redacted to \"other\" by the \
+                 request_metadata whitelist; add it to RPC_TOOL_WHITELIST in \
+                 src/diagnostics.rs so diagnostics and perf metrics agree"
+            );
+        }
+
+        // Direction 2: every whitelisted name must own a real perf-metrics
+        // slot; otherwise diagnostics records a name perf metrics counts as
+        // "other".
+        for name in RPC_TOOL_WHITELIST {
+            let slot = crate::perf_metrics::tool_index(Some(name));
+            assert_ne!(
+                slot,
+                crate::perf_metrics::TOOL_OTHER,
+                "request_metadata whitelists {name:?} but perf_metrics::TOOLS has \
+                 no slot for it; add it to TOOLS in src/perf_metrics.rs"
+            );
+            assert_eq!(
+                crate::perf_metrics::tool_name(slot),
+                name,
+                "whitelisted tool {name:?} resolves to a perf-metrics slot whose \
+                 canonical name differs"
+            );
+        }
+
+        // Load-bearing slot indices other code and exported metrics rely on.
+        assert_eq!(crate::perf_metrics::TOOLS[5], "read");
+        assert_eq!(crate::perf_metrics::TOOLS[11], "create_handoff");
+        assert_eq!(
+            crate::perf_metrics::TOOLS[crate::perf_metrics::TOOL_OTHER],
+            "other"
+        );
+    }
+
+    #[test]
     fn request_metadata_records_only_safe_requested_timing_values() {
         let poll = request_metadata(&json!({
             "method": "tools/call",
@@ -1494,6 +1541,28 @@ pub(crate) fn process_started_record() -> Value {
     })
 }
 
+/// Tool names `request_metadata` may persist; only known local tool names
+/// are safe because browser/custom names are client input. Must stay in sync
+/// with `perf_metrics::TOOLS` (minus its trailing "other" slot) — enforced by
+/// `request_metadata_whitelist_stays_in_sync_with_perf_metrics_tool_slots`,
+/// not by this comment.
+const RPC_TOOL_WHITELIST: [&str; 14] = [
+    "catdesk_instruction",
+    "run_command",
+    "start_command",
+    "poll_command",
+    "cancel_command",
+    "read",
+    "read_image",
+    "search",
+    "write",
+    "edit",
+    "delete",
+    "create_handoff",
+    "read_result",
+    "search_result",
+];
+
 fn request_metadata(body: &Value) -> Value {
     let method = match body.get("method").and_then(Value::as_str) {
         Some(
@@ -1515,28 +1584,12 @@ fn request_metadata(body: &Value) -> Value {
     };
     let mut metadata = json!({"rpc_method": method});
     if method == "tools/call" {
-        // Only known local tool names are safe: browser/custom names are input.
         let tool = match body
             .get("params")
             .and_then(|p| p.get("name"))
             .and_then(Value::as_str)
         {
-            Some(
-                name @ ("catdesk_instruction"
-                | "run_command"
-                | "start_command"
-                | "poll_command"
-                | "cancel_command"
-                | "read"
-                | "read_image"
-                | "search"
-                | "write"
-                | "edit"
-                | "delete"
-                | "create_handoff"
-                | "read_result"
-                | "search_result"),
-            ) => name,
+            Some(name) if RPC_TOOL_WHITELIST.contains(&name) => name,
             _ => "other",
         };
         metadata["rpc_tool"] = json!(tool);

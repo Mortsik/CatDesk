@@ -51,8 +51,10 @@ const WINDOW_MS: u64 = BUCKET_MS * WINDOW_BUCKETS as u64;
 
 /// Tool counters mirror the `request_metadata` whitelist plus "other". The
 /// result-retrieval tools have their own slots so byte accounting can report
-/// retrieval success separately (see `tool_result_metrics`).
-const TOOLS: [&str; TOOL_COUNT] = [
+/// retrieval success separately (see `tool_result_metrics`). The sync with
+/// the whitelist is enforced by a test, not by this comment
+/// (`request_metadata_whitelist_stays_in_sync_with_perf_metrics_tool_slots`).
+pub(crate) const TOOLS: [&str; TOOL_COUNT] = [
     "catdesk_instruction",
     "run_command",
     "start_command",
@@ -70,7 +72,7 @@ const TOOLS: [&str; TOOL_COUNT] = [
     "other",
 ];
 pub(crate) const TOOL_COUNT: usize = 15;
-const TOOL_OTHER: usize = TOOL_COUNT - 1;
+pub(crate) const TOOL_OTHER: usize = TOOL_COUNT - 1;
 
 const ELAPSED_SAMPLES: usize = 32;
 const STAGE_SAMPLES: usize = 16;
