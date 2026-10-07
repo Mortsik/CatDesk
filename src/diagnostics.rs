@@ -475,52 +475,63 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A held `connections.lock` must be retried: a writer that releases the
-    /// lock within the retry budget is acquired instead of failing, which is
-    /// the flake resistance this helper exists for.
+    /// A holder that releases inside the retry budget must be acquired — the
+    /// flake resistance this helper exists for. The holder thread owns the
+    /// lock file through a blocking rendezvous before the retry starts (so
+    /// the release provably happens while `try_lock_bounded` is running, not
+    /// before it), and the holding window spans the first retry delay so the
+    /// acquisition comes from the retry loop rather than a lucky first
+    /// attempt. No wall-clock assertion: correctness follows from the
+    /// rendezvous, not from timing.
     #[test]
     fn held_log_lock_is_acquired_once_the_holder_releases() {
         let root =
             std::env::temp_dir().join(format!("catdesk-lock-retry-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
+        let (handover, handover_rx) = mpsc::sync_channel::<File>(0);
+        let (released, released_rx) = mpsc::sync_channel::<()>(0);
+        let holder = std::thread::spawn(move || {
+            let held = handover_rx
+                .recv()
+                .expect("handover must deliver the lock file");
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+            released.send(()).expect("release ack must be received");
+        });
         let lock = private_file(&root.join("connections.lock")).unwrap();
         lock.try_lock()
-            .expect("the first holder must take the lock");
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            drop(lock);
-        });
+            .expect("the test must take the lock before the handover");
+        // Rendezvous channel of capacity zero: when send returns, the holder
+        // thread has received — and therefore owns and still holds — the lock.
+        handover.send(lock).unwrap();
 
-        let started = Instant::now();
         let retry_lock = private_file(&root.join("connections.lock")).unwrap();
         try_lock_bounded(
             &retry_lock,
             LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(LOCK_RETRY_DELAY_MS),
         )
-        .expect("a released lock must be acquired within the retry budget");
-        assert!(
-            started.elapsed() >= Duration::from_millis(50),
-            "the acquisition must have waited for the holder, not raced it"
-        );
-        releaser.join().unwrap();
+        .expect("a lock released inside the retry budget must be acquired");
+        released_rx
+            .recv()
+            .expect("the holder must confirm the release");
+        holder.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A holder that outlasts the retry budget still fails the open, keeping
     /// the `WouldBlock` failure shape (and `Diagnostics::start`'s concurrent
-    /// slot fallback) exactly as before the retry existed.
+    /// slot fallback) exactly as before the retry existed. The test thread
+    /// itself holds the lock for the whole call, so the exhausted budget is
+    /// deterministic regardless of scheduler timing; the lower elapsed bound
+    /// is the protocol's own retry delay between the two attempts.
     #[test]
     fn held_log_lock_still_fails_after_the_retry_budget() {
         let root =
             std::env::temp_dir().join(format!("catdesk-lock-budget-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let lock = private_file(&root.join("connections.lock")).unwrap();
-        lock.try_lock().expect("the holder must take the lock");
-        let holder = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(250));
-            drop(lock);
-        });
+        let held = private_file(&root.join("connections.lock")).unwrap();
+        held.try_lock().expect("the test thread must take the lock");
 
         let started = Instant::now();
         let retry_lock = private_file(&root.join("connections.lock")).unwrap();
@@ -528,13 +539,13 @@ mod tests {
             .expect_err("an outlasted budget must fail");
         assert!(
             started.elapsed() >= Duration::from_millis(10),
-            "the retry delay must have run before giving up"
+            "the protocol's delay between both attempts must have run"
         );
         assert!(
             format!("{error:?}").contains("WouldBlock"),
             "the exhausted budget must keep the WouldBlock failure shape: {error:?}"
         );
-        holder.join().unwrap();
+        drop(held);
         std::fs::remove_dir_all(root).unwrap();
     }
 
