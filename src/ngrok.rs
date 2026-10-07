@@ -32,11 +32,19 @@ fn reconnect_jitter_seed(attempt: u32) -> u64 {
 /// connection; with the default connector it retries reconnects indefinitely
 /// until the session is canceled. Reconnect attempts record
 /// `tunnel_session_reconnect_attempt`, and a re-established transport records
-/// `tunnel_session_renewed` (the SDK rebinds the tunnel on top of it). The
-/// initial connect stays silent — the supervisor's own `tunnel_starting`
-/// already covers it. The delegate does the actual transport, so production
-/// wires `ngrok::session::default_connect` and connection behavior is
-/// unchanged; tests wire a recording fake.
+/// `tunnel_transport_reconnected`. The initial connect stays silent — the
+/// supervisor's own `tunnel_starting` already covers it.
+///
+/// The success event deliberately claims only the transport dial. After
+/// `Connector::connect` returns, the SDK still has to authenticate
+/// (`RawSession::start`) and rebind the tunnels (`ConnectError::Rebind`); if
+/// any of that fails it loops into another dial, which shows up as another
+/// `tunnel_session_reconnect_attempt`. ngrok's public API exposes no
+/// observation point for the completed reconnect (the session id only changes
+/// after the internal store, readable only by polling), so no event claims a
+/// fully renewed session or tunnel. The delegate does the actual transport,
+/// so production wires `ngrok::session::default_connect` and connection
+/// behavior is unchanged; tests wire a recording fake.
 async fn connect_with_reconnect_evidence<D, E>(
     delegate: D,
     on_evidence: E,
@@ -55,7 +63,7 @@ where
     }
     let stream = delegate.connect(host, port, tls_config, error).await?;
     if was_reconnect {
-        on_evidence("tunnel_session_renewed");
+        on_evidence("tunnel_transport_reconnected");
     }
     Ok(stream)
 }
@@ -197,8 +205,8 @@ pub async fn start(state: SharedState) -> Result<(), String> {
 
             // While the forwarder lives, SDK-internal reconnects are already
             // visible: the connector hook installed on the session builder
-            // reports every attempt and every re-established transport as
-            // tunnel_session_* events (see connect_with_reconnect_evidence).
+            // reports every redial and every re-established transport as
+            // tunnel_* events (see connect_with_reconnect_evidence).
             let result = forwarder.join().await;
             crate::diagnostics::event(match &result {
                 Ok(Ok(())) => "tunnel_stopped",
@@ -347,7 +355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_reconnect_reports_attempt_then_renewal() {
+    async fn successful_reconnect_reports_attempt_then_transport_reconnected() {
         let calls: DelegateCalls = Arc::new(Mutex::new(Vec::new()));
         let evidence: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = {
@@ -365,11 +373,17 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "the renewed transport must pass through");
+        assert!(
+            result.is_ok(),
+            "the reconnected transport must pass through"
+        );
         assert_eq!(
             *evidence.lock().unwrap(),
-            vec!["tunnel_session_reconnect_attempt", "tunnel_session_renewed"],
-            "a re-established transport must leave both traces"
+            vec![
+                "tunnel_session_reconnect_attempt",
+                "tunnel_transport_reconnected"
+            ],
+            "a re-established transport must leave exactly these two traces"
         );
         assert_eq!(
             *calls.lock().unwrap(),
@@ -378,8 +392,68 @@ mod tests {
         );
     }
 
+    /// After a successful dial the SDK still authenticates and rebinds the
+    /// tunnels; the wrapper cannot observe those steps, so it must never claim
+    /// a renewed session or tunnel. This test drives the
+    /// "connector Ok, later setup/rebind Err" shape the SDK produces in that
+    /// case: the failed setup shows up only as the next redial attempt, and
+    /// the recorded evidence never contains a renewal claim (the exact-match
+    /// assertion above fails if one is ever added).
     #[tokio::test]
-    async fn failed_reconnect_reports_the_attempt_without_renewal() {
+    async fn transport_success_followed_by_setup_failure_leaves_no_renewal_claim() {
+        let calls: DelegateCalls = Arc::new(Mutex::new(Vec::new()));
+        let evidence: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = {
+            let evidence = evidence.clone();
+            move |name: &'static str| evidence.lock().unwrap().push(name)
+        };
+
+        // First dial: transport succeeds (auth/rebind afterwards are invisible
+        // to the wrapper). Second dial: the SDK redials after the setup
+        // failure and this time the transport itself fails.
+        let first = connect_with_reconnect_evidence(
+            succeeding_delegate(calls.clone()),
+            recorder.clone(),
+            "connect.ngrok.com".to_string(),
+            443,
+            test_tls_config(),
+            reconnect_cause(),
+        )
+        .await;
+        let second = connect_with_reconnect_evidence(
+            failing_delegate(calls.clone()),
+            recorder,
+            "connect.ngrok.com".to_string(),
+            443,
+            test_tls_config(),
+            reconnect_cause(),
+        )
+        .await;
+
+        assert!(first.is_ok(), "the first transport dial must succeed");
+        assert!(second.is_err(), "the retry dial must fail");
+        assert_eq!(
+            *evidence.lock().unwrap(),
+            vec![
+                "tunnel_session_reconnect_attempt",
+                "tunnel_transport_reconnected",
+                "tunnel_session_reconnect_attempt",
+            ],
+            "a failed setup must only surface as the next redial attempt, with \
+             no session or tunnel renewal claim anywhere"
+        );
+        assert!(
+            !evidence
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|name| name.contains("renewed")),
+            "no event may claim a renewed session or tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reconnect_reports_the_attempt_without_transport_claim() {
         let calls: DelegateCalls = Arc::new(Mutex::new(Vec::new()));
         let evidence: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = {
@@ -404,7 +478,7 @@ mod tests {
         assert_eq!(
             *evidence.lock().unwrap(),
             vec!["tunnel_session_reconnect_attempt"],
-            "a failed dial must not claim renewal"
+            "a failed dial must not claim a reconnected transport"
         );
         assert_eq!(
             *calls.lock().unwrap(),
