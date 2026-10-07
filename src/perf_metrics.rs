@@ -49,7 +49,9 @@ const WINDOW_BUCKETS: usize = 15;
 const BUCKET_MS: u64 = 60_000;
 const WINDOW_MS: u64 = BUCKET_MS * WINDOW_BUCKETS as u64;
 
-/// Tool counters mirror the `request_metadata` whitelist plus "other".
+/// Tool counters mirror the `request_metadata` whitelist plus "other". The
+/// result-retrieval tools have their own slots so byte accounting can report
+/// retrieval success separately (see `tool_result_metrics`).
 const TOOLS: [&str; TOOL_COUNT] = [
     "catdesk_instruction",
     "run_command",
@@ -63,9 +65,11 @@ const TOOLS: [&str; TOOL_COUNT] = [
     "edit",
     "delete",
     "create_handoff",
+    "read_result",
+    "search_result",
     "other",
 ];
-const TOOL_COUNT: usize = 13;
+pub(crate) const TOOL_COUNT: usize = 15;
 const TOOL_OTHER: usize = TOOL_COUNT - 1;
 
 const ELAPSED_SAMPLES: usize = 32;
@@ -416,6 +420,12 @@ pub(crate) fn observe_at(now_ms: u64, observation: &Observation) {
 pub(crate) fn tool_index(name: Option<&str>) -> usize {
     name.and_then(|name| TOOLS.iter().position(|tool| *tool == name))
         .unwrap_or(TOOL_OTHER)
+}
+
+/// Canonical name for a tool slot; out-of-range slots read as "other", so a
+/// numeric slot can never surface caller-controlled text.
+pub(crate) fn tool_name(slot: usize) -> &'static str {
+    TOOLS.get(slot).copied().unwrap_or(TOOLS[TOOL_OTHER])
 }
 
 /// Bump the fixed counter for one tool invocation (no latency reservoirs).
@@ -1000,8 +1010,13 @@ mod tests {
     fn tool_counters_track_whitelist_and_other() {
         assert_eq!(tool_index(Some("read")), 5);
         assert_eq!(tool_index(Some("create_handoff")), 11);
+        assert_eq!(tool_index(Some("read_result")), 12);
+        assert_eq!(tool_index(Some("search_result")), 13);
         assert_eq!(tool_index(Some("mystery-tool")), TOOL_OTHER);
         assert_eq!(tool_index(None), TOOL_OTHER);
+        assert_eq!(tool_name(12), "read_result");
+        assert_eq!(tool_name(TOOL_OTHER), "other");
+        assert_eq!(tool_name(TOOL_COUNT), "other", "out-of-range stays safe");
 
         let before = snapshot().tools[5].count;
         observe_tool(5, 64, false, false);

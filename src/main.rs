@@ -30,6 +30,7 @@ mod session_context;
 mod startup;
 mod state;
 mod theme;
+mod tool_result_metrics;
 mod tui;
 
 mod usage_persistence;
