@@ -1722,6 +1722,22 @@ mod tests {
     }
 
     #[test]
+    fn request_failure_deadline_maps_to_the_worker_timeout_event() {
+        use crate::request_workers::RequestFailure;
+        // The deadline arm is the diagnostics pairing the soak correlates with
+        // `deadline_timeout` finishes; the HTTP e2e test proves the failure
+        // fires, this pins the separate event-name mapping itself.
+        assert_eq!(
+            request_failure_event(&RequestFailure::Deadline),
+            "request_worker_timeout"
+        );
+        assert_eq!(
+            request_failure_event(&RequestFailure::Failed),
+            "request_worker_failed"
+        );
+    }
+
+    #[test]
     fn client_session_falls_back_to_openai_session_metadata() {
         fn body_with_openai_session(session_id: &str) -> Value {
             let bytes = tool_call_body("read", json!({ "paths": ["x"] }));

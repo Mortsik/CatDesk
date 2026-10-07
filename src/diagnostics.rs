@@ -1025,13 +1025,17 @@ mod tests {
             .expect("tool call request must complete")
     }
 
-    /// The 120-second response deadline of a real HTTP `tools/call` (the
-    /// production shape is `run_command {"sleep 121"}`) must surface as a 504
-    /// with a JSON-RPC error and exactly one `http_finished` record whose
-    /// `terminal_reason` is `deadline_timeout`, paired with one
-    /// `request_worker_timeout` event. The soak-only deadline override
-    /// shortens only the deadline value, so the suite stays fast; the
-    /// pipeline under test is the production one end to end.
+    /// A real HTTP `tools/call` that runs past its response deadline must
+    /// surface as a 504 with a JSON-RPC error and exactly one `http_finished`
+    /// record whose `terminal_reason` is `deadline_timeout`, paired with one
+    /// `request_worker_timeout` event. This test exercises the deadline
+    /// BRANCH with the soak-only shortened override (the suite must stay
+    /// fast); the production 120-second deadline value itself is pinned
+    /// separately by `request_deadlines_never_exceed_mcp_http_ceiling` in
+    /// `src/server.rs` — a literal near-ceiling probe would also race
+    /// `run_command`'s own 30 s default / 120 s max command timeout, so the
+    /// branch is deliberately tested short. The pipeline under test is the
+    /// production one end to end.
     #[tokio::test]
     async fn deadline_timeout_is_recorded_through_real_http() {
         let root =
