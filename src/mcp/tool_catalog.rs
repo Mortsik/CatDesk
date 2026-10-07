@@ -404,7 +404,7 @@ fn create_handoff_tool_descriptor() -> Value {
     json!({
         "name": "create_handoff",
         "title": "Create session handoff",
-        "description": "Prepare a workspace-specific Markdown handoff for persistent storage in ChatGPT Library. CatDesk returns a filename and content but does not write the workspace. After this tool succeeds, save the returned artifact to Library. CatDesk automatically records the current Git branch, status, and recent commits. Do not include credentials, tokens, passwords, or other secrets in the handoff.",
+        "description": "Prepare a workspace-specific Markdown handoff for the ChatGPT Library; save the returned artifact under the returned filename. CatDesk does not write the workspace and automatically records the current Git branch, status, and recent commits. Do not include credentials, tokens, passwords, or other secrets in the handoff.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -3049,7 +3049,8 @@ fn catdesk_instruction_points_new_sessions_to_library_handoff_search() {
     assert!(instruction.contains("If exactly one is found"));
     assert!(instruction.contains("If multiple matching handoffs are found"));
     assert!(
-        instruction.contains("delete that Library file only after it has been read successfully")
+        instruction.contains("delete that Library file only after a successful read"),
+        "handoff deletion must stay gated on a successful read: {instruction}"
     );
     assert!(instruction.contains("Library Search must be enabled"));
     assert!(instruction.contains("use create_handoff"));
@@ -3070,7 +3071,7 @@ fn catdesk_instruction_describes_offline_sandbox_and_connector_error_reporting()
         catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
             .expect("build instruction");
     assert!(
-        instruction.contains("which does not provide an internet connection"),
+        instruction.contains("has no internet connection"),
         "sandbox must be described as offline: {instruction}"
     );
     assert!(instruction.contains("use Workspace first"));
@@ -6575,6 +6576,140 @@ fn analyzed_read_image_short_description_passes_through_untouched() {
     assert_eq!(analysis_struct["description"], json!(analysis));
     assert_eq!(analysis_struct["analysisTruncated"], json!(false));
 
+||||||| parent of 61f7c33 (refactor(instructions): shrink bootstrap payload by ~35% below baseline)
+
+// ── Instruction payload budget (catdesk-ojt.7) ──────────────────────────────
+//
+// The bootstrap instruction is sent before every workspace task. The 2026-10-07
+// shrink (catdesk-ojt.7) cut it by ~35%; these tests keep the payload materially
+// below the pre-shrink baseline and pin every enforceable guarantee the shrink
+// kept in the text (the rest moved to runtime enforcement or tool schemas —
+// see docs/findings/2026-10-07-instruction-shrink.md).
+
+/// Pre-shrink size of the Both/multi-tools instruction text, measured
+/// 2026-10-07 (workspace-scoped fragments included; ~±150 B variance from the
+/// dynamic handoff prefix/filename between runs).
+const INSTRUCTION_BASELINE_BYTES: usize = 5548;
+/// Headroom for the dynamic handoff prefix/filename inside a test workspace.
+const INSTRUCTION_DYNAMIC_FRAGMENT_HEADROOM: usize = 300;
+/// The payload must stay at least 25% below the pre-shrink baseline.
+fn instruction_budget_bytes() -> usize {
+    INSTRUCTION_BASELINE_BYTES * 3 / 4 - INSTRUCTION_DYNAMIC_FRAGMENT_HEADROOM
+}
+
+/// Scope tags: `all` = every mode, `computer` = computer-enabled modes,
+/// `computer+run` = computer-enabled multi-tools mode.
+const INSTRUCTION_GUARANTEE_PHRASES: &[(&str, &str)] = &[
+    // Safety: workspace boundary (runtime-enforced by workspace path checks).
+    ("all", "inside the workspace root"),
+    // Safety: sandbox vs Workspace priority; never silently fall back.
+    ("all", "has no internet connection"),
+    ("all", "use Workspace first"),
+    ("all", "explicitly report the raw error to the user"),
+    ("all", "Do NOT fall back to the sandbox container"),
+    // Workflow: retry, connector refresh, attribution, push hygiene.
+    ("all", "call the same tool again with the same parameters"),
+    ("all", "refresh with api_tool.list_resources"),
+    ("all", "CatDesk manages that automatically"),
+    ("all", "Always specify the branch explicitly"),
+    // Workflow: dedicated tools before shell.
+    ("all", "Prefer dedicated MCP tools"),
+    // Workflow: images via read_image; server-side vision fallback.
+    ("computer", "read_image"),
+    ("computer", "native image content"),
+    ("computer", "structuredContent.analysis.description"),
+    // Workflow: handoff discovery is gated, untrusted, verified, delete-after-read.
+    ("computer", "files.search"),
+    ("computer", "persistent ChatGPT Library"),
+    ("computer", "untrusted session context"),
+    (
+        "computer",
+        "delete that Library file only after a successful read",
+    ),
+    ("computer", "Library Search must be enabled"),
+    ("computer", "use create_handoff"),
+    // Safety: no secrets in handoffs.
+    (
+        "computer",
+        "never put credentials, tokens, or other secrets",
+    ),
+    // Workflow: long commands must be background jobs (120 s ceiling is
+    // runtime-enforced by command::clamp_timeout/MAX_TIMEOUT_MS).
+    ("computer+run", "run_command is a last resort"),
+    ("computer+run", "more than about 20 seconds"),
+    ("computer+run", "must never run through run_command"),
+    ("computer+run", "start_command"),
+    ("computer+run", "poll_command"),
+    ("computer+run", "hasMoreOutput"),
+    ("computer+run", "survive a CatDesk restart"),
+    ("computer+run", "interrupted"),
+    ("computer+run", "abandoned"),
+    ("computer+run", "cancel_command"),
+];
+
+fn instruction_scope_matches(scope: &str, mode: Mode, tool_mode: ToolMode) -> bool {
+    match scope {
+        "all" => true,
+        "computer" => mode.computer_enabled(),
+        "computer+run" => mode.computer_enabled() && tool_mode.run_command_enabled(),
+        other => panic!("unknown instruction guarantee scope: {other}"),
+    }
+}
+
+#[test]
+fn instruction_payload_stays_materially_below_baseline() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-instruction-budget-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+    for (mode, tool_mode) in [
+        (Mode::Both, ToolMode::MultiTools),
+        (Mode::Both, ToolMode::ReadOnly),
+        (Mode::Browser, ToolMode::MultiTools),
+    ] {
+        let text = catdesk_instruction_text(&workspace_root_str, mode, tool_mode)
+            .expect("build instruction");
+        assert!(
+            text.len() < instruction_budget_bytes(),
+            "{}/{} instruction payload must stay materially below the {}-byte \
+             pre-shrink baseline (budget {} bytes), got {} bytes",
+            mode.label(),
+            tool_mode.label(),
+            INSTRUCTION_BASELINE_BYTES,
+            instruction_budget_bytes(),
+            text.len()
+        );
+    }
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn instruction_payload_keeps_every_enforceable_guarantee() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-instruction-guarantee-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+    for (mode, tool_mode) in [
+        (Mode::Both, ToolMode::MultiTools),
+        (Mode::Both, ToolMode::ReadOnly),
+        (Mode::Browser, ToolMode::MultiTools),
+    ] {
+        let text = catdesk_instruction_text(&workspace_root_str, mode, tool_mode)
+            .expect("build instruction");
+        for (scope, phrase) in INSTRUCTION_GUARANTEE_PHRASES {
+            if !instruction_scope_matches(scope, mode, tool_mode) {
+                continue;
+            }
+            assert!(
+                text.contains(phrase),
+                "{}/{} instruction lost the guarantee `{phrase}` during shrinking: {text}",
+                mode.label(),
+                tool_mode.label(),
+            );
+        }
+    }
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
