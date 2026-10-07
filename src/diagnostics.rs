@@ -1660,7 +1660,9 @@ const RPC_TOOL_WHITELIST: [&str; 14] = [
     "search_result",
 ];
 
-fn request_metadata(body: &Value) -> Value {
+pub(crate) fn request_metadata(body: &Value) -> Value {
+||||||| parent of f18b298 (feat(tui): warn on consecutive identical 504s per tool)
+pub(crate) fn request_metadata(body: &Value) -> Value {
     let method = match body.get("method").and_then(Value::as_str) {
         Some(
             method @ ("initialize"

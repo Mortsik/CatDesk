@@ -26,7 +26,7 @@ use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::project_scope;
 use crate::request_lifecycle::{RequestStage, TerminalReason};
-use crate::request_workers::{RequestClass, run_timed};
+use crate::request_workers::{RequestClass, RequestDeadlineStage, run_timed};
 use crate::result_store::LargeResultStore;
 use crate::session_context::{ProjectStateChange, SessionContextStore};
 use crate::state::{
@@ -540,6 +540,20 @@ fn request_tool_name(req: &Value) -> Option<String> {
         .and_then(|v| v.get("name"))
         .and_then(Value::as_str)
         .map(|s| s.to_string())
+}
+
+/// Telemetry-safe tool identity for a tools/call body: the diagnostics
+/// allowlist keeps known local tool names and buckets everything else to
+/// `other`, so raw client input (browser/custom names) never reaches UI
+/// telemetry. Returns `None` for non-tools/call requests.
+fn tool_call_telemetry_name(body: Option<&Value>) -> Option<String> {
+    let body = body?;
+    if body.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let metadata = crate::diagnostics::request_metadata(body);
+    let tool = metadata.get("rpc_tool").and_then(Value::as_str)?;
+    Some(tool.to_string())
 }
 
 fn request_tool_arguments(req: &Value) -> Option<&serde_json::Map<String, Value>> {
@@ -4620,6 +4634,9 @@ async fn post_mcp_http(
     let deadline = response_deadline_override
         .map(|Extension(deadline)| deadline)
         .unwrap_or_else(|| request_deadline(class));
+    // Telemetry-only outcome feed for the UI streak counter; `s` moves into
+    // the timed request, so clone the sender up front.
+    let ui_events = s.ui_events.clone();
     match run_timed(
         async move { post_mcp_inner(State(s), body_bytes, &headers, None).await },
         deadline,
@@ -4629,6 +4646,13 @@ async fn post_mcp_http(
     {
         Ok(result) => {
             crate::diagnostics::set_current_request_stage(RequestStage::Responding);
+            // Any answer inside the deadline ends the tool's 504 streak.
+            if let Some(tool) = tool_call_telemetry_name(metadata.as_ref()) {
+                let _ = ui_events.try_send(ServerUiEvent::RecordToolCallOutcome {
+                    tool,
+                    gateway_timeout_reason: None,
+                });
+            }
             let mut response = result.value;
             response
                 .extensions_mut()
@@ -4651,6 +4675,22 @@ async fn post_mcp_http(
                     TerminalReason::WorkerFailed,
                 ),
             };
+            // Telemetry: a 504 feeds the per-tool streak with its failure
+            // class (`deadline_timeout@<stage>`); any other failure resets it.
+            let gateway_timeout_reason =
+                (status == StatusCode::GATEWAY_TIMEOUT).then(|| {
+                    match error.timing.deadline_stage {
+                        Some(RequestDeadlineStage::Queue) => "deadline_timeout@queue",
+                        Some(RequestDeadlineStage::Execution) => "deadline_timeout@execution",
+                        None => "deadline_timeout",
+                    }
+                });
+            if let Some(tool) = tool_call_telemetry_name(metadata.as_ref()) {
+                let _ = ui_events.try_send(ServerUiEvent::RecordToolCallOutcome {
+                    tool,
+                    gateway_timeout_reason,
+                });
+            }
             crate::diagnostics::event(request_failure_event(&error.failure));
             let payload = mcp::JsonRpcResponse::error(
                 id,

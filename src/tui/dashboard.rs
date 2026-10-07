@@ -227,18 +227,39 @@ pub(crate) fn draw_ui(
             ),
             Span::styled(active_job_count.to_string(), value_style),
         ]),
-        Line::from(vec![
-            status_label(ui_language.text("REQ SESSION", "工作階段請求")),
-            Span::styled(app.request_count.to_string(), value_style),
-            Span::styled(
-                format!("  {} ", ui_language.text("last call", "最後呼叫")),
-                muted_style,
-            ),
-            Span::styled(
-                format_last_tool_call_elapsed(app.last_tool_call_ms, now_millis),
-                value_style,
-            ),
-        ]),
+        Line::from({
+            // Retry-storm warning: a per-tool streak of consecutive identical
+            // 504s, shown only once the same failure class repeats (>1).
+            let mut spans = vec![
+                status_label(ui_language.text("REQ SESSION", "工作階段請求")),
+                Span::styled(app.request_count.to_string(), value_style),
+                Span::styled(
+                    format!("  {} ", ui_language.text("last call", "最後呼叫")),
+                    muted_style,
+                ),
+                Span::styled(
+                    format_last_tool_call_elapsed(app.last_tool_call_ms, now_millis),
+                    value_style,
+                ),
+            ];
+            if let Some(streak) = app.worst_tool_timeout_streak() {
+                spans.push(Span::raw("      "));
+                spans.push(Span::styled(
+                    format!("504×{} ", streak.count),
+                    Style::default()
+                        .fg(palette.danger_fg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    streak.tool.clone(),
+                    Style::default()
+                        .fg(palette.warning_fg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(format!("@{}", streak.reason), muted_style));
+            }
+            spans
+        }),
         Line::from(vec![
             status_label(ui_language.text("REQ TOTAL", "累計請求")),
             Span::styled(app.total_request_count.to_string(), value_style),

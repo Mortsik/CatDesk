@@ -543,8 +543,25 @@ pub enum FlowDirection {
     Backward, // response: ChatGPT Web -> Your computer
 }
 
+/// Live telemetry for one tool's streak of consecutive identical 504s.
+/// `reason` distinguishes failure classes (`deadline_timeout@execution` vs
+/// `deadline_timeout@queue`), so a streak only grows while every 504 fails
+/// the same way; any other outcome resets the tool's streak.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolTimeoutStreak {
+    pub tool: String,
+    pub reason: &'static str,
+    pub count: u32,
+}
+
 pub enum ServerUiEvent {
     IncrementRequestCount,
+    RecordToolCallOutcome {
+        tool: String,
+        /// `Some(reason)` marks a 504 whose class is `terminal_reason@stage`;
+        /// `None` marks any other outcome and resets the tool's streak.
+        gateway_timeout_reason: Option<&'static str>,
+    },
     RecordBootstrapDiscoverResponse {
         flow_id: String,
         success: bool,
@@ -721,6 +738,10 @@ pub struct AppState {
     /// When the last tool call was observed, for stream-failure correlation:
     /// a stream error long after this is unlikely to be CatDesk's fault.
     pub last_tool_call_ms: Option<u128>,
+    /// Per-tool consecutive identical 504 streaks, fed by
+    /// [`ServerUiEvent::RecordToolCallOutcome`]. Bounded by the number of
+    /// known tool names; session telemetry only, never persisted.
+    pub tool_timeout_streaks: HashMap<String, ToolTimeoutStreak>,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub daily_usage_by_model: DailyUsageByModel,
     pub session_usage_totals: UsageTotals,
@@ -1127,6 +1148,7 @@ impl AppState {
             request_count: 0,
             total_request_count: config.total_request_count,
             last_tool_call_ms: None,
+            tool_timeout_streaks: HashMap::new(),
             usage_by_model: config.usage_by_model,
             daily_usage_by_model: config.daily_usage_by_model,
             session_usage_totals: UsageTotals::default(),
@@ -1343,12 +1365,56 @@ impl AppState {
         self.connected_chat_ids.len()
     }
 
+    /// Fold one tool-call outcome into the streak telemetry. An identical 504
+    /// class grows the streak; a different class restarts it at one; any
+    /// other outcome (success, non-504 failure) clears the tool's entry.
+    pub fn record_tool_call_outcome(
+        &mut self,
+        tool: &str,
+        gateway_timeout_reason: Option<&'static str>,
+    ) {
+        match gateway_timeout_reason {
+            Some(reason) => match self.tool_timeout_streaks.get_mut(tool) {
+                Some(streak) if streak.reason == reason => streak.count += 1,
+                _ => {
+                    self.tool_timeout_streaks.insert(
+                        tool.to_string(),
+                        ToolTimeoutStreak {
+                            tool: tool.to_string(),
+                            reason,
+                            count: 1,
+                        },
+                    );
+                }
+            },
+            None => {
+                self.tool_timeout_streaks.remove(tool);
+            }
+        }
+    }
+
+    /// The longest live consecutive-identical-504 streak, shown once it
+    /// exceeds a single failure. Ties resolve to the lexically first tool so
+    /// the dashboard stays deterministic.
+    pub fn worst_tool_timeout_streak(&self) -> Option<&ToolTimeoutStreak> {
+        self.tool_timeout_streaks
+            .values()
+            .filter(|streak| streak.count > 1)
+            .max_by(|a, b| a.count.cmp(&b.count).then_with(|| b.tool.cmp(&a.tool)))
+    }
+
     pub fn apply_server_ui_event(&mut self, event: ServerUiEvent) {
         match event {
             ServerUiEvent::IncrementRequestCount => {
                 self.request_count = self.request_count.saturating_add(1);
                 self.total_request_count = self.total_request_count.saturating_add(1);
                 self.schedule_usage_persistence();
+            }
+            ServerUiEvent::RecordToolCallOutcome {
+                tool,
+                gateway_timeout_reason,
+            } => {
+                self.record_tool_call_outcome(&tool, gateway_timeout_reason);
             }
             ServerUiEvent::RecordBootstrapDiscoverResponse { flow_id, success } => {
                 self.record_bootstrap_discover_response(&flow_id, success);
