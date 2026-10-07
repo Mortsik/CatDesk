@@ -735,6 +735,49 @@ mod tests {
         (base, log, guard, server)
     }
 
+    /// The same harness as [`spawn_diagnostic_server`], plus the soak-only
+    /// response-deadline override layer (`post_mcp_http` reads the injected
+    /// extension): requests on this router expire at `deadline` instead of
+    /// the production policy. Production routers never install the layer.
+    async fn spawn_deadline_diagnostic_server(
+        root: &std::path::Path,
+        deadline: Duration,
+    ) -> (String, Diagnostics, Guard, tokio::task::JoinHandle<()>) {
+        use crate::{command_jobs::CommandJobManager, state::AppState};
+        use tokio::sync::{Mutex, mpsc::channel};
+        let (log, guard) = Diagnostics::start(&root.join("logs")).unwrap();
+        let state = AppState::new_for_test(
+            0,
+            root.to_string_lossy().into_owned(),
+            root.join("config.toml"),
+        )
+        .unwrap();
+        let (events, _receiver) = channel(crate::state::UI_EVENT_CAPACITY);
+        let app = crate::server::router(
+            Arc::new(Mutex::new(state)),
+            None,
+            CommandJobManager::new(),
+            "/secret-slug/mcp".into(),
+            events,
+        )
+        .layer(axum::middleware::from_fn(
+            move |mut request: Request, next: Next| async move {
+                request.extensions_mut().insert(deadline);
+                next.run(request).await
+            },
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            Some(log.clone()),
+            http_request,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, log, guard, server)
+    }
+
     async fn post_tools_call(
         client: &reqwest::Client,
         base: &str,
@@ -955,6 +998,144 @@ mod tests {
             "the concurrent polls must overlap in the lifecycle registry"
         );
         assert_eq!(log.active.load(Ordering::Relaxed), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Like [`post_tools_call`], but returns the HTTP response so a deadline
+    /// scenario can assert the 504 status before decoding the JSON-RPC body.
+    async fn post_tools_call_raw(
+        client: &reqwest::Client,
+        base: &str,
+        tool: &'static str,
+        arguments: Value,
+    ) -> reqwest::Response {
+        client
+            .post(format!("{base}/secret-slug/mcp"))
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", tool)
+            .json(
+                &json!({"jsonrpc": "2.0", "id": "lifecycle-id", "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments, "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}}}}),
+            )
+            .send()
+            .await
+            .expect("tool call request must complete")
+    }
+
+    /// The 120-second response deadline of a real HTTP `tools/call` (the
+    /// production shape is `run_command {"sleep 121"}`) must surface as a 504
+    /// with a JSON-RPC error and exactly one `http_finished` record whose
+    /// `terminal_reason` is `deadline_timeout`, paired with one
+    /// `request_worker_timeout` event. The soak-only deadline override
+    /// shortens only the deadline value, so the suite stays fast; the
+    /// pipeline under test is the production one end to end.
+    #[tokio::test]
+    async fn deadline_timeout_is_recorded_through_real_http() {
+        let root =
+            std::env::temp_dir().join(format!("catdesk-deadline-http-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Pay the process-global catdesk_instruction warm-up (tokenizer, first
+        // widget build) against a production-deadline router: on the shortened
+        // router below, a cold gate call could exceed the deadline and pollute
+        // the failure budget with its own deadline_timeout record.
+        let (warmup_base, _warmup_guard, _warmup_log, warmup_server) =
+            spawn_diagnostic_server(&root.join("warmup")).await;
+        let warmup_client = reqwest::Client::new();
+        let warmup = post_tools_call(
+            &warmup_client,
+            &warmup_base,
+            "catdesk_instruction",
+            json!({}),
+        )
+        .await;
+        assert!(
+            warmup["result"]["structuredContent"]["errorCode"].is_null(),
+            "the warm-up gate call must succeed: {warmup}"
+        );
+        warmup_server.abort();
+        let _ = warmup_server.await;
+
+        // Deadline far below any production policy value, but wide enough for
+        // the command to reach `Executing` first (soak-proven margin).
+        let (base, log, guard, server) =
+            spawn_deadline_diagnostic_server(&root, Duration::from_millis(1_500)).await;
+        let client = reqwest::Client::new();
+
+        let instruction = post_tools_call(&client, &base, "catdesk_instruction", json!({})).await;
+        assert!(
+            instruction["result"]["structuredContent"]["errorCode"].is_null(),
+            "the gate must open for the anonymous session: {instruction}"
+        );
+
+        let probe =
+            post_tools_call_raw(&client, &base, "run_command", json!({"command": "sleep 2"})).await;
+        assert_eq!(
+            probe.status().as_u16(),
+            504,
+            "work outliving the deadline must answer 504"
+        );
+        let body = probe.json::<Value>().await.expect("deadline body is JSON");
+        assert_eq!(body["error"]["code"], -32000);
+
+        // The lifecycle registry is updated synchronously on completion.
+        assert_eq!(log.active.load(Ordering::Relaxed), 0);
+        server.abort();
+        let _ = server.await;
+        drop(guard); // waits for every accepted record to reach disk
+
+        let records: Vec<Value> = std::fs::read_to_string(root.join("logs/connections.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let timeouts: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record["event"] == "http_finished"
+                    && record["terminal_reason"] == "deadline_timeout"
+            })
+            .collect();
+        assert_eq!(
+            timeouts.len(),
+            1,
+            "exactly the run_command probe may time out (saw {} finished records)",
+            records.len()
+        );
+        assert_eq!(timeouts[0]["status"], 504);
+        assert_eq!(timeouts[0]["rpc_error_code"], -32000);
+        assert_eq!(timeouts[0]["stage"], "completed");
+        assert_eq!(timeouts[0]["scheduler_class"], "process");
+        assert_eq!(
+            timeouts[0]["scheduler_deadline_stage"], "execution",
+            "the command must have started before the deadline expired"
+        );
+        assert!(
+            timeouts[0]["elapsed_ms"].as_u64().unwrap() >= 1_400,
+            "the finish must come from the shortened deadline, not a fast failure"
+        );
+        // The tool identity lives on the correlated request record, so the
+        // timed-out finish is proven to belong to the run_command probe.
+        let probe_request = records
+            .iter()
+            .find(|record| {
+                record["event"] == "mcp_request"
+                    && record["request_id"] == timeouts[0]["request_id"]
+            })
+            .expect("the timed-out request must have an mcp_request record");
+        assert_eq!(probe_request["rpc_tool"], "run_command");
+
+        // The paired `request_worker_timeout` failure event is emitted through
+        // the process-global diagnostics feed (`diagnostics::event`), which
+        // test harnesses deliberately never install (see [`Diagnostics::start`]
+        // and the soak deadline scenario, which hits the same boundary). The
+        // 504 + `deadline_timeout` classification above proves the same
+        // `RequestFailure::Deadline` that drives that event fired on a real
+        // connection.
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }
