@@ -1673,14 +1673,14 @@ mod tests {
         std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755))
             .expect("chmod systemd-run stub");
 
-        let _env = EnvGuards::set_many(&[
-            ("PATH", bin.as_path()),
-            ("CATDESK_SANDBOX_MEMORY", Path::new("on")),
-        ]);
+        // No PATH rewrite: the stub is passed by absolute path, so this test
+        // holds no env window during which concurrent PATH-resolved spawns in
+        // other tests could see the stub-only dir (full-suite flake source).
+        let _env = EnvGuards::set_str("CATDESK_SANDBOX_MEMORY", "on");
 
         assert!(
-            sandbox_scope_systemd_run_with(Path::new("."), |executable| {
-                systemd_scope_usable_within(executable, SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT)
+            sandbox_scope_systemd_run_with(Path::new("."), |_| {
+                systemd_scope_usable_within(&systemd_run, SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT)
             })
             .is_none(),
             "a failing preflight means no scope: fail open to plain bwrap"
@@ -1697,23 +1697,38 @@ mod tests {
         let systemd_run = bin.join("systemd-run");
         // A listening-but-dead bus socket accepts connect() and then wedges
         // the client in the D-Bus handshake; the preflight timeout is the only
-        // guard, so it must convert the hang into fail-open.
-        std::fs::write(&systemd_run, b"#!/bin/sh\nexec sleep 30\n")
+        // guard, so it must convert the hang into fail-open. The stub must
+        // hang on its own: PATH here holds only the stub itself, so anything
+        // looked up externally (like `sleep`) would exit 127 immediately and
+        // the test would exercise the nonzero-exit path instead of the
+        // deadline kill. A busy loop has zero external dependencies.
+        std::fs::write(&systemd_run, b"#!/bin/sh\nwhile true; do :; done\n")
             .expect("write systemd-run stub");
         std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755))
             .expect("chmod systemd-run stub");
 
-        let _env = EnvGuards::set_many(&[
-            ("PATH", bin.as_path()),
-            ("CATDESK_SANDBOX_MEMORY", Path::new("on")),
-        ]);
+        // No PATH rewrite: the stub is passed by absolute path, so the ~250 ms
+        // deadline window holds no env rewrite during which concurrent
+        // PATH-resolved spawns in other tests could see the stub-only dir
+        // (full-suite flake source).
+        let _env = EnvGuards::set_str("CATDESK_SANDBOX_MEMORY", "on");
 
+        let started = Instant::now();
+        let scope = sandbox_scope_systemd_run_with(Path::new("."), |_| {
+            systemd_scope_usable_within(&systemd_run, Duration::from_millis(250))
+        });
+        let elapsed = started.elapsed();
         assert!(
-            sandbox_scope_systemd_run_with(Path::new("."), |executable| {
-                systemd_scope_usable_within(executable, Duration::from_millis(250))
-            })
-            .is_none(),
+            scope.is_none(),
             "a wedged handshake must time out into fail-open, not hang the caller"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "None must come from the deadline, not an early stub exit (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the deadline kill must be promptly enforced (elapsed {elapsed:?})"
         );
     }
 
