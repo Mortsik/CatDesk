@@ -6771,13 +6771,18 @@ print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'content':[{'type':'t
 // without a payload audit.
 
 /// (tool, bounding class) for every tool the local catalog can expose. Must
-/// match the local tool inventory table in the audit document exactly.
+/// match the local tool inventory table in the audit document exactly —
+/// including the per-tool bounding class, which the document test compares
+/// column by column.
 const TOOL_PAYLOAD_AUDIT: &[(&str, &str)] = &[
     ("run_command", "shared-budget+pre-cap"),
     ("start_command", "shared-budget+pre-cap"),
     ("poll_command", "shared-budget+pre-cap"),
     ("cancel_command", "shared-budget+pre-cap"),
-    ("catdesk_instruction", "inherent-static"),
+    // Not inherent-static: the template is fixed, but the response embeds
+    // uncapped host-controlled AGENTS.md text and Binagotchy card images
+    // (finding F5). Only the shared-budget gate bounds it today.
+    ("catdesk_instruction", "shared-budget"),
     ("read", "shared-budget+pre-cap"),
     ("read_image", "multimodal-exempt"),
     ("search", "shared-budget+pre-cap"),
@@ -6800,16 +6805,53 @@ const AUDITED_BOUNDING_CLASSES: &[&str] = &[
     "devtools-passthrough",
 ];
 
-/// Names the catalog exposes for one (mode, tool_mode) pair with the DevTools
-/// bridge absent, so the local set is fully deterministic.
-async fn audit_tools_list_names(mode: Mode, tool_mode: ToolMode) -> Vec<String> {
+/// The exact tool list (order included) the catalog must expose for one
+/// (mode, tool_mode) pair with the DevTools bridge absent.
+fn audit_expected_tools(mode: Mode, tool_mode: ToolMode) -> &'static [&'static str] {
+    match (mode, tool_mode) {
+        (Mode::Browser, _) => &["catdesk_instruction"],
+        (Mode::Computer | Mode::Both, ToolMode::ReadOnly) => &[
+            "catdesk_instruction",
+            "read",
+            "read_image",
+            "search",
+            "read_result",
+            "search_result",
+            "create_handoff",
+        ],
+        (Mode::Computer | Mode::Both, ToolMode::MultiTools) => &[
+            "run_command",
+            "start_command",
+            "poll_command",
+            "cancel_command",
+            "catdesk_instruction",
+            "read",
+            "read_image",
+            "search",
+            "read_result",
+            "search_result",
+            "write",
+            "edit",
+            "create_handoff",
+            "delete",
+        ],
+    }
+}
+
+/// Names the catalog exposes for one (mode, tool_mode) pair with the given
+/// DevTools bridge.
+async fn audit_tools_list_names(
+    mode: Mode,
+    tool_mode: ToolMode,
+    devtools: &Option<std::sync::Arc<tokio::sync::Mutex<crate::devtools::DevtoolsBridge>>>,
+) -> Vec<String> {
     let req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(json!("req-tool-payload-audit")),
         method: "tools/list".into(),
         params: json!({}),
     };
-    handle_tools_list(&req, mode, tool_mode, &None)
+    handle_tools_list(&req, mode, tool_mode, devtools)
         .await
         .result
         .as_ref()
@@ -6833,19 +6875,29 @@ async fn tool_payload_audit_covers_every_exposed_tool() {
         (Mode::Browser, ToolMode::MultiTools),
         (Mode::Browser, ToolMode::ReadOnly),
     ] {
-        for name in audit_tools_list_names(mode, tool_mode).await {
+        let expected = audit_expected_tools(mode, tool_mode);
+        let exposed = audit_tools_list_names(mode, tool_mode, &None).await;
+        let expected_owned: Vec<String> = expected.iter().map(|name| (*name).to_string()).collect();
+        assert_eq!(
+            exposed,
+            expected_owned,
+            "tools/list exposure drifted for {}/{}; audit the change, then update \
+             audit_expected_tools, TOOL_PAYLOAD_AUDIT and \
+             docs/findings/2026-10-07-tool-payload-audit.md together",
+            mode.label(),
+            tool_mode.label(),
+        );
+        for name in expected {
             assert!(
                 TOOL_PAYLOAD_AUDIT
                     .iter()
-                    .any(|(audited, _)| audited == &name),
-                "tool `{name}` is exposed by tools/list in {}/{} but is not covered \
-                 by the payload audit inventory; audit its payload surfaces, then add \
-                 it to TOOL_PAYLOAD_AUDIT and to the table in \
-                 docs/findings/2026-10-07-tool-payload-audit.md",
+                    .any(|(audited, _)| audited == name),
+                "tool `{name}` is expected in {}/{} but has no payload-audit entry; \
+                 add it to TOOL_PAYLOAD_AUDIT and to the inventory document",
                 mode.label(),
                 tool_mode.label(),
             );
-            exposed_union.insert(name);
+            exposed_union.insert((*name).to_string());
         }
     }
 
@@ -6874,39 +6926,293 @@ fn tool_payload_audit_mechanisms_use_audited_classes() {
 #[test]
 fn tool_payload_audit_document_lists_every_audited_tool() {
     let document = include_str!("../../docs/findings/2026-10-07-tool-payload-audit.md");
+    let inventory = document
+        .split("## Local tool inventory")
+        .nth(1)
+        .expect("missing '## Local tool inventory' section")
+        .split("## DevTools passthrough")
+        .next()
+        .expect("missing '## DevTools passthrough' section");
 
-    for (tool, _) in TOOL_PAYLOAD_AUDIT {
-        let row = format!("| `{tool}` |");
-        assert_eq!(
-            document.matches(&row).count(),
-            1,
-            "audit document must list `{tool}` exactly once in the local tool table"
-        );
-    }
-
-    let mut listed = std::collections::BTreeSet::new();
-    for line in document.lines().filter(|line| line.starts_with("| `")) {
-        let name = line
-            .strip_prefix("| `")
-            .and_then(|rest| rest.split('`').next())
-            .unwrap_or_default();
+    // Parse the full record of every local-tool row: name, exposure tokens,
+    // and bounding class. Row shape: | `tool` | C+M, C+R | ... | `class` | ...
+    let mut rows: std::collections::BTreeMap<String, (Vec<String>, String)> =
+        std::collections::BTreeMap::new();
+    for line in inventory.lines().filter(|line| line.starts_with("| `")) {
+        let columns: Vec<&str> = line.split('|').collect();
         assert!(
-            !name.is_empty(),
-            "audit document has an unparseable table row: {line}"
+            columns.len() >= 5,
+            "inventory row must expose Tool/Exposed in/Bounding columns: {line}"
         );
-        listed.insert(name.to_string());
+        let tool = columns[1].trim().trim_matches('`').to_string();
+        assert!(!tool.is_empty(), "inventory row has no tool name: {line}");
+        let exposure: Vec<String> = columns[2]
+            .trim()
+            .split(", ")
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect();
+        // Columns: Tool | Exposed in | Payload surface(s) | Bounding | ...
+        let bounding = columns[4].trim().trim_matches('`').to_string();
+        assert!(
+            !bounding.is_empty(),
+            "inventory row has no bounding class: {line}"
+        );
+        rows.insert(tool, (exposure, bounding));
     }
-    // The bounding-class table documents `devtools-passthrough` even though no
-    // statically enumerable local tool uses it; every other backticked row is
-    // a bounding class or an audited tool name.
-    let expected: std::collections::BTreeSet<String> = AUDITED_BOUNDING_CLASSES
-        .iter()
-        .chain(TOOL_PAYLOAD_AUDIT.iter().map(|(name, _)| name))
-        .map(|name| name.to_string())
-        .collect();
 
+    let audited: std::collections::BTreeMap<&str, &str> =
+        TOOL_PAYLOAD_AUDIT.iter().copied().collect();
+    let documented: std::collections::BTreeSet<String> = rows.keys().cloned().collect();
+    let audited_names: std::collections::BTreeSet<String> =
+        audited.keys().map(|name| (*name).to_string()).collect();
     assert_eq!(
-        listed, expected,
+        documented, audited_names,
         "audit document rows and audited inventory drifted out of sync"
     );
+
+    for (tool, (exposure, bounding)) in &rows {
+        let audited_class = audited
+            .get(tool.as_str())
+            .unwrap_or_else(|| panic!("tool `{tool}` missing from TOOL_PAYLOAD_AUDIT"));
+        assert_eq!(
+            bounding, *audited_class,
+            "bounding class for `{tool}` drifted between the audit document and \
+             TOOL_PAYLOAD_AUDIT"
+        );
+
+        let mut computed_exposure: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for (mode, tool_mode, token) in [
+            (Mode::Both, ToolMode::MultiTools, "C+M"),
+            (Mode::Both, ToolMode::ReadOnly, "C+R"),
+            (Mode::Browser, ToolMode::MultiTools, "B"),
+        ] {
+            if audit_expected_tools(mode, tool_mode).contains(&tool.as_str()) {
+                computed_exposure.insert(token.to_string());
+            }
+        }
+        let parsed_exposure: std::collections::BTreeSet<String> =
+            exposure.iter().cloned().collect();
+        assert_eq!(
+            parsed_exposure, computed_exposure,
+            "`Exposed in` column for `{tool}` drifted from the enumerated catalog exposure"
+        );
+    }
+}
+
+// ── DevTools passthrough payload contract (catdesk-ojt.5) ───────────────────
+//
+// Dynamic DevTools tool names are not statically enumerable, so the audit pins
+// the passthrough behavior instead: listing with arbitrary names, the
+// read-only filter, and the shared response-budget gate on forwarded results.
+
+/// A fake chrome-devtools-mcp process: echoes the request `id`, serves a fixed
+/// tool list with one read-only and one mutating tool, and answers any
+/// tools/call with a large payload.
+const FAKE_DEVTOOLS_SERVER_SCRIPT: &str = r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    request = json.loads(line)
+    method = request.get("method", "")
+    if method == "tools/list":
+        result = {"tools": [
+            {"name": "fake_dt_read", "annotations": {"readOnlyHint": True}},
+            {"name": "fake_dt_write", "annotations": {"readOnlyHint": False}},
+        ]}
+    elif method == "tools/call":
+        result = {
+            "content": [{"type": "text", "text": "A" * 200_000}],
+            "structuredContent": {"toolName": "fake_dt_big", "data": "B" * 200_000, "success": True},
+        }
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+
+async fn fake_devtools_bridge()
+-> std::sync::Arc<tokio::sync::Mutex<crate::devtools::DevtoolsBridge>> {
+    crate::devtools::DevtoolsBridge::bridge_for_test(FAKE_DEVTOOLS_SERVER_SCRIPT)
+        .await
+        .expect("spawn fake devtools bridge")
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn devtools_passthrough_lists_dynamic_tools_and_filters_read_only() {
+    let bridge = fake_devtools_bridge().await;
+
+    let multi =
+        audit_tools_list_names(Mode::Browser, ToolMode::MultiTools, &Some(bridge.clone())).await;
+    assert_eq!(
+        multi,
+        vec![
+            "catdesk_instruction".to_string(),
+            "fake_dt_read".to_string(),
+            "fake_dt_write".to_string(),
+        ],
+        "browser tools/list must expose every dynamic DevTools tool by its own name"
+    );
+
+    let read_only = audit_tools_list_names(Mode::Browser, ToolMode::ReadOnly, &Some(bridge)).await;
+    assert_eq!(
+        read_only,
+        vec![
+            "catdesk_instruction".to_string(),
+            "fake_dt_read".to_string(),
+        ],
+        "read-only mode must filter dynamic DevTools tools by readOnlyHint"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn devtools_passthrough_big_result_goes_through_shared_budget() {
+    let bridge = fake_devtools_bridge().await;
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-audit-devtools-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let req = tool_call_request("fake_dt_big", json!({}));
+
+    let response = handle_tools_call(
+        &req,
+        &workspace_root.to_string_lossy(),
+        1,
+        Mode::Browser,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &Some(bridge),
+    )
+    .await;
+
+    let result = response.result.expect("forwarded result");
+    let serialized = serde_json::to_vec(&result).expect("serialize result");
+    assert!(
+        serialized.len() <= crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "a large DevTools result must be compacted below the inline budget, got {} bytes",
+        serialized.len()
+    );
+    assert!(
+        result
+            .pointer("/responseBudget/outputRef")
+            .and_then(Value::as_str)
+            .is_some_and(|output_ref| !output_ref.is_empty()),
+        "a large DevTools result must carry a responseBudget manifest with a lossless outputRef"
+    );
+    assert!(
+        result
+            .pointer("/responseBudget/preview/omissionCount")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0),
+        "the manifest must report the omissions made to the DevTools payload"
+    );
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+// ── catdesk_instruction externalization (catdesk-ojt.5, finding F5) ─────────
+
+#[tokio::test]
+async fn oversized_catdesk_instruction_is_externalized_not_inlined() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-audit-instruction-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    // ~1 MiB of AGENTS.md: the template itself is static, but the AGENTS.md
+    // layers (finding F5) are host-controlled and uncapped, so only the
+    // shared-budget gate may bound this response.
+    std::fs::write(
+        workspace_root.join("AGENTS.md"),
+        "INSTRUCTIONS-".repeat(80_000),
+    )
+    .expect("write oversized AGENTS.md");
+    let req = tool_call_request("catdesk_instruction", json!({}));
+
+    let response = handle_tools_call(
+        &req,
+        &workspace_root.to_string_lossy(),
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+    )
+    .await;
+
+    let result = response.result.expect("instruction result");
+    let serialized = serde_json::to_vec(&result).expect("serialize result");
+    assert!(
+        serialized.len() <= crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "an oversized instruction must be externalized, not inlined; got {} bytes",
+        serialized.len()
+    );
+    assert_eq!(
+        result
+            .pointer("/responseBudget/retrieval/tool")
+            .and_then(Value::as_str),
+        Some("read_result"),
+        "the manifest must point at the lossless retrieval tool"
+    );
+    assert!(
+        result
+            .pointer("/responseBudget/outputRef")
+            .and_then(Value::as_str)
+            .is_some_and(|output_ref| !output_ref.is_empty()),
+        "the manifest must carry a lossless outputRef"
+    );
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+// ── read_result worst-case size (catdesk-ojt.5) ─────────────────────────────
+
+#[tokio::test]
+async fn read_result_max_range_serialized_size_stays_bounded() {
+    let store = LargeResultStore::new_default().expect("create result store");
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-audit-read-result-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let range_bytes = crate::result_store::DEFAULT_MAX_RANGE_BYTES;
+    let stored = store
+        .put(
+            Some("session-a"),
+            &workspace_root,
+            &vec![b'a'; range_bytes],
+            None,
+        )
+        .expect("store maximal range payload");
+    let req = tool_call_request(
+        "read_result",
+        json!({
+            "result_id": stored.metadata.result_id,
+            "offset": 0,
+            "max_bytes": range_bytes,
+        }),
+    );
+
+    let response = handle_read_result(
+        &req,
+        &workspace_root.to_string_lossy(),
+        &store,
+        Some("session-a"),
+    );
+
+    let result = response.result.expect("read_result payload");
+    let serialized = serde_json::to_vec(&result).expect("serialize result");
+    // One maximal ASCII range: dataBase64 ≈ 171 KiB + the same bytes mirrored
+    // as text ≈ 128 KiB + metadata ≈ 306 KiB total. Control-byte escaping can
+    // push the text mirror up to ≈ 962 KiB; this test pins the ASCII case.
+    assert!(
+        (250 * 1024..=450 * 1024).contains(&serialized.len()),
+        "one maximal ASCII range must serialize to roughly 306 KiB, got {} bytes",
+        serialized.len()
+    );
+    assert!(
+        result.get("responseBudget").is_none(),
+        "read_result is the retrieval instrument and must not be re-externalized"
+    );
+    let _ = std::fs::remove_dir_all(workspace_root);
 }

@@ -394,6 +394,26 @@ impl DevtoolsBridge {
     pub async fn stop(&mut self) {
         let _ = self.child.kill().await;
     }
+
+    /// A bridge around an in-process fake DevTools MCP server for tests. The
+    /// script reads one JSON-RPC request per stdin line and must echo the
+    /// request `id` back; each stdout line is parsed as the response. Built
+    /// without a `LaunchSpec`, so a dropped connection never respawns npx.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn bridge_for_test(script: &'static str) -> Result<Arc<Mutex<Self>>, String> {
+        let mut command = Command::new("python3");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("Failed to spawn fake DevTools bridge: {error}"))?;
+        Ok(Arc::new(Mutex::new(Self::from_child_inner(child, None)?)))
+    }
 }
 
 impl Drop for DevtoolsBridge {
