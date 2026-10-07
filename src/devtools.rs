@@ -155,6 +155,13 @@ impl DevtoolsBridge {
         Ok(bridge)
     }
 
+    /// Ad-hoc bridge over an already-spawned peer process; used by tests that
+    /// fake the DevTools side with a script.
+    #[cfg(test)]
+    pub(crate) fn from_child(child: Child) -> Result<Arc<Mutex<Self>>, String> {
+        Ok(Arc::new(Mutex::new(Self::from_child_inner(child, None)?)))
+    }
+
     fn from_child_inner(mut child: Child, launch: Option<LaunchSpec>) -> Result<Self, String> {
         let child_stdin = child.stdin.take().ok_or("No stdin")?;
         let child_stdout = child.stdout.take().ok_or("No stdout")?;

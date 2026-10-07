@@ -10,6 +10,7 @@ use super::*;
 use base64::Engine as _;
 
 use crate::command;
+use crate::devtools::DevtoolsBridge;
 use crate::handoff;
 use crate::workspace_tools;
 use std::collections::HashMap;
@@ -17,7 +18,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use super::agents_state::cached_file_value;
-use super::commands::{change_scope_for_request, command_job_output_text, handle_poll_command};
+use super::commands::{
+    apply_devtools_request_defaults, change_scope_for_request, command_job_output_text,
+    forward_to_devtools, handle_poll_command,
+};
 use super::file_tools::{handle_create_handoff_for_project, image_tool_analyzed_response};
 use super::instruction::{
     CATDESK_INSTRUCTION_REQUIRED_CODE, CATDESK_INSTRUCTION_REQUIRED_MESSAGE,
@@ -6477,6 +6481,191 @@ fn analyzed_read_image_short_description_passes_through_untouched() {
         &response.result.expect("analyzed result")["structuredContent"]["analysis"];
     assert_eq!(analysis_struct["description"], json!(analysis));
     assert_eq!(analysis_struct["analysisTruncated"], json!(false));
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn devtools_listing_requests_default_to_bounded_pages_without_overriding_explicit_page_size() {
+    for tool_name in ["list_console_messages", "list_network_requests"] {
+        let req = tool_call_request(tool_name, json!({ "pageIdx": 7 }));
+        let bounded = apply_devtools_request_defaults(tool_name, &req.params);
+        assert_eq!(bounded["arguments"]["pageSize"], json!(100));
+        assert_eq!(bounded["arguments"]["pageIdx"], json!(7));
+
+        let explicit = tool_call_request(tool_name, json!({ "pageIdx": 7, "pageSize": 250 }));
+        let bounded = apply_devtools_request_defaults(tool_name, &explicit.params);
+        assert_eq!(bounded["arguments"]["pageSize"], json!(250));
+    }
+}
+
+#[test]
+fn devtools_snapshot_defaults_to_non_verbose_without_overriding_explicit_verbose() {
+    let compact = tool_call_request("take_snapshot", json!({}));
+    let bounded = apply_devtools_request_defaults("take_snapshot", &compact.params);
+    assert_eq!(bounded["arguments"]["verbose"], json!(false));
+
+    let verbose = tool_call_request("take_snapshot", json!({ "verbose": true }));
+    let bounded = apply_devtools_request_defaults("take_snapshot", &verbose.params);
+    assert_eq!(bounded["arguments"]["verbose"], json!(true));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devtools_forwarding_sends_bounded_defaults_to_upstream_peer() {
+    let child = tokio::process::Command::new("python3")
+        .args([
+            "-c",
+            r#"import json,sys
+for line in sys.stdin:
+    req=json.loads(line)
+    args=req.get('params',{}).get('arguments',{})
+    print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'content':[{'type':'text','text':json.dumps(args,sort_keys=True)}]}}), flush=True)
+"#,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn fake DevTools peer");
+    let bridge = DevtoolsBridge::from_child(child).expect("create DevTools bridge");
+    let devtools = Some(bridge);
+
+    let list_req = tool_call_request("list_network_requests", json!({ "pageIdx": 3 }));
+    let list_response = forward_to_devtools(
+        &list_req,
+        "list_network_requests",
+        ToolMode::MultiTools,
+        &devtools,
+    )
+    .await;
+    let list_args: Value = serde_json::from_str(
+        list_response
+            .result
+            .as_ref()
+            .and_then(|value| value.pointer("/content/0/text"))
+            .and_then(Value::as_str)
+            .expect("echoed list arguments"),
+    )
+    .expect("decode list arguments");
+    assert_eq!(list_args["pageSize"], json!(100));
+    assert_eq!(list_args["pageIdx"], json!(3));
+
+    let snapshot_req = tool_call_request("take_snapshot", json!({}));
+    let snapshot_response = forward_to_devtools(
+        &snapshot_req,
+        "take_snapshot",
+        ToolMode::MultiTools,
+        &devtools,
+    )
+    .await;
+    let snapshot_args: Value = serde_json::from_str(
+        snapshot_response
+            .result
+            .as_ref()
+            .and_then(|value| value.pointer("/content/0/text"))
+            .and_then(Value::as_str)
+            .expect("echoed snapshot arguments"),
+    )
+    .expect("decode snapshot arguments");
+    assert_eq!(snapshot_args["verbose"], json!(false));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn devtools_forwarding_externalizes_large_network_body_through_shared_budget() {
+    let workspace_root = read_workspace("devtools-forward-large-body");
+    let store = LargeResultStore::new_default().expect("create result store");
+    let child = tokio::process::Command::new("python3")
+        .args([
+            "-c",
+            r#"import json,sys
+req=json.loads(sys.stdin.readline())
+body='HEAD-SENTINEL\\n' + ('0123456789abcdef' * 5000) + '\\nTAIL-SENTINEL'
+print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{'content':[{'type':'text','text':body}],'isError':False}}), flush=True)
+"#,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn fake DevTools peer");
+    let bridge = DevtoolsBridge::from_child(child).expect("create DevTools bridge");
+    let devtools = Some(bridge);
+    let jobs = CommandJobManager::new();
+    let req = tool_call_request("get_network_request", json!({ "reqid": 17 }));
+
+    let response = handle_tools_call_with_result_store(
+        &req,
+        workspace_root.to_str().expect("workspace path"),
+        0,
+        Mode::Browser,
+        ToolMode::MultiTools,
+        false,
+        &jobs,
+        &devtools,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+
+    let result = response.result.as_ref().expect("forwarded result");
+    assert_eq!(
+        result
+            .pointer("/responseBudget/policy")
+            .and_then(Value::as_str),
+        Some("catdesk-mcp-v1")
+    );
+    let result_id = result
+        .pointer("/responseBudget/outputRef")
+        .and_then(Value::as_str)
+        .expect("large DevTools result should be externalized");
+    let encoded_len = serde_json::to_vec(result)
+        .expect("encode forwarded preview")
+        .len();
+    assert!(
+        encoded_len <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "forwarded preview was {encoded_len} bytes"
+    );
+
+    let read_req = tool_call_request(
+        "read_result",
+        json!({ "result_id": result_id, "max_bytes": store.max_range_bytes() }),
+    );
+    let read_response = handle_tools_call_with_result_store(
+        &read_req,
+        workspace_root.to_str().expect("workspace path"),
+        0,
+        Mode::Computer,
+        ToolMode::MultiTools,
+        false,
+        &jobs,
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+    let restored_text = read_response
+        .result
+        .as_ref()
+        .and_then(|value| value.pointer("/structuredContent/text"))
+        .and_then(Value::as_str)
+        .expect("retrieved JSON text");
+    let restored: Value =
+        serde_json::from_str(restored_text).expect("decode stored DevTools result");
+    let body = restored
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .expect("stored response body");
+    assert!(body.starts_with("HEAD-SENTINEL"));
+    assert!(body.ends_with("TAIL-SENTINEL"));
+    assert!(body.len() > super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES);
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }

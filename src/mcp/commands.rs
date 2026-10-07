@@ -23,13 +23,41 @@ use crate::mcp::jsonrpc::{
 };
 use crate::mcp::{read_only_blocked_response, tool_is_read_only};
 
+/// Fill input-side defaults for high-volume CDP tools, bounding the work the
+/// upstream DevTools peer does BEFORE the output-side response budget trims
+/// what comes back: `pageSize` for the listing tools and non-verbose
+/// snapshots. Defaults land only in absent argument slots (`entry` +
+/// `or_insert_with`), so explicitly provided values always pass through.
+pub(crate) fn apply_devtools_request_defaults(tool_name: &str, params: &Value) -> Value {
+    let mut params = params.clone();
+    let Some(arguments) = params.get_mut("arguments").and_then(Value::as_object_mut) else {
+        return params;
+    };
+
+    match tool_name {
+        "list_console_messages" | "list_network_requests" => {
+            arguments
+                .entry("pageSize".to_string())
+                .or_insert_with(|| json!(100));
+        }
+        "take_snapshot" => {
+            arguments
+                .entry("verbose".to_string())
+                .or_insert_with(|| json!(false));
+        }
+        _ => {}
+    }
+
+    params
+}
+
 pub(crate) async fn forward_to_devtools(
     req: &JsonRpcRequest,
     tool_name: &str,
     tool_mode: ToolMode,
     devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
 ) -> JsonRpcResponse {
-    let params = &req.params;
+    let params = apply_devtools_request_defaults(tool_name, &req.params);
     let Some(bridge) = devtools else {
         return tool_error_response(req, format!("Unknown tool: {tool_name}"));
     };
