@@ -7010,6 +7010,11 @@ fn tool_payload_audit_document_lists_every_audited_tool() {
 /// A fake chrome-devtools-mcp process: echoes the request `id`, serves a fixed
 /// tool list with one read-only and one mutating tool, and answers any
 /// tools/call with a large payload.
+///
+/// Unix-only, matching `DevtoolsBridge::bridge_for_test` (which spawns
+/// python3); without this gate the Windows test build would fail to resolve
+/// the bridge method.
+#[cfg(unix)]
 const FAKE_DEVTOOLS_SERVER_SCRIPT: &str = r#"
 import sys, json
 for line in sys.stdin:
@@ -7034,6 +7039,7 @@ for line in sys.stdin:
     sys.stdout.flush()
 "#;
 
+#[cfg(unix)]
 async fn fake_devtools_bridge()
 -> std::sync::Arc<tokio::sync::Mutex<crate::devtools::DevtoolsBridge>> {
     crate::devtools::DevtoolsBridge::bridge_for_test(FAKE_DEVTOOLS_SERVER_SCRIPT)
@@ -7169,20 +7175,21 @@ async fn oversized_catdesk_instruction_is_externalized_not_inlined() {
 
 // ── read_result worst-case size (catdesk-ojt.5) ─────────────────────────────
 
-#[tokio::test]
-async fn read_result_max_range_serialized_size_stays_bounded() {
-    let store = LargeResultStore::new_default().expect("create result store");
+/// Puts `payload` in the dispatcher's result store and reads one maximal range
+/// back through the FULL tools/call dispatcher, so the exemption of read_result
+/// from `apply_response_budget` (src/mcp.rs) is exercised, not just the handler.
+///
+/// Runs with `ShowDetailMode::Disable`: the budget gate is independent of the
+/// detail mode, but widget/token enrichment is not — and the o200k estimate
+/// over an untrimmed retrieval payload takes tens of seconds (finding F6).
+async fn maximal_read_result_through_dispatcher(payload: &[u8]) -> (serde_json::Value, usize) {
+    let store = fallback_result_store();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-audit-read-result-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
     let range_bytes = crate::result_store::DEFAULT_MAX_RANGE_BYTES;
     let stored = store
-        .put(
-            Some("session-a"),
-            &workspace_root,
-            &vec![b'a'; range_bytes],
-            None,
-        )
+        .put(None, &workspace_root, payload, None)
         .expect("store maximal range payload");
     let req = tool_call_request(
         "read_result",
@@ -7193,26 +7200,95 @@ async fn read_result_max_range_serialized_size_stays_bounded() {
         }),
     );
 
-    let response = handle_read_result(
+    let response = handle_tools_call_with_session(
         &req,
         &workspace_root.to_string_lossy(),
-        &store,
-        Some("session-a"),
-    );
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        None,
+        None,
+    )
+    .await;
 
     let result = response.result.expect("read_result payload");
     let serialized = serde_json::to_vec(&result).expect("serialize result");
+    let _ = std::fs::remove_dir_all(workspace_root);
+    (result, serialized.len())
+}
+
+/// Reads one maximal range straight from the handler (fast path, no dispatcher
+/// overhead) to pin the serialized worst-case size for a payload shape.
+fn maximal_read_result_from_handler(payload: &[u8]) -> usize {
+    let store = LargeResultStore::new_default().expect("create result store");
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-audit-read-range-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let range_bytes = crate::result_store::DEFAULT_MAX_RANGE_BYTES;
+    let stored = store
+        .put(None, &workspace_root, payload, None)
+        .expect("store maximal range payload");
+    let req = tool_call_request(
+        "read_result",
+        json!({
+            "result_id": stored.metadata.result_id,
+            "offset": 0,
+            "max_bytes": range_bytes,
+        }),
+    );
+    let response = handle_read_result(&req, &workspace_root.to_string_lossy(), &store, None);
+    let result = response.result.expect("read_result payload");
+    let len = serde_json::to_vec(&result).expect("serialize result").len();
+    let _ = std::fs::remove_dir_all(workspace_root);
+    len
+}
+
+#[tokio::test]
+async fn read_result_bypasses_dispatcher_budget_gate() {
+    let (result, serialized) = maximal_read_result_through_dispatcher(&vec![
+        b'a';
+        crate::result_store::DEFAULT_MAX_RANGE_BYTES
+    ])
+    .await;
     // One maximal ASCII range: dataBase64 ≈ 171 KiB + the same bytes mirrored
-    // as text ≈ 128 KiB + metadata ≈ 306 KiB total. Control-byte escaping can
-    // push the text mirror up to ≈ 962 KiB; this test pins the ASCII case.
+    // as text ≈ 128 KiB + metadata ≈ 306 KiB total — well over the 64 KiB
+    // inline budget, so only the dispatcher exemption keeps this inline.
     assert!(
-        (250 * 1024..=450 * 1024).contains(&serialized.len()),
-        "one maximal ASCII range must serialize to roughly 306 KiB, got {} bytes",
-        serialized.len()
+        (250 * 1024..=450 * 1024).contains(&serialized),
+        "one maximal ASCII range must serialize to roughly 306 KiB, got {serialized} bytes"
     );
     assert!(
         result.get("responseBudget").is_none(),
-        "read_result is the retrieval instrument and must not be re-externalized"
+        "read_result is the retrieval instrument and must bypass the shared response-budget \
+         gate; a responseBudget manifest here means the dispatcher exemption (src/mcp.rs) \
+         was removed and read_result now re-externalizes its own retrieval payload"
     );
-    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn read_result_max_range_serialized_size_stays_bounded() {
+    let serialized =
+        maximal_read_result_from_handler(&vec![b'a'; crate::result_store::DEFAULT_MAX_RANGE_BYTES]);
+    assert!(
+        (250 * 1024..=450 * 1024).contains(&serialized),
+        "one maximal ASCII range must serialize to roughly 306 KiB, got {serialized} bytes"
+    );
+}
+
+#[test]
+fn read_result_control_byte_range_serializes_bounded_escaped_text() {
+    let serialized =
+        maximal_read_result_from_handler(&vec![0x01; crate::result_store::DEFAULT_MAX_RANGE_BYTES]);
+    // Control bytes are valid UTF-8, so the range is mirrored as text and
+    // JSON-escaped as \u00XX (6 bytes per byte): base64 ≈ 171 KiB + escaped
+    // text mirror ≈ 768 KiB + metadata ≈ 962 KiB — still bounded by the
+    // store-side range validation.
+    assert!(
+        (800 * 1024..=1100 * 1024).contains(&serialized),
+        "one maximal control-byte range must serialize to roughly 962 KiB, got {serialized} bytes"
+    );
 }
