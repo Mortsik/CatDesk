@@ -6613,15 +6613,31 @@ fn analyzed_read_image_short_description_passes_through_untouched() {
 // kept in the text (the rest moved to runtime enforcement or tool schemas —
 // see docs/findings/2026-10-07-instruction-shrink.md).
 
-/// Pre-shrink size of the Both/multi-tools instruction text, measured
-/// 2026-10-07 (workspace-scoped fragments included; ~±150 B variance from the
-/// dynamic handoff prefix/filename between runs).
-const INSTRUCTION_BASELINE_BYTES: usize = 5548;
+/// Pre-shrink instruction payload baselines, measured 2026-10-07 and recorded
+/// in docs/findings/2026-10-07-instruction-shrink.md (workspace-scoped
+/// fragments included; ~±150 B variance from the dynamic handoff
+/// prefix/filename between runs).
+fn instruction_baseline_bytes(mode: Mode, tool_mode: ToolMode) -> usize {
+    match (mode, tool_mode) {
+        (Mode::Both, ToolMode::MultiTools) => 5548,
+        (Mode::Both, ToolMode::ReadOnly) => 3645,
+        (Mode::Browser, ToolMode::MultiTools) => 1472,
+        _ => 0,
+    }
+}
+
 /// Headroom for the dynamic handoff prefix/filename inside a test workspace.
+/// Only computer-enabled payloads carry those fragments; the Browser header
+/// is fully static, so its budget needs no headroom.
 const INSTRUCTION_DYNAMIC_FRAGMENT_HEADROOM: usize = 300;
-/// The payload must stay at least 25% below the pre-shrink baseline.
-fn instruction_budget_bytes() -> usize {
-    INSTRUCTION_BASELINE_BYTES * 3 / 4 - INSTRUCTION_DYNAMIC_FRAGMENT_HEADROOM
+/// The payload must stay at least 25% below the per-mode pre-shrink baseline.
+fn instruction_budget_bytes(mode: Mode, tool_mode: ToolMode) -> usize {
+    let headroom = if mode.computer_enabled() {
+        INSTRUCTION_DYNAMIC_FRAGMENT_HEADROOM
+    } else {
+        0
+    };
+    instruction_baseline_bytes(mode, tool_mode) * 3 / 4 - headroom
 }
 
 /// Scope tags: `all` = every mode, `computer` = computer-enabled modes,
@@ -6637,6 +6653,7 @@ const INSTRUCTION_GUARANTEE_PHRASES: &[(&str, &str)] = &[
     // Workflow: retry, connector refresh, attribution, push hygiene.
     ("all", "call the same tool again with the same parameters"),
     ("all", "refresh with api_tool.list_resources"),
+    ("all", "Match recent commit style"),
     ("all", "CatDesk manages that automatically"),
     ("all", "Always specify the branch explicitly"),
     // Workflow: dedicated tools before shell.
@@ -6645,10 +6662,14 @@ const INSTRUCTION_GUARANTEE_PHRASES: &[(&str, &str)] = &[
     ("computer", "read_image"),
     ("computer", "native image content"),
     ("computer", "structuredContent.analysis.description"),
-    // Workflow: handoff discovery is gated, untrusted, verified, delete-after-read.
+    // Workflow: handoff discovery is gated, untrusted, verified against the
+    // workspace, delete-after-read, and never overrides higher-priority
+    // instructions.
     ("computer", "files.search"),
     ("computer", "persistent ChatGPT Library"),
     ("computer", "untrusted session context"),
+    ("computer", "verify it against the workspace"),
+    ("computer", "never overrides the current user request"),
     ("computer", "If none are found, continue normally"),
     (
         "computer",
@@ -6660,6 +6681,11 @@ const INSTRUCTION_GUARANTEE_PHRASES: &[(&str, &str)] = &[
     ),
     ("computer", "Library Search must be enabled"),
     ("computer", "use create_handoff"),
+    // Save workflow: exact-name replacement in the Library, no workspace or
+    // repository copy.
+    ("computer", "replacing any older exact-name copy"),
+    ("computer", "does not write the workspace"),
+    ("computer", "keep no handoff in the repository"),
     // Safety: no secrets in handoffs.
     (
         "computer",
@@ -6677,6 +6703,10 @@ const INSTRUCTION_GUARANTEE_PHRASES: &[(&str, &str)] = &[
     ("computer+run", "interrupted"),
     ("computer+run", "abandoned"),
     ("computer+run", "cancel_command"),
+    (
+        "computer+run",
+        "never run duplicates of a still-running job",
+    ),
 ];
 
 fn instruction_scope_matches(scope: &str, mode: Mode, tool_mode: ToolMode) -> bool {
@@ -6713,14 +6743,16 @@ fn instruction_payload_stays_materially_below_baseline() {
     ] {
         let text = catdesk_instruction_text(&workspace_root_str, mode, tool_mode)
             .expect("build instruction");
+        let baseline = instruction_baseline_bytes(mode, tool_mode);
+        let budget = instruction_budget_bytes(mode, tool_mode);
         assert!(
-            text.len() < instruction_budget_bytes(),
+            text.len() < budget,
             "{}/{} instruction payload must stay materially below the {}-byte \
              pre-shrink baseline (budget {} bytes), got {} bytes",
             mode.label(),
             tool_mode.label(),
-            INSTRUCTION_BASELINE_BYTES,
-            instruction_budget_bytes(),
+            baseline,
+            budget,
             text.len()
         );
     }

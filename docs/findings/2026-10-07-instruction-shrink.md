@@ -16,16 +16,17 @@ prefix/filename included). Tokens ≈ bytes/4 (English-prose heuristic).
 
 | Payload | Before | After | Δ bytes | Δ % | ~tokens before | ~tokens after |
 | --- | --- | --- | --- | --- | --- | --- |
-| Instruction, `Both` + multi-tools | 5548 B | 3542 B | −2006 B | −36.1% | ~1387 | ~885 |
-| Instruction, `Both` + read-only | 3645 B | 2376 B | −1269 B | −34.8% | ~911 | ~594 |
-| Instruction, `Browser` + multi-tools | 1472 B | 955 B | −517 B | −35.1% | ~368 | ~238 |
+| Instruction, `Both` + multi-tools | 5548 B | 3578 B | −1970 B | −35.5% | ~1387 | ~895 |
+| Instruction, `Both` + read-only | 3645 B | 2412 B | −1233 B | −33.8% | ~911 | ~603 |
+| Instruction, `Browser` + multi-tools | 1472 B | 933 B | −539 B | −36.6% | ~368 | ~233 |
 | `tools/list` (context, Both + multi-tools) | 25398 B | 25331 B | −67 B | −0.3% | ~6349 | ~6332 |
 
 The pinned budget lives in
 `instruction_payload_stays_materially_below_baseline` (`src/mcp/tests.rs`):
-every mode must stay ≥ 25 % below the recorded baseline (with headroom for the
-workspace-scoped handoff fragments). Growing the template past that line fails
-the test.
+every `(Mode, ToolMode)` pair must stay ≥ 25 % below its own recorded baseline
+(with headroom for the workspace-scoped handoff fragments — the Browser header
+is fully static and needs none). Growing the template past that line fails the
+test per mode.
 
 ## What was removed and why
 
