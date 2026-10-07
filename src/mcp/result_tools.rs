@@ -7,6 +7,13 @@ use crate::mcp::jsonrpc::{
 };
 use crate::result_store::{LargeResultStore, ResultKind, StoreError};
 
+// Store-range tools sit outside the dispatcher response budget and must
+// self-bound everything they echo. The query is the only client-supplied
+// string search_result returns, so it gets one deterministic limit enforced
+// twice: as input validation (the schema's maxLength plus this handler) and
+// as a cap on the echoed copy.
+pub(crate) const MAX_SEARCH_RESULT_QUERY_CHARS: usize = 1024;
+
 pub(crate) fn handle_read_result(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -83,6 +90,12 @@ pub(crate) fn handle_search_result(
         Ok(value) => value,
         Err(error) => return invalid_arguments(req, error),
     };
+    if query.chars().count() > MAX_SEARCH_RESULT_QUERY_CHARS {
+        return invalid_arguments(
+            req,
+            format!("Parameter query must not exceed {MAX_SEARCH_RESULT_QUERY_CHARS} characters"),
+        );
+    }
     let start_offset = match optional_u64(&arguments, "start_offset", 0) {
         Ok(value) => value,
         Err(error) => return invalid_arguments(req, error),
@@ -102,6 +115,10 @@ pub(crate) fn handle_search_result(
         max_matches,
     ) {
         Ok(result) => {
+            // Defense in depth: the input validation above already bounds the
+            // query, but the echo must stay capped even if that check is ever
+            // relaxed.
+            let echoed_query: String = query.chars().take(MAX_SEARCH_RESULT_QUERY_CHARS).collect();
             let structured = json!({
                 "toolName": "search_result",
                 "resultId": result.metadata.result_id,
@@ -110,7 +127,7 @@ pub(crate) fn handle_search_result(
                 "contentType": result.metadata.content_type,
                 "createdAtMs": result.metadata.created_at_ms,
                 "expiresAtMs": result.metadata.expires_at_ms,
-                "query": query,
+                "query": echoed_query,
                 "startOffset": start_offset,
                 "matchCount": result.matches.len(),
                 "matches": result.matches,

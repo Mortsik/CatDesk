@@ -676,7 +676,12 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
                 "type": "object",
                 "properties": {
                     "result_id": { "type": "string", "minLength": 1, "description": "Opaque CatDesk result ID" },
-                    "query": { "type": "string", "minLength": 1, "description": "Exact literal text to search for" },
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::mcp::result_tools::MAX_SEARCH_RESULT_QUERY_CHARS,
+                        "description": format!("Exact literal text to search for, at most {} characters", crate::mcp::result_tools::MAX_SEARCH_RESULT_QUERY_CHARS)
+                    },
                     "start_offset": { "type": "integer", "minimum": 0, "description": "Byte offset to begin searching (default 0)" },
                     "max_matches": {
                         "type": "integer",
