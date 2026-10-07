@@ -6,6 +6,7 @@
 //! deliberately avoided because it fails in shallow CI checkouts.
 
 use std::env;
+use std::path::Path;
 use std::process::Command;
 
 const UNKNOWN: &str = "unknown";
@@ -81,23 +82,19 @@ fn git_timestamp() -> Option<String> {
 }
 
 /// Rerun the build script only when THIS checkout's HEAD identity changes:
-/// the checkout's own `HEAD` file plus the one loose ref file it points at.
+/// the checkout's own `HEAD` file (checkouts, detached commits) plus the
+/// branch-ref files that exist right now — see [`watch_branch_files`].
 /// Worktrees share the common ref store, so watching `refs/heads` wholesale
-/// (the previous behavior) rebuilt on every sibling-worktree commit.
+/// (the original behavior) rebuilt on every sibling-worktree commit.
 ///
 /// Absolute paths are required in worktrees, where `.git` is a pointer file;
 /// older gits without those flags degrade to crate-relative `.git` paths.
-/// Watching the loose ref path even while it does not exist is safe: cargo
-/// fingerprints creation too, so a packed ref going loose on its next commit
-/// still reruns the script.
 fn emit_git_watch_paths() {
     if let Some(git_dir) = git_output(&["rev-parse", "--absolute-git-dir"]) {
         println!("cargo:rerun-if-changed={git_dir}/HEAD");
         if let Some(head_ref) = git_output(&["symbolic-ref", "HEAD"]) {
-            println!(
-                "cargo:rerun-if-changed={}",
-                head_ref_file(&git_dir, &head_ref)
-            );
+            let common = git_output(&["rev-parse", "--git-common-dir"]);
+            watch_branch_files(&git_dir, common.as_deref(), &head_ref);
         }
     } else {
         println!("cargo:rerun-if-changed=.git/HEAD");
@@ -105,34 +102,51 @@ fn emit_git_watch_paths() {
     }
 }
 
-/// Filesystem path of one ref's loose file — here, the `refs/heads/<branch>`
-/// this checkout's `HEAD` points at. Detached HEAD never reaches this: the
-/// `HEAD` file itself carries the commit and is already watched.
-fn head_ref_file(git_dir: &str, head_ref: &str) -> String {
-    if let Some(path) = git_output(&[
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-path",
-        head_ref,
-    ]) {
-        return path;
+/// Watch the branch-ref files that change when this branch's commit changes:
+/// its loose ref, its reflog, and the shared `packed-refs`. Each is emitted
+/// only while the file exists — cargo treats a missing watched path as
+/// permanently dirty, so a ref packed away by `git pack-refs` must leave the
+/// watch set instead.
+///
+/// The reflog is what keeps coverage full while the ref is packed: every
+/// commit appends to it even when the loose ref file is gone, so the first
+/// post-pack commit still triggers a rerun. `packed-refs` catches the
+/// loose→packed transition (pack-refs/gc rewrite it) and lets the watch set
+/// re-adapt on the next script run; those rewrites are rare, so the extra
+/// reruns are rare. With reflogs disabled, a commit onto a packed branch can
+/// go unnoticed until the next trigger — a narrow gap (non-bare repos
+/// default to reflogs on).
+fn watch_branch_files(git_dir: &str, common: Option<&str>, head_ref: &str) {
+    let relatives = [
+        head_ref.to_string(),
+        format!("logs/{head_ref}"),
+        "packed-refs".to_string(),
+    ];
+    for rel in &relatives {
+        let path = git_file_path(git_dir, common, rel);
+        if Path::new(&path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
     }
-    // Pre-2.31 gits: branch refs live in the shared common dir, reported
-    // absolute in worktrees and as a bare relative dir in the main checkout,
-    // where the absolute git dir is already the right base.
-    let common = git_output(&["rev-parse", "--git-common-dir"]);
-    compose_ref_file(git_dir, common.as_deref(), head_ref)
 }
 
-/// Compose the loose ref file path when `--git-path` cannot. Git prints
-/// host-flavored paths, so absoluteness has to cover Windows drive and UNC
-/// forms too — not just the POSIX leading slash — or a linked Windows
-/// worktree would watch its private per-worktree dir and miss its own
-/// commits, embedding a stale SHA.
-fn compose_ref_file(git_dir: &str, common: Option<&str>, head_ref: &str) -> String {
+/// Filesystem path of one git-managed file, e.g. the `refs/heads/<branch>`
+/// loose file this checkout's `HEAD` points at, its reflog, or `packed-refs`.
+fn git_file_path(git_dir: &str, common: Option<&str>, rel: &str) -> String {
+    if let Some(path) = git_output(&["rev-parse", "--path-format=absolute", "--git-path", rel]) {
+        return path;
+    }
+    compose_git_path(git_dir, common, rel)
+}
+
+/// Compose the file path when `--git-path` cannot (pre-2.31 gits). Branch
+/// refs, their reflogs, and `packed-refs` all live in the shared common dir,
+/// which git reports absolute in worktrees and as a bare relative dir in the
+/// main checkout, where the absolute git dir is already the right base.
+fn compose_git_path(git_dir: &str, common: Option<&str>, rel: &str) -> String {
     match common {
-        Some(common) if is_absolute(common) => format!("{common}/{head_ref}"),
-        _ => format!("{git_dir}/{head_ref}"),
+        Some(common) if is_absolute(common) => format!("{common}/{rel}"),
+        _ => format!("{git_dir}/{rel}"),
     }
 }
 
@@ -160,7 +174,7 @@ mod tests {
         // a POSIX-only check would send commits to the private per-worktree
         // dir and embed a stale SHA.
         assert_eq!(
-            compose_ref_file(
+            compose_git_path(
                 "C:/repo/.git/worktrees/wt",
                 Some("C:/repo/.git"),
                 "refs/heads/feat/x",
@@ -174,7 +188,7 @@ mod tests {
         // Mixed separators in the composed path are fine: git and the Windows
         // APIs both accept them.
         assert_eq!(
-            compose_ref_file(
+            compose_git_path(
                 r"C:\repo\.git\worktrees\wt",
                 Some(r"C:\repo\.git"),
                 "refs/heads/main",
@@ -186,7 +200,7 @@ mod tests {
     #[test]
     fn compose_uses_posix_absolute_common_dir() {
         assert_eq!(
-            compose_ref_file(
+            compose_git_path(
                 "/repo/.git/worktrees/wt",
                 Some("/repo/.git"),
                 "refs/heads/main"
@@ -196,11 +210,29 @@ mod tests {
     }
 
     #[test]
+    fn compose_resolves_reflog_and_packed_refs_relatives() {
+        // The packed-window watchers share the same composition: the branch
+        // reflog lives under logs/, packed-refs directly in the common dir.
+        assert_eq!(
+            compose_git_path(
+                "/repo/.git/worktrees/wt",
+                Some("/repo/.git"),
+                "logs/refs/heads/feat/x",
+            ),
+            "/repo/.git/logs/refs/heads/feat/x",
+        );
+        assert_eq!(
+            compose_git_path("/repo/.git/worktrees/wt", Some("/repo/.git"), "packed-refs"),
+            "/repo/.git/packed-refs",
+        );
+    }
+
+    #[test]
     fn compose_falls_back_to_git_dir_for_relative_common() {
         // Main checkout: a bare `.git` is relative and git_dir is already
         // the absolute base.
         assert_eq!(
-            compose_ref_file("/repo/.git", Some(".git"), "refs/heads/main"),
+            compose_git_path("/repo/.git", Some(".git"), "refs/heads/main"),
             "/repo/.git/refs/heads/main",
         );
     }
@@ -208,7 +240,7 @@ mod tests {
     #[test]
     fn compose_falls_back_when_common_dir_unknown() {
         assert_eq!(
-            compose_ref_file("/repo/.git", None, "refs/heads/main"),
+            compose_git_path("/repo/.git", None, "refs/heads/main"),
             "/repo/.git/refs/heads/main",
         );
     }
