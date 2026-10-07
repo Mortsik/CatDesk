@@ -3,7 +3,9 @@ use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 fn canonical_existing(path: &Path) -> io::Result<PathBuf> {
     path.canonicalize().map_err(|error| {
@@ -659,19 +661,60 @@ fn systemd_run_executable(workspace: &Path) -> Option<PathBuf> {
     executable_on_path(workspace, "systemd-run")
 }
 
-fn systemd_user_bus_available_at(runtime_dir: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(runtime_dir.join("bus")).is_ok()
+/// Hard ceiling for one scope preflight: a healthy `systemd-run --user` round
+/// trip takes tens of milliseconds, while a wedged D-Bus handshake (a
+/// listening-but-dead socket) would otherwise hang the caller indefinitely.
+const SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Poll cadence while waiting for the preflight child: fast verdicts surface
+/// promptly without spinning the scheduler.
+const SYSTEMD_SCOPE_PREFLIGHT_POLL: Duration = Duration::from_millis(25);
+
+/// Whether a transient user scope can actually be created, decided by one real
+/// `systemd-run --user --scope --quiet true` per process (cached).
+///
+/// Preflight instead of socket probing: a listening-but-dead bus socket
+/// accepts `connect()` while the real client hangs on the D-Bus handshake, and
+/// `systemd-run` resolves the bus strictly as `DBUS_SESSION_BUS_ADDRESS` else
+/// `$XDG_RUNTIME_DIR/bus` with no fallback — so no socket heuristic predicts
+/// usability and only the client itself is an honest oracle. The cached
+/// verdict pays ~50 ms once per process; if the bus dies after a pass, the
+/// real launch fails with a systemd-run error instead of degrading — accepted
+/// and known.
+fn systemd_scope_usable(executable: &Path) -> bool {
+    static USABLE: OnceLock<bool> = OnceLock::new();
+    *USABLE.get_or_init(|| systemd_scope_usable_within(executable, SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT))
 }
 
-fn systemd_user_bus_available() -> bool {
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
-        && systemd_user_bus_available_at(&runtime_dir)
+/// Uncached preflight: runs the resolved `systemd-run` with the process env
+/// inherited (the server's environment is exactly what the real launch sees)
+/// and returns true only on a clean exit. Nonzero exit, spawn failure and the
+/// timeout kill (wedged handshake) all count as unusable.
+fn systemd_scope_usable_within(executable: &Path, timeout: Duration) -> bool {
+    let mut child = match Command::new(executable)
+        .args(["--user", "--scope", "--quiet", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
     {
-        return true;
-    }
+        Ok(child) => child,
+        Err(_) => return false,
+    };
 
-    let default_runtime = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
-    systemd_user_bus_available_at(&default_runtime)
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(SYSTEMD_SCOPE_PREFLIGHT_POLL),
+            Err(_) => return false,
+        }
+    }
 }
 
 /// Memory ceilings for a single sandboxed command, applied through cgroup v2
@@ -722,20 +765,31 @@ fn memory_limit_from_env(variable: &str, default: &str) -> String {
 /// mount-namespace confinement intact — the memory ceilings protect the host
 /// on setups that have a user manager (WSL2/systemd), they are not a
 /// confinement boundary. The executable is resolved outside the workspace like
-/// `bwrap`, so a hijacked copy cannot run anything unsandboxed.
+/// `bwrap`, so a hijacked copy cannot run anything unsandboxed — and the
+/// preflight probes that resolved copy, not a fresh `PATH` lookup.
 /// Jedna decyzja o transient scope: `Some(systemd-run)` gdy limity pamięci są
-/// włączone, `systemd-run` jest na `PATH` i osiągalny jest systemd user bus.
-/// Sam klient na PATH nie wystarcza: np. WSL/test shell może mieć binarkę bez
-/// `/run/user/<uid>/bus`, wtedy `systemd-run --user` kończy się natychmiast.
-/// W takim środowisku fail-open do plain bwrap zachowuje confinement, tylko bez
-/// dodatkowych limitów cgroup. Marker `CATDESK_SANDBOX_UNIT` i wrapper muszą
-/// wynikać z tej samej decyzji.
+/// włączone, `systemd-run` jest na `PATH` i preflight potwierdza, że transient
+/// scope da się rzeczywiście utworzyć. Sam klient na PATH nie wystarcza.
+/// W środowisku bez działającego user managera fail-open do plain bwrap
+/// zachowuje confinement, tylko bez dodatkowych limitów cgroup. Marker
+/// `CATDESK_SANDBOX_UNIT` i wrapper muszą wynikać z tej samej decyzji.
 fn sandbox_scope_systemd_run(workspace: &Path) -> Option<PathBuf> {
+    sandbox_scope_systemd_run_with(workspace, systemd_scope_usable)
+}
+
+/// [`sandbox_scope_systemd_run`] with the usability oracle injected, so tests
+/// can exercise real preflights hermetically (PATH stubs, short timeouts)
+/// without touching the process-wide cached verdict.
+fn sandbox_scope_systemd_run_with(
+    workspace: &Path,
+    scope_usable: impl FnOnce(&Path) -> bool,
+) -> Option<PathBuf> {
     sandbox_memory_limits()?;
-    if !systemd_user_bus_available() {
+    let executable = systemd_run_executable(workspace)?;
+    if !scope_usable(&executable) {
         return None;
     }
-    systemd_run_executable(workspace)
+    Some(executable)
 }
 
 fn sandbox_command(
@@ -1581,27 +1635,12 @@ mod tests {
     }
 
     #[test]
-    fn systemd_user_bus_probe_distinguishes_missing_and_live_socket() {
-        let runtime = PathBuf::from(format!("/tmp/cdbus-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&runtime);
-        std::fs::create_dir_all(&runtime).expect("create runtime");
-
-        assert!(!systemd_user_bus_available_at(&runtime));
-        let _listener = std::os::unix::net::UnixListener::bind(runtime.join("bus"))
-            .expect("bind fake user bus");
-        assert!(systemd_user_bus_available_at(&runtime));
-        let _ = std::fs::remove_dir_all(&runtime);
-    }
-
-    #[test]
-    fn sandbox_scope_fails_open_when_systemd_user_bus_is_unavailable() {
+    fn sandbox_scope_preflight_success_yields_systemd_run_scope() {
         use std::os::unix::fs::PermissionsExt;
 
         let tree = TempTree::new();
         let bin = tree.path().join("bin");
-        let runtime = tree.path().join("runtime");
         std::fs::create_dir_all(&bin).expect("create bin");
-        std::fs::create_dir_all(&runtime).expect("create runtime");
         let systemd_run = bin.join("systemd-run");
         std::fs::write(&systemd_run, b"#!/bin/sh\nexit 0\n").expect("write systemd-run stub");
         std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755))
@@ -1609,13 +1648,72 @@ mod tests {
 
         let _env = EnvGuards::set_many(&[
             ("PATH", bin.as_path()),
-            ("XDG_RUNTIME_DIR", runtime.as_path()),
+            ("CATDESK_SANDBOX_MEMORY", Path::new("on")),
+        ]);
+
+        assert_eq!(
+            sandbox_scope_systemd_run_with(Path::new("."), |executable| {
+                systemd_scope_usable_within(executable, SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT)
+            })
+            .as_deref(),
+            Some(systemd_run.as_path()),
+            "a clean preflight yields the resolved systemd-run scope"
+        );
+    }
+
+    #[test]
+    fn sandbox_scope_fails_open_when_preflight_exits_nonzero() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tree = TempTree::new();
+        let bin = tree.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("create bin");
+        let systemd_run = bin.join("systemd-run");
+        std::fs::write(&systemd_run, b"#!/bin/sh\nexit 1\n").expect("write systemd-run stub");
+        std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod systemd-run stub");
+
+        let _env = EnvGuards::set_many(&[
+            ("PATH", bin.as_path()),
             ("CATDESK_SANDBOX_MEMORY", Path::new("on")),
         ]);
 
         assert!(
-            sandbox_scope_systemd_run(Path::new(".")).is_none(),
-            "systemd-run on PATH is insufficient when the user bus cannot be reached"
+            sandbox_scope_systemd_run_with(Path::new("."), |executable| {
+                systemd_scope_usable_within(executable, SYSTEMD_SCOPE_PREFLIGHT_TIMEOUT)
+            })
+            .is_none(),
+            "a failing preflight means no scope: fail open to plain bwrap"
+        );
+    }
+
+    #[test]
+    fn sandbox_scope_fails_open_when_preflight_hangs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tree = TempTree::new();
+        let bin = tree.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("create bin");
+        let systemd_run = bin.join("systemd-run");
+        // A listening-but-dead bus socket accepts connect() and then wedges
+        // the client in the D-Bus handshake; the preflight timeout is the only
+        // guard, so it must convert the hang into fail-open.
+        std::fs::write(&systemd_run, b"#!/bin/sh\nexec sleep 30\n")
+            .expect("write systemd-run stub");
+        std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod systemd-run stub");
+
+        let _env = EnvGuards::set_many(&[
+            ("PATH", bin.as_path()),
+            ("CATDESK_SANDBOX_MEMORY", Path::new("on")),
+        ]);
+
+        assert!(
+            sandbox_scope_systemd_run_with(Path::new("."), |executable| {
+                systemd_scope_usable_within(executable, Duration::from_millis(250))
+            })
+            .is_none(),
+            "a wedged handshake must time out into fail-open, not hang the caller"
         );
     }
 
