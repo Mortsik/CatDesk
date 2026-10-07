@@ -1254,3 +1254,10 @@ mod soak;
 
 #[cfg(test)]
 mod tests;
+
+// The build script includes this same file via #[path] for the watch-path
+// composition helpers; here it exists only in the test build so those unit
+// tests run under `cargo test` without adding runtime code paths.
+#[cfg(test)]
+#[path = "../build_paths.rs"]
+mod build_paths;
