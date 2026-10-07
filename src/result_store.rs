@@ -265,6 +265,16 @@ impl LargeResultStore {
         self.inner.config.max_range_bytes
     }
 
+    /// The largest payload `put` accepts: the entry cap intersected with the
+    /// global total budget. Callers bounding an oversized response inline use
+    /// this as the hard ceiling (`StoreError::EntryTooLarge` reports it).
+    pub(crate) fn max_entry_bytes(&self) -> u64 {
+        self.inner
+            .config
+            .max_entry_bytes
+            .min(self.inner.config.max_total_bytes)
+    }
+
     pub(crate) fn max_search_matches(&self) -> usize {
         self.inner.config.max_search_matches
     }

@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use crate::change_tracking::{ChangeSession, FileChange};
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
-use crate::result_store::LargeResultStore;
+use crate::result_store::{LargeResultStore, StoreError};
 use crate::state::{Mode, ShowDetailMode, TokenStatsLayout, ToolMode, WidgetCornerStyle};
 use crate::tool_result_metrics;
 
@@ -497,16 +497,32 @@ async fn handle_tools_call_with_result_store(
     {
         // Store first and replace only after a successful lossless write. If the
         // store is unavailable or rejects the payload, the original response is
-        // left untouched rather than silently losing capability.
-        budget_outcome = response_budget::apply_response_budget(
+        // left untouched rather than silently losing capability — except an
+        // entry-cap rejection, which would otherwise send the oversized
+        // payload inline (finding F2): the response is reduced until it fits
+        // the cap and externalized like any other.
+        budget_outcome = match response_budget::apply_response_budget(
             result,
             is_error,
             result_store,
             session_namespace,
             Path::new(workspace_root),
-        )
-        .ok()
-        .flatten();
+        ) {
+            Ok(outcome) => outcome,
+            Err(StoreError::EntryTooLarge { .. }) => {
+                reduce_result_to_entry_cap(result, result_store.max_entry_bytes());
+                response_budget::apply_response_budget(
+                    result,
+                    is_error,
+                    result_store,
+                    session_namespace,
+                    Path::new(workspace_root),
+                )
+                .ok()
+                .flatten()
+            }
+            Err(_) => None,
+        };
     }
 
     if let Some(result) = response.result.as_mut()
@@ -548,6 +564,118 @@ fn read_only_blocked_response(req: &JsonRpcRequest, tool_name: &str) -> JsonRpcR
         req,
         format!("Tool '{tool_name}' is disabled in read-only mode"),
     )
+}
+
+// ── Entry-cap reduction (finding F2) ─────────────────────────
+
+/// Smallest string worth a trim pass; below this the truncation marker costs
+/// more than the pass saves.
+const ENTRY_CAP_TRIM_MIN_BYTES: usize = 64;
+/// Bound on trim passes before the metadata-only fallback replaces the
+/// response; halving the largest payload converges in a handful of passes,
+/// so this only guards pathological many-small-field shapes.
+const ENTRY_CAP_TRIM_PASSES: usize = 64;
+
+/// Bound a result the store rejected as oversized until its serialized form
+/// fits the entry cap: each pass halves the largest string payload (keeping
+/// a quarter of each end around a truncation marker). Numbers, statuses and
+/// small fields survive untouched, and the reduced result is then
+/// externalized like any other, so nothing above the cap ever travels
+/// inline. Lossless retention above the cap was never possible — the store
+/// rejects such entries outright.
+fn reduce_result_to_entry_cap(result: &mut Value, cap_bytes: u64) {
+    for _ in 0..ENTRY_CAP_TRIM_PASSES {
+        let serialized = serde_json::to_vec(result).map_or(0, |bytes| bytes.len());
+        if serialized as u64 <= cap_bytes {
+            return;
+        }
+        let mut largest: Option<(String, usize)> = None;
+        largest_string_path(result, String::new(), &mut largest);
+        let Some((path, bytes)) = largest.filter(|(_, bytes)| *bytes >= ENTRY_CAP_TRIM_MIN_BYTES)
+        else {
+            break;
+        };
+        let Some(text) = result
+            .pointer_mut(&path)
+            .and_then(|leaf| leaf.as_str())
+            .map(str::to_string)
+        else {
+            break;
+        };
+        if let Some(leaf) = result.pointer_mut(&path) {
+            *leaf = Value::String(trim_middle_with_marker(&text));
+        }
+    }
+    // Still oversized after the pass budget: send a bounded metadata-only
+    // response instead of an over-cap payload.
+    let tool_name = result
+        .pointer("/structuredContent/toolName")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let was_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    *result = json!({
+        "content": [],
+        "structuredContent": {
+            "toolName": tool_name,
+            "success": false,
+            "responseExceedsEntryCap": true,
+        },
+        "isError": was_error,
+    });
+}
+
+/// Deepest JSON-pointer path of the largest string leaf, first on ties.
+fn largest_string_path(value: &Value, base: String, largest: &mut Option<(String, usize)>) {
+    match value {
+        Value::String(text) => {
+            if largest
+                .as_ref()
+                .is_none_or(|(_, bytes)| text.len() > *bytes)
+            {
+                *largest = Some((base, text.len()));
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                largest_string_path(item, pointer_child(&base, &index.to_string()), largest);
+            }
+        }
+        Value::Object(object) => {
+            for (key, child) in object {
+                largest_string_path(child, pointer_child(&base, key), largest);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn pointer_child(base: &str, token: &str) -> String {
+    let escaped = token.replace('~', "~0").replace('/', "~1");
+    if base.is_empty() {
+        format!("/{escaped}")
+    } else {
+        format!("{base}/{escaped}")
+    }
+}
+
+/// Keep a quarter of each end around a truncation marker; boundaries stay on
+/// char edges so the surviving text is valid UTF-8.
+fn trim_middle_with_marker(text: &str) -> String {
+    let keep = text.len() / 4;
+    let head_end = text.floor_char_boundary(keep);
+    let tail_start = text.ceil_char_boundary(text.len().saturating_sub(keep));
+    let omitted = tail_start.saturating_sub(head_end);
+    let mut trimmed = String::with_capacity(head_end + text.len() - tail_start + 96);
+    trimmed.push_str(&text[..head_end]);
+    trimmed.push_str(&format!(
+        "\n… <truncated {omitted} bytes; response exceeded the entry cap> …\n"
+    ));
+    trimmed.push_str(&text[tail_start..]);
+    trimmed
 }
 
 fn current_token_stats_layout() -> TokenStatsLayout {
