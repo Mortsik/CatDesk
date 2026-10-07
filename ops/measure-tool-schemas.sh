@@ -14,11 +14,12 @@
 #
 #   PROFILE   MultiTools, ReadOnly (CatDesk tools/list under a headless pty,
 #             computer mode), DevTools (direct stdio measurement of
-#             chrome-devtools-mcp@latest — the set CatDesk forwards verbatim
-#             in browser mode). Default: all three.
+#             chrome-devtools-mcp@latest using CatDesk's exact bridge
+#             handshake, with a second protocol probe that must return a
+#             byte-identical catalog). Default: all three.
 #   --bin     use an existing catdesk binary instead of cargo build --release.
-#   --out     also write per-profile tools/list JSON + a machine-readable
-#             summary.json into DIR.
+#   --out     also write per-profile tools/list JSON (raw DevTools catalog
+#             included) + machine-readable summary JSON into DIR.
 #
 # The script also prints Combined (Mode::Both + MultiTools) as a COMPUTED SUM
 # of the MultiTools and DevTools profiles. Driving CatDesk's full Both path
@@ -30,8 +31,11 @@
 # GPT-family tokenizer lands within roughly ±10% of it; the char counts are
 # reported alongside).
 #
-# Requirements: cargo, python3, curl. Everything runs against a throwaway
-# HOME/workspace/port; the only outside writes are cargo's own target dir.
+# Requirements: cargo, python3, curl, npx (Node.js, for the DevTools profile)
+# and a POSIX `timeout` utility (coreutils; not present on stock macOS —
+# install coreutils or run the DevTools profile through a wrapper that
+# provides `timeout`). Everything runs against a throwaway HOME/workspace/
+# port; the only outside writes are cargo's own target dir.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -70,6 +74,8 @@ fi
 
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 2; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 2; }
+command -v npx >/dev/null || { echo "npx (Node.js) is required for the DevTools profile" >&2; exit 2; }
+command -v timeout >/dev/null || { echo "a POSIX timeout utility is required (coreutils)" >&2; exit 2; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/catdesk-measure.XXXXXX")"
 PTQ_LOG="$TMP/pty.log"
@@ -83,7 +89,12 @@ cleanup() {
         [[ -f "$EXITED_FILE" ]] && break
         sleep 1
     done
-    [[ -f "$TMP/child.pid" ]] && kill "$(cat "$TMP/child.pid")" 2>/dev/null || true
+    # Kill only the driver — a direct child whose PID bash captured from $!,
+    # never a PID read back from a file that could have been recycled after
+    # the process died. Closing the driver's pty master also ends the app.
+    if [[ -n "${DRIVER_PID:-}" ]]; then
+        kill "$DRIVER_PID" 2>/dev/null || true
+    fi
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -126,6 +137,8 @@ def summarize(tools):
     total_chars = sum(r["chars"] for r in rows)
     return {
         "tools": rows,
+        # Sum of individually serialized tool objects; the serialized array
+        # adds the brackets and inter-object commas (see tools_array_bytes).
         "total_bytes": total,
         "total_chars": total_chars,
         "total_tokens_chars_over_4": round(total_chars / 4.0, 1),
@@ -147,7 +160,11 @@ if not isinstance(result, dict) or not isinstance(result.get("tools"), list) or 
     sys.exit(1)
 tools = result["tools"]
 summary = summarize(tools)
-summary["result_envelope_bytes"] = utf8(compact(result)) - summary["total_bytes"]
+tools_array_bytes = utf8(compact(tools))
+summary["tools_array_bytes"] = tools_array_bytes
+# Envelope is everything in the result beyond the serialized tools array
+# itself (ttlMs, cacheScope, resultType, result _meta, ...).
+summary["result_envelope_bytes"] = utf8(compact(result)) - tools_array_bytes
 summary["tool_count"] = len(tools)
 json.dump(summary, open(sys.argv[2], "w"), indent=2, ensure_ascii=False)
 
@@ -166,14 +183,24 @@ print(
     f"{summary['total_outputSchema_bytes']:>6} {summary['total_annotations_bytes']:>5} "
     f"{summary['total_meta_bytes']:>5}"
 )
-print(f"result envelope beyond the tools array: {summary['result_envelope_bytes']} bytes")
+print(f"serialized tools array (brackets + commas included): {summary['tools_array_bytes']} bytes")
+print(f"result envelope beyond the serialized tools array: {summary['result_envelope_bytes']} bytes")
 PYEOF
 
-# Direct measurement of the browser toolset CatDesk forwards verbatim: speak
-# stdio JSON-RPC to npx chrome-devtools-mcp@latest and record the resolved
-# package version from the initialize serverInfo.
+# Direct measurement of the browser toolset CatDesk forwards verbatim. The
+# handshake reproduces src/devtools.rs initialize_protocol() exactly (same
+# protocolVersion, clientInfo, id), and a second probe with a newer protocol
+# version must return a byte-identical catalog before the numbers count as
+# representative.
 cat >"$TMP/devtools_measure.py" <<'PYEOF'
 import json, os, subprocess, sys
+
+# Mirror src/devtools.rs constants so the probe speaks the same handshake
+# CatDesk's bridge speaks.
+PROTOCOL_VERSIONS = ["2025-03-26", "2025-06-18"]
+CLIENT_INFO = {"name": "catdesk-bridge", "version": "4.0.0"}
+INIT_ID = "dt-init"
+LIST_ID = "dt-tools-list"
 
 def compact(value):
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
@@ -181,46 +208,83 @@ def compact(value):
 def utf8(text):
     return len(text.encode("utf-8"))
 
-proc = subprocess.Popen(
-    ["npx", "-y", "chrome-devtools-mcp@latest"],
-    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    env={**os.environ, "NO_COLOR": "1"},
-    text=True, bufsize=1,
-)
+def fail(message):
+    print(f"MEASURE FAIL: {message}", file=sys.stderr)
+    sys.exit(1)
 
-def send(obj):
-    proc.stdin.write(json.dumps(obj) + "\n")
-    proc.stdin.flush()
-
-def readline_json():
+def read_response(proc, want_id):
+    """Read lines until the JSON-RPC response with want_id arrives; skip
+    notifications and mismatched ids, fail on EOF."""
     while True:
         line = proc.stdout.readline()
         if not line:
-            raise RuntimeError("chrome-devtools-mcp closed stdout before replying")
+            fail(f"chrome-devtools-mcp closed stdout before answering id {want_id!r}")
         line = line.strip()
-        if line:
-            return json.loads(line)
+        if not line:
+            continue
+        message = json.loads(line)
+        if message.get("id") != want_id:
+            continue
+        if message.get("error") is not None:
+            fail(f"chrome-devtools-mcp returned an error for id {want_id!r}: {message['error']}")
+        if not isinstance(message.get("result"), dict):
+            fail(f"chrome-devtools-mcp returned no result for id {want_id!r}")
+        return message["result"]
 
-send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                 "clientInfo": {"name": "catdesk-measure", "version": "1.0"}}})
-init = readline_json()
-server_info = init.get("result", {}).get("serverInfo", {})
-version = server_info.get("version", "unknown")
-send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-tools = None
-while tools is None:
-    msg = readline_json()
-    if msg.get("id") == 2:
-        if msg.get("error") is not None:
-            print(f"MEASURE FAIL: DevTools tools/list error: {msg['error']}", file=sys.stderr)
-            sys.exit(1)
-        tools = msg.get("result", {}).get("tools", [])
-if not tools:
-    print("MEASURE FAIL: DevTools tools/list returned an empty catalog", file=sys.stderr)
-    sys.exit(1)
+def measure(protocol_version):
+    proc = subprocess.Popen(
+        ["npx", "-y", "chrome-devtools-mcp@latest"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env={**os.environ, "NO_COLOR": "1"},
+        text=True, bufsize=1,
+    )
+    try:
+        proc.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": INIT_ID, "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": CLIENT_INFO,
+            },
+        }) + "\n")
+        proc.stdin.flush()
+        init = read_response(proc, INIT_ID)
+        server_info = init.get("serverInfo")
+        if not isinstance(server_info, dict) \
+                or not isinstance(server_info.get("name"), str) \
+                or not isinstance(server_info.get("version"), str):
+            fail(f"initialize (protocol {protocol_version}) returned no usable "
+                 f"serverInfo (name/version strings): {server_info!r}")
+        negotiated = init.get("protocolVersion")
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        proc.stdin.flush()
+        proc.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": LIST_ID, "method": "tools/list", "params": {},
+        }) + "\n")
+        proc.stdin.flush()
+        listing = read_response(proc, LIST_ID)
+        tools = listing.get("tools")
+        if not isinstance(tools, list) or not tools:
+            fail(f"tools/list (protocol {protocol_version}) returned no non-empty tools array")
+        return {
+            "requested_protocol": protocol_version,
+            "negotiated_protocol": negotiated,
+            "resolved_version": server_info["version"],
+            "server_name": server_info["name"],
+            "tools": tools,
+        }
+    finally:
+        proc.terminate()
 
+primary = measure(PROTOCOL_VERSIONS[0])
+secondary = measure(PROTOCOL_VERSIONS[1])
+if compact(primary["tools"]) != compact(secondary["tools"]):
+    fail("catalogs differ between protocol probes "
+         f"({PROTOCOL_VERSIONS[0]} vs {PROTOCOL_VERSIONS[1]}): the direct "
+         "measurement is not protocol-stable, so it cannot stand in for what "
+         "CatDesk forwards; record both raw catalogs and document the delta")
+
+tools = primary["tools"]
 rows = []
 for tool in tools:
     text = compact(tool)
@@ -231,25 +295,35 @@ for tool in tools:
         "tokens_chars_over_4": round(len(text) / 4.0, 1),
     })
 rows.sort(key=lambda r: r["bytes"], reverse=True)
-total = sum(r["bytes"] for r in rows)
-total_chars = sum(r["chars"] for r in rows)
+tool_objects_bytes = sum(r["bytes"] for r in rows)
+tool_objects_chars = sum(r["chars"] for r in rows)
+tools_array_bytes = utf8(compact(tools))
 summary = {
-    "source": "npx chrome-devtools-mcp@latest (stdio)",
-    "resolved_version": version,
+    "source": "npx chrome-devtools-mcp@latest (stdio), handshake mirrored from src/devtools.rs",
+    "resolved_version": primary["resolved_version"],
+    "server_name": primary["server_name"],
+    "negotiated_protocol": primary["negotiated_protocol"],
+    "protocol_equivalence_checked": PROTOCOL_VERSIONS,
     "tools": rows,
     "tool_count": len(tools),
-    "total_bytes": total,
-    "total_chars": total_chars,
-    "total_tokens_chars_over_4": round(total_chars / 4.0, 1),
+    "tool_objects_bytes": tool_objects_bytes,
+    "tools_array_bytes": tools_array_bytes,
+    "total_bytes": tool_objects_bytes,
+    "total_chars": tool_objects_chars,
+    "total_tokens_chars_over_4": round(tool_objects_chars / 4.0, 1),
 }
 json.dump(summary, open(sys.argv[1], "w"), indent=2, ensure_ascii=False)
-print(f"chrome-devtools-mcp resolved version: {version}")
-print(f"tools: {summary['tool_count']}")
+json.dump(tools, open(sys.argv[2], "w"), indent=2, ensure_ascii=False)
+print(f"chrome-devtools-mcp resolved version: {primary['resolved_version']} "
+      f"(negotiated protocol {primary['negotiated_protocol']}; "
+      f"{PROTOCOL_VERSIONS[0]}/{PROTOCOL_VERSIONS[1]} catalogs byte-identical)")
+print(f"tools: {summary['tool_count']}  objects: {tool_objects_bytes} B  "
+      f"serialized array: {tools_array_bytes} B")
 print(f"{'tool':<28} {'bytes':>7} {'~tokens':>8}")
 for r in rows:
     print(f"{r['name']:<28} {r['bytes']:>7} {r['tokens_chars_over_4']:>8.0f}")
-print(f"{'TOTAL':<28} {total:>7} {summary['total_tokens_chars_over_4']:>8.0f}")
-proc.terminate()
+print(f"{'TOTAL objects':<28} {tool_objects_bytes:>7} "
+      f"{summary['total_tokens_chars_over_4']:>8.0f}")
 PYEOF
 
 cat >"$TMP/drive.py" <<'EOF'
@@ -314,11 +388,13 @@ for PROFILE in "${PROFILES[@]}"; do
     if [[ "$PROFILE" == "DevTools" ]]; then
         echo "== profile $PROFILE: measuring chrome-devtools-mcp@latest over stdio =="
         DEVTOOLS_SUMMARY="$TMP/summary-DevTools.json"
-        timeout 180 python3 "$TMP/devtools_measure.py" "$DEVTOOLS_SUMMARY" \
+        DEVTOOLS_RAW="$TMP/devtools-tools-list.json"
+        timeout 240 python3 "$TMP/devtools_measure.py" "$DEVTOOLS_SUMMARY" "$DEVTOOLS_RAW" \
             || fail "DevTools measurement failed"
         if [[ -n "$OUT" ]]; then
             mkdir -p "$OUT"
             cp "$DEVTOOLS_SUMMARY" "$OUT/summary-DevTools.json"
+            cp "$DEVTOOLS_RAW" "$OUT/devtools-tools-list.json"
         fi
         echo
         continue
@@ -378,9 +454,13 @@ EOF
     done
     # The driver's quit branch can outlive the app (it writes 'q' on a fixed
     # cadence); stop the app (child.pid holds the pty child) and the driver
-    # itself, then reap the driver so the next profile starts clean.
+    # itself, then reap the driver so the next profile starts clean. The
+    # child.pid file is removed immediately after its single use so a stale
+    # recycled PID can never be signalled from the EXIT trap.
     if [[ -f "$TMP/child.pid" ]]; then
-        kill "$(cat "$TMP/child.pid")" 2>/dev/null || true
+        child_pid="$(cat "$TMP/child.pid")"
+        rm -f "$TMP/child.pid"
+        kill "$child_pid" 2>/dev/null || true
     fi
     kill "$DRIVER_PID" 2>/dev/null || true
     wait "$DRIVER_PID" 2>/dev/null || true
@@ -424,7 +504,8 @@ combined = {
     "note": "computed sum of measured MultiTools and DevTools profiles, "
             "not a single tools/list capture",
     "tool_count": mt["tool_count"] + dt["tool_count"],
-    "total_bytes": mt["total_bytes"] + dt["total_bytes"],
+    "tool_objects_bytes": mt["total_bytes"] + dt["total_bytes"],
+    "tools_array_bytes": mt["tools_array_bytes"] + dt["tools_array_bytes"],
     "total_chars": mt["total_chars"] + dt["total_chars"],
     "total_tokens_chars_over_4": round(mt["total_tokens_chars_over_4"]
                                        + dt["total_tokens_chars_over_4"], 1),
@@ -432,7 +513,8 @@ combined = {
 }
 json.dump(combined, open(sum_path, "w"), indent=2, ensure_ascii=False)
 print(f"== Combined (computed sum: MultiTools + DevTools) ==")
-print(f"tools: {combined['tool_count']}  bytes: {combined['total_bytes']}  "
+print(f"tools: {combined['tool_count']}  objects: {combined['tool_objects_bytes']} B  "
+      f"serialized arrays: {combined['tools_array_bytes']} B  "
       f"~tokens: {combined['total_tokens_chars_over_4']:,.0f}  "
       f"(chrome-devtools-mcp {combined['devtools_resolved_version']})")
 if out_dir:
