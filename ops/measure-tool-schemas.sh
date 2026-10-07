@@ -12,13 +12,23 @@
 # Usage:
 #   ops/measure-tool-schemas.sh [--bin PATH] [--out DIR] [PROFILE...]
 #
-#   PROFILE   one of: MultiTools, ReadOnly (default: both).
+#   PROFILE   MultiTools, ReadOnly (CatDesk tools/list under a headless pty,
+#             computer mode), DevTools (direct stdio measurement of
+#             chrome-devtools-mcp@latest — the set CatDesk forwards verbatim
+#             in browser mode). Default: all three.
 #   --bin     use an existing catdesk binary instead of cargo build --release.
 #   --out     also write per-profile tools/list JSON + a machine-readable
 #             summary.json into DIR.
 #
-# Token approximation: compact JSON characters / 4 (the usual ASCII JSON
-# heuristic; a GPT-family tokenizer lands within roughly ±10% of it).
+# The script also prints Combined (Mode::Both + MultiTools) as a COMPUTED SUM
+# of the MultiTools and DevTools profiles. Driving CatDesk's full Both path
+# headlessly needs a detected browser plus a multi-step TUI wizard, so the
+# combined figure is labeled as computed, never as a single tools/list
+# capture.
+#
+# Sizes are UTF-8 bytes; tokens use the compact-JSON chars/4 heuristic (a
+# GPT-family tokenizer lands within roughly ±10% of it; the char counts are
+# reported alongside).
 #
 # Requirements: cargo, python3, curl. Everything runs against a throwaway
 # HOME/workspace/port; the only outside writes are cargo's own target dir.
@@ -39,7 +49,7 @@ while [[ $# -gt 0 ]]; do
             OUT="$2"
             shift 2
             ;;
-        MultiTools | ReadOnly)
+        MultiTools | ReadOnly | DevTools)
             PROFILES+=("$1")
             shift
             ;;
@@ -50,7 +60,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 if [[ ${#PROFILES[@]} -eq 0 ]]; then
-    PROFILES=(MultiTools ReadOnly)
+    PROFILES=(MultiTools ReadOnly DevTools)
 fi
 if [[ -z "$BIN" ]]; then
     echo "== building release binary =="
@@ -84,19 +94,26 @@ import json, sys
 def compact(value):
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
+def utf8(text):
+    # Sizes reported in UTF-8 bytes; JSON escaped non-ASCII inflates bytes
+    # relative to the char count the tokenizer sees.
+    return len(text.encode("utf-8"))
+
 def field_size(tool, field):
     if field not in tool:
         return 0
-    return len(compact(tool[field]))
+    return utf8(compact(tool[field]))
 
 def summarize(tools):
     rows = []
     for tool in tools:
-        full = len(compact(tool))
+        full_text = compact(tool)
+        full = utf8(full_text)
         rows.append({
             "name": tool.get("name", "?"),
             "bytes": full,
-            "tokens_chars_over_4": round(full / 4.0, 1),
+            "chars": len(full_text),
+            "tokens_chars_over_4": round(len(full_text) / 4.0, 1),
             "description_bytes": field_size(tool, "description"),
             "title_bytes": field_size(tool, "title"),
             "inputSchema_bytes": field_size(tool, "inputSchema"),
@@ -106,10 +123,12 @@ def summarize(tools):
         })
     rows.sort(key=lambda r: r["bytes"], reverse=True)
     total = sum(r["bytes"] for r in rows)
+    total_chars = sum(r["chars"] for r in rows)
     return {
         "tools": rows,
         "total_bytes": total,
-        "total_tokens_chars_over_4": round(total / 4.0, 1),
+        "total_chars": total_chars,
+        "total_tokens_chars_over_4": round(total_chars / 4.0, 1),
         "total_description_bytes": sum(r["description_bytes"] for r in rows),
         "total_inputSchema_bytes": sum(r["inputSchema_bytes"] for r in rows),
         "total_outputSchema_bytes": sum(r["outputSchema_bytes"] for r in rows),
@@ -118,10 +137,17 @@ def summarize(tools):
     }
 
 payload = json.load(open(sys.argv[1]))
-result = payload.get("result", {})
-tools = result.get("tools", [])
+if payload.get("error") is not None:
+    print(f"MEASURE FAIL: tools/list returned a JSON-RPC error: {payload['error']}", file=sys.stderr)
+    sys.exit(1)
+result = payload.get("result")
+if not isinstance(result, dict) or not isinstance(result.get("tools"), list) or not result["tools"]:
+    print("MEASURE FAIL: tools/list returned no non-empty result.tools array "
+          "(HTTP 200 with an empty or malformed catalog is a failure)", file=sys.stderr)
+    sys.exit(1)
+tools = result["tools"]
 summary = summarize(tools)
-summary["result_envelope_bytes"] = len(compact(result)) - summary["total_bytes"]
+summary["result_envelope_bytes"] = utf8(compact(result)) - summary["total_bytes"]
 summary["tool_count"] = len(tools)
 json.dump(summary, open(sys.argv[2], "w"), indent=2, ensure_ascii=False)
 
@@ -141,6 +167,89 @@ print(
     f"{summary['total_meta_bytes']:>5}"
 )
 print(f"result envelope beyond the tools array: {summary['result_envelope_bytes']} bytes")
+PYEOF
+
+# Direct measurement of the browser toolset CatDesk forwards verbatim: speak
+# stdio JSON-RPC to npx chrome-devtools-mcp@latest and record the resolved
+# package version from the initialize serverInfo.
+cat >"$TMP/devtools_measure.py" <<'PYEOF'
+import json, os, subprocess, sys
+
+def compact(value):
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+def utf8(text):
+    return len(text.encode("utf-8"))
+
+proc = subprocess.Popen(
+    ["npx", "-y", "chrome-devtools-mcp@latest"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    env={**os.environ, "NO_COLOR": "1"},
+    text=True, bufsize=1,
+)
+
+def send(obj):
+    proc.stdin.write(json.dumps(obj) + "\n")
+    proc.stdin.flush()
+
+def readline_json():
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            raise RuntimeError("chrome-devtools-mcp closed stdout before replying")
+        line = line.strip()
+        if line:
+            return json.loads(line)
+
+send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                 "clientInfo": {"name": "catdesk-measure", "version": "1.0"}}})
+init = readline_json()
+server_info = init.get("result", {}).get("serverInfo", {})
+version = server_info.get("version", "unknown")
+send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+tools = None
+while tools is None:
+    msg = readline_json()
+    if msg.get("id") == 2:
+        if msg.get("error") is not None:
+            print(f"MEASURE FAIL: DevTools tools/list error: {msg['error']}", file=sys.stderr)
+            sys.exit(1)
+        tools = msg.get("result", {}).get("tools", [])
+if not tools:
+    print("MEASURE FAIL: DevTools tools/list returned an empty catalog", file=sys.stderr)
+    sys.exit(1)
+
+rows = []
+for tool in tools:
+    text = compact(tool)
+    rows.append({
+        "name": tool.get("name", "?"),
+        "bytes": utf8(text),
+        "chars": len(text),
+        "tokens_chars_over_4": round(len(text) / 4.0, 1),
+    })
+rows.sort(key=lambda r: r["bytes"], reverse=True)
+total = sum(r["bytes"] for r in rows)
+total_chars = sum(r["chars"] for r in rows)
+summary = {
+    "source": "npx chrome-devtools-mcp@latest (stdio)",
+    "resolved_version": version,
+    "tools": rows,
+    "tool_count": len(tools),
+    "total_bytes": total,
+    "total_chars": total_chars,
+    "total_tokens_chars_over_4": round(total_chars / 4.0, 1),
+}
+json.dump(summary, open(sys.argv[1], "w"), indent=2, ensure_ascii=False)
+print(f"chrome-devtools-mcp resolved version: {version}")
+print(f"tools: {summary['tool_count']}")
+print(f"{'tool':<28} {'bytes':>7} {'~tokens':>8}")
+for r in rows:
+    print(f"{r['name']:<28} {r['bytes']:>7} {r['tokens_chars_over_4']:>8.0f}")
+print(f"{'TOTAL':<28} {total:>7} {summary['total_tokens_chars_over_4']:>8.0f}")
+proc.terminate()
 PYEOF
 
 cat >"$TMP/drive.py" <<'EOF'
@@ -202,6 +311,18 @@ for PROFILE in "${PROFILES[@]}"; do
         MultiTools) TOOL_MODE_VALUE="multiTools" ;;
         ReadOnly) TOOL_MODE_VALUE="readOnly" ;;
     esac
+    if [[ "$PROFILE" == "DevTools" ]]; then
+        echo "== profile $PROFILE: measuring chrome-devtools-mcp@latest over stdio =="
+        DEVTOOLS_SUMMARY="$TMP/summary-DevTools.json"
+        timeout 180 python3 "$TMP/devtools_measure.py" "$DEVTOOLS_SUMMARY" \
+            || fail "DevTools measurement failed"
+        if [[ -n "$OUT" ]]; then
+            mkdir -p "$OUT"
+            cp "$DEVTOOLS_SUMMARY" "$OUT/summary-DevTools.json"
+        fi
+        echo
+        continue
+    fi
     HOME_DIR="$TMP/home-$PROFILE"
     WORKSPACE="$TMP/workspace-$PROFILE"
     mkdir -p "$HOME_DIR/.catdesk" "$WORKSPACE"
@@ -278,5 +399,51 @@ EOF
     fi
     echo
 done
+
+# Combined default-session footprint (Mode::Both + MultiTools) as a computed
+# sum: CatDesk in Both mode with a live DevTools bridge could not be driven
+# headlessly in every environment (it needs a detected browser and a
+# multi-step TUI wizard), so when both inputs were measured, report the sum
+# explicitly as computed, not as a single tools/list capture.
+SUM_FILE="$TMP/summary-Combined.json"
+if python3 - "$SUM_FILE" "${OUT:-}" "$TMP" <<'PYEOF'
+import json, os, sys
+
+sum_path, out_dir, tmp_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+summaries = {}
+for name in ("MultiTools", "DevTools"):
+    for candidate in (os.path.join(out_dir, f"summary-{name}.json") if out_dir else None,
+                      os.path.join(tmp_dir, f"summary-{name}.json")):
+        if candidate and os.path.exists(candidate):
+            summaries[name] = json.load(open(candidate))
+            break
+if len(summaries) != 2:
+    sys.exit(1)
+mt, dt = summaries["MultiTools"], summaries["DevTools"]
+combined = {
+    "note": "computed sum of measured MultiTools and DevTools profiles, "
+            "not a single tools/list capture",
+    "tool_count": mt["tool_count"] + dt["tool_count"],
+    "total_bytes": mt["total_bytes"] + dt["total_bytes"],
+    "total_chars": mt["total_chars"] + dt["total_chars"],
+    "total_tokens_chars_over_4": round(mt["total_tokens_chars_over_4"]
+                                       + dt["total_tokens_chars_over_4"], 1),
+    "devtools_resolved_version": dt.get("resolved_version", "unknown"),
+}
+json.dump(combined, open(sum_path, "w"), indent=2, ensure_ascii=False)
+print(f"== Combined (computed sum: MultiTools + DevTools) ==")
+print(f"tools: {combined['tool_count']}  bytes: {combined['total_bytes']}  "
+      f"~tokens: {combined['total_tokens_chars_over_4']:,.0f}  "
+      f"(chrome-devtools-mcp {combined['devtools_resolved_version']})")
+if out_dir:
+    json.dump(combined, open(os.path.join(out_dir, "summary-Combined.json"), "w"),
+              indent=2, ensure_ascii=False)
+sys.exit(0)
+PYEOF
+then
+    :
+else
+    echo "note: Combined summary skipped (needs measured MultiTools and DevTools profiles)"
+fi
 
 echo "MEASURE OK"
