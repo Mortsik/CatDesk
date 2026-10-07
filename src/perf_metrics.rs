@@ -1046,17 +1046,24 @@ mod tests {
         record_cache_miss(CacheKind::AppConfig);
         record_cache_hit(CacheKind::DataUri);
         let after = snapshot();
-        assert_eq!(
-            after.cache_hits[CacheKind::AppConfig as usize],
-            before.cache_hits[CacheKind::AppConfig as usize] + 1
+        // Parallel mcp tests hit the same process-global caches (app config,
+        // file values), so only this test's own contribution (>=) can be
+        // asserted safely — like the tool counters above. A missing increment
+        // would still leave the delta below 1 and fail these assertions.
+        assert!(
+            after.cache_hits[CacheKind::AppConfig as usize]
+                >= before.cache_hits[CacheKind::AppConfig as usize] + 1,
+            "an AppConfig cache hit must accumulate"
         );
-        assert_eq!(
-            after.cache_misses[CacheKind::AppConfig as usize],
-            before.cache_misses[CacheKind::AppConfig as usize] + 1
+        assert!(
+            after.cache_misses[CacheKind::AppConfig as usize]
+                >= before.cache_misses[CacheKind::AppConfig as usize] + 1,
+            "an AppConfig cache miss must accumulate"
         );
-        assert_eq!(
-            after.cache_hits[CacheKind::DataUri as usize],
-            before.cache_hits[CacheKind::DataUri as usize] + 1
+        assert!(
+            after.cache_hits[CacheKind::DataUri as usize]
+                >= before.cache_hits[CacheKind::DataUri as usize] + 1,
+            "a DataUri cache hit must accumulate"
         );
     }
 
