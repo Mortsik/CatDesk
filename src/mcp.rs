@@ -527,7 +527,34 @@ async fn handle_tools_call_with_result_store(
                     Path::new(workspace_root),
                     Some(reduction),
                 ) {
-                    Ok(outcome) => outcome,
+                    Ok(Some(outcome)) => Some(outcome),
+                    Ok(None) => {
+                        // Reduced below the inline budget: nothing is
+                        // externalized and no manifest appears, so the
+                        // disclosure rides on the result directly. Attach it
+                        // before the final size check — the added fields can
+                        // push the answer over the budget again, and that
+                        // overflow goes through the standard externalization
+                        // path, whose rebuilt manifest re-attaches the
+                        // disclosure at every compaction level.
+                        attach_entry_cap_disclosure(result, reduction);
+                        if serde_json::to_vec(result).map_or(0, |bytes| bytes.len())
+                            > response_budget::DEFAULT_INLINE_RESPONSE_BYTES
+                        {
+                            response_budget::apply_response_budget(
+                                result,
+                                is_error,
+                                result_store,
+                                session_namespace,
+                                Path::new(workspace_root),
+                                Some(reduction),
+                            )
+                            .ok()
+                            .flatten()
+                        } else {
+                            None
+                        }
+                    }
                     // Store unavailable after the reduction: the lossy
                     // answer travels inline without a manifest, so the
                     // disclosure rides on the result directly.

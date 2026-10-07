@@ -6543,6 +6543,96 @@ async fn entry_cap_reduction_is_disclosed_in_the_inline_manifest() {
     std::fs::remove_dir_all(workspace_root).ok();
 }
 
+/// A result only slightly over the entry cap can halve down below the inline
+/// budget: nothing is externalized, so no manifest appears and the
+/// disclosure must ride on the inline result itself — all three fields,
+/// with original-minus-omitted still inside the inline budget.
+#[tokio::test]
+async fn sub_budget_entry_cap_reduction_discloses_loss_inline_without_a_manifest() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-entry-cap-inline-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = LargeResultStore::new(LargeResultStoreConfig {
+        ttl: std::time::Duration::from_secs(3600),
+        max_entry_bytes: 120 * 1024,
+        max_total_bytes: 1024 * 1024,
+        max_range_bytes: 128 * 1024,
+        max_search_matches: 100,
+        search_chunk_bytes: 64 * 1024,
+        tombstone_limit: 1024,
+    })
+    .expect("create capped store");
+    // One newline-free ~126 KiB stdout: over the 120 KiB cap with margin,
+    // while a single halving of that stream lands the reduced result below
+    // the 64 KiB inline budget.
+    let req = tool_call_request(
+        "run_command",
+        json!({
+            "command": concat!(
+                "printf 'HEAD-OUT-SENTINEL\\n'; ",
+                "head -c 126000 /dev/zero | tr '\\0' 'x'; ",
+                "printf '\\nTAIL-OUT-SENTINEL\\n'"
+            )
+        }),
+    );
+
+    let response = handle_tools_call_with_result_store(
+        &req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+
+    let inline = response.result.as_ref().expect("missing result");
+    assert_eq!(
+        inline.get("entryCapTruncated").and_then(Value::as_bool),
+        Some(true),
+        "a sub-budget lossy reduction must still disclose the loss"
+    );
+    let original_bytes = inline
+        .get("entryCapOriginalBytes")
+        .and_then(Value::as_u64)
+        .expect("entryCapOriginalBytes must disclose the pre-reduction size");
+    let omitted_bytes = inline
+        .get("entryCapOmittedBytes")
+        .and_then(Value::as_u64)
+        .expect("entryCapOmittedBytes must quantify the dropped bytes");
+    assert!(
+        original_bytes > store.max_entry_bytes(),
+        "the disclosed original size must exceed the cap, saw {original_bytes}"
+    );
+    assert!(omitted_bytes > 0, "the halving must drop bytes");
+    let reduced_bytes = original_bytes - omitted_bytes;
+    assert!(
+        reduced_bytes <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES as u64,
+        "the reduced size must sit below the inline budget, saw {reduced_bytes}"
+    );
+    assert!(
+        inline.pointer("/responseBudget").is_none(),
+        "a sub-budget result must stay inline without an outputRef manifest"
+    );
+    let stdout = inline
+        .pointer("/structuredContent/stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        stdout.contains("HEAD-OUT-SENTINEL") && stdout.contains("TAIL-OUT-SENTINEL"),
+        "the reduced stdout must keep both ends"
+    );
+
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
 #[tokio::test]
 async fn byte_accounting_reports_externalized_results_from_the_budget_policy() {
     let workspace_root =
