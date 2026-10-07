@@ -507,19 +507,35 @@ async fn handle_tools_call_with_result_store(
             result_store,
             session_namespace,
             Path::new(workspace_root),
+            None,
         ) {
             Ok(outcome) => outcome,
             Err(StoreError::EntryTooLarge { .. }) => {
+                // The reducer is lossy and the retry stores the reduced
+                // payload, so the inline manifest must disclose the
+                // truncation before anything reads the outputRef.
+                let reduction = response_budget::EntryCapReduction {
+                    original_bytes: serde_json::to_vec(result)
+                        .map_or(0, |bytes| bytes.len() as u64),
+                };
                 reduce_result_to_entry_cap(result, result_store.max_entry_bytes());
-                response_budget::apply_response_budget(
+                match response_budget::apply_response_budget(
                     result,
                     is_error,
                     result_store,
                     session_namespace,
                     Path::new(workspace_root),
-                )
-                .ok()
-                .flatten()
+                    Some(reduction),
+                ) {
+                    Ok(outcome) => outcome,
+                    // Store unavailable after the reduction: the lossy
+                    // answer travels inline without a manifest, so the
+                    // disclosure rides on the result directly.
+                    Err(_) => {
+                        attach_entry_cap_disclosure(result, reduction);
+                        None
+                    }
+                }
             }
             Err(_) => None,
         };
@@ -626,6 +642,26 @@ fn reduce_result_to_entry_cap(result: &mut Value, cap_bytes: u64) {
         },
         "isError": was_error,
     });
+}
+
+/// Entry-cap disclosure for a reduced result that could not be externalized
+/// (store unavailable after the retry): no manifest exists on this path, so
+/// the truncation metadata is attached to the result directly and survives
+/// as-is — nothing compacts the response afterwards.
+fn attach_entry_cap_disclosure(result: &mut Value, reduction: response_budget::EntryCapReduction) {
+    let current_bytes = serde_json::to_vec(result).map_or(0, |bytes| bytes.len() as u64);
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    object.insert("entryCapTruncated".to_string(), Value::Bool(true));
+    object.insert(
+        "entryCapOriginalBytes".to_string(),
+        json!(reduction.original_bytes),
+    );
+    object.insert(
+        "entryCapOmittedBytes".to_string(),
+        json!(reduction.original_bytes.saturating_sub(current_bytes)),
+    );
 }
 
 /// Deepest JSON-pointer path of the largest string leaf, first on ties.

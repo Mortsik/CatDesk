@@ -72,12 +72,24 @@ impl OmissionTracker {
     }
 }
 
+/// Disclosure for a result that was lossy-reduced to fit the store's entry
+/// cap before externalization: the payload behind `outputRef` is not the
+/// full result, so the inline manifest must say so at every compaction
+/// level — otherwise retrieval tools look complete while data was
+/// irreversibly dropped.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EntryCapReduction {
+    /// Serialized size of the result before the reducer touched it.
+    pub(crate) original_bytes: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BudgetCandidate {
     original: Vec<u8>,
     preview: Value,
     omissions: OmissionTracker,
     is_error: bool,
+    entry_cap: Option<EntryCapReduction>,
 }
 
 /// Byte accounting for one externalized result, straight from the policy's
@@ -123,31 +135,49 @@ impl BudgetCandidate {
     fn attach_manifest(&mut self, output_ref: &str) {
         let preview_bytes = serialized_len(&self.preview);
         if let Some(object) = self.preview.as_object_mut() {
-            object.insert(
-                "responseBudget".to_string(),
-                json!({
-                    "policy": POLICY_NAME,
-                    "limitBytes": DEFAULT_INLINE_RESPONSE_BYTES,
-                    "originalBytes": self.original.len(),
-                    "previewBytes": preview_bytes,
-                    "omittedBytes": self.original.len().saturating_sub(preview_bytes),
-                    "outputRef": output_ref,
-                    "contentType": "application/json",
-                    "retrieval": {
-                        "tool": "read_result",
-                        "arguments": { "result_id": output_ref }
-                    },
-                    "search": {
-                        "tool": "search_result",
-                        "arguments": { "result_id": output_ref }
-                    },
-                    "preview": {
-                        "strategy": "structured-head-tail",
-                        "omissionCount": self.omissions.total,
-                        "omissions": self.omissions.details
-                    }
-                }),
-            );
+            let mut manifest = json!({
+                "policy": POLICY_NAME,
+                "limitBytes": DEFAULT_INLINE_RESPONSE_BYTES,
+                "originalBytes": self.original.len(),
+                "previewBytes": preview_bytes,
+                "omittedBytes": self.original.len().saturating_sub(preview_bytes),
+                "outputRef": output_ref,
+                "contentType": "application/json",
+                "retrieval": {
+                    "tool": "read_result",
+                    "arguments": { "result_id": output_ref }
+                },
+                "search": {
+                    "tool": "search_result",
+                    "arguments": { "result_id": output_ref }
+                },
+                "preview": {
+                    "strategy": "structured-head-tail",
+                    "omissionCount": self.omissions.total,
+                    "omissions": self.omissions.details
+                }
+            });
+            // Entry-cap fields live here, not in the payload, because the
+            // manifest is rebuilt after every compaction level while string
+            // fields are subject to halving and head+tail previewing.
+            if let Some(reduction) = self.entry_cap
+                && let Some(manifest) = manifest.as_object_mut()
+            {
+                manifest.insert("entryCapTruncated".to_string(), Value::Bool(true));
+                manifest.insert(
+                    "entryCapOriginalBytes".to_string(),
+                    json!(reduction.original_bytes),
+                );
+                manifest.insert(
+                    "entryCapOmittedBytes".to_string(),
+                    json!(
+                        reduction
+                            .original_bytes
+                            .saturating_sub(self.original.len() as u64)
+                    ),
+                );
+            }
+            object.insert("responseBudget".to_string(), manifest);
         }
     }
 }
@@ -158,10 +188,12 @@ pub(crate) fn apply_response_budget(
     store: &LargeResultStore,
     owner_session: Option<&str>,
     workspace_root: &Path,
+    entry_cap_reduction: Option<EntryCapReduction>,
 ) -> Result<Option<BudgetOutcome>, StoreError> {
-    let Some(candidate) = prepare_response_budget(result, is_error) else {
+    let Some(mut candidate) = prepare_response_budget(result, is_error) else {
         return Ok(None);
     };
+    candidate.entry_cap = entry_cap_reduction;
 
     let raw_bytes = candidate.payload().len() as u64;
     let stored = store.put(
@@ -201,6 +233,7 @@ pub(crate) fn prepare_response_budget(result: &Value, is_error: bool) -> Option<
         preview,
         omissions,
         is_error,
+        entry_cap: None,
     })
 }
 
@@ -956,10 +989,16 @@ mod tests {
         let expected = serde_json::to_vec(&original).unwrap();
         let mut inline = original;
 
-        let outcome =
-            apply_response_budget(&mut inline, false, &store, Some("session-a"), &workspace)
-                .expect("budget application")
-                .expect("must externalize");
+        let outcome = apply_response_budget(
+            &mut inline,
+            false,
+            &store,
+            Some("session-a"),
+            &workspace,
+            None,
+        )
+        .expect("budget application")
+        .expect("must externalize");
 
         assert!(serde_json::to_vec(&inline).unwrap().len() <= DEFAULT_INLINE_RESPONSE_BYTES);
         assert_eq!(
@@ -1026,10 +1065,16 @@ mod tests {
         let expected_bytes = serde_json::to_vec(&original).unwrap().len() as u64;
         let mut inline = original;
 
-        let outcome =
-            apply_response_budget(&mut inline, false, &store, Some("session-a"), &workspace)
-                .expect("budget application")
-                .expect("must externalize");
+        let outcome = apply_response_budget(
+            &mut inline,
+            false,
+            &store,
+            Some("session-a"),
+            &workspace,
+            None,
+        )
+        .expect("budget application")
+        .expect("must externalize");
 
         assert_eq!(
             outcome.raw_bytes, expected_bytes,
@@ -1073,9 +1118,15 @@ mod tests {
         let before = original.clone();
         let mut inline = original;
 
-        let error =
-            apply_response_budget(&mut inline, false, &store, Some("session-a"), &workspace)
-                .expect_err("store must reject oversized entry");
+        let error = apply_response_budget(
+            &mut inline,
+            false,
+            &store,
+            Some("session-a"),
+            &workspace,
+            None,
+        )
+        .expect_err("store must reject oversized entry");
 
         assert_eq!(error.code(), "entry_too_large");
         assert_eq!(
@@ -1084,5 +1135,60 @@ mod tests {
         );
 
         std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// Entry-cap disclosure must live in the manifest, not the payload: the
+    /// manifest is rebuilt after every compaction level, so the disclosure
+    /// survives while string markers can be previewed away. The pre-reduction
+    /// size comes from the reducer's caller, not from the reduced payload.
+    #[test]
+    fn entry_cap_disclosure_survives_compaction_and_quantifies_the_loss() {
+        let mut result = json!({
+            "content": [],
+            "structuredContent": {
+                "toolName": "run_command",
+                "success": true,
+                "exitCode": 0,
+                "stdout": oversized_text("HEAD-SENTINEL\n", "\nTAIL-SENTINEL"),
+                "stderr": ""
+            }
+        });
+        let pre_reduction_bytes = serialized_len(&result) as u64;
+        // The production sequence: the reducer drops bytes down to the entry
+        // cap, and the reduced payload still exceeds the inline budget so the
+        // preview is compacted again.
+        super::super::reduce_result_to_entry_cap(&mut result, 120 * 1024);
+        let reduced_bytes = serialized_len(&result) as u64;
+        assert!(
+            reduced_bytes < pre_reduction_bytes,
+            "reduction must be lossy"
+        );
+        let mut candidate = prepare_response_budget(&result, false).expect("must budget");
+        candidate.entry_cap = Some(EntryCapReduction {
+            original_bytes: pre_reduction_bytes,
+        });
+
+        let preview = candidate.finish("lr_entry_cap_disclosed");
+
+        let budget = manifest(&preview);
+        assert_eq!(
+            budget.get("entryCapTruncated").and_then(Value::as_bool),
+            Some(true),
+            "the inline answer must disclose the lossy reduction"
+        );
+        assert_eq!(
+            budget.get("entryCapOriginalBytes").and_then(Value::as_u64),
+            Some(pre_reduction_bytes),
+            "the disclosed original size must be measured before the reducer ran"
+        );
+        let omitted = budget
+            .get("entryCapOmittedBytes")
+            .and_then(Value::as_u64)
+            .expect("entryCapOmittedBytes must quantify the dropped bytes");
+        assert!(omitted > 0, "reduction must drop bytes, saw {omitted}");
+        assert!(
+            omitted < pre_reduction_bytes,
+            "the loss must be partial, saw {omitted}/{pre_reduction_bytes}"
+        );
     }
 }
