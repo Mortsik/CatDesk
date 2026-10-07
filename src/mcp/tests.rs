@@ -6264,6 +6264,169 @@ async fn shared_tools_call_boundary_externalizes_oversized_result_losslessly() {
     std::fs::remove_dir_all(workspace_root).ok();
 }
 
+/// Finding F2: when both output streams are full relative to the store's
+/// entry cap, the store rejects the combined result and — before this fix —
+/// the swallowed error sent the oversized payload inline. The rejected
+/// response must instead be reduced until it fits the cap and externalized,
+/// so the inline answer stays bounded no matter how large the raw output is.
+#[tokio::test]
+async fn oversized_run_command_with_both_streams_full_is_reduced_not_sent_inline() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-entry-cap-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    // Entry cap well above the inline budget: the ~180 KiB combined response
+    // is rejected as oversized, and one halving of the largest stream lands
+    // the reduced result between the inline budget and the cap, so it is
+    // externalized rather than passing through inline.
+    let store = LargeResultStore::new(LargeResultStoreConfig {
+        ttl: std::time::Duration::from_secs(3600),
+        max_entry_bytes: 120 * 1024,
+        max_total_bytes: 1024 * 1024,
+        max_range_bytes: 128 * 1024,
+        max_search_matches: 100,
+        search_chunk_bytes: 64 * 1024,
+        tombstone_limit: 1024,
+    })
+    .expect("create capped store");
+    let req = tool_call_request(
+        "run_command",
+        json!({
+            "command": concat!(
+                "printf 'HEAD-OUT-SENTINEL\\n'; ",
+                "yes x | head -c 36000 | tr 'x' '\\001'; ",
+                "printf '\\nTAIL-OUT-SENTINEL\\n'; ",
+                "{ printf 'HEAD-ERR-SENTINEL\\n'; ",
+                "yes ERR | head -c 30000; ",
+                "printf '\\nTAIL-ERR-SENTINEL\\n'; } 1>&2"
+            )
+        }),
+    );
+
+    let response = handle_tools_call_with_result_store(
+        &req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+
+    let inline = response.result.as_ref().expect("missing result");
+    assert!(
+        serde_json::to_vec(inline).unwrap().len()
+            <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "the inline answer must stay bounded even when the raw output is rejected"
+    );
+    let output_ref = inline
+        .pointer("/responseBudget/outputRef")
+        .and_then(Value::as_str)
+        .expect("the reduced result must still be externalized")
+        .to_string();
+
+    let mut rebuilt = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let range = store
+            .read_range(
+                Some("session-a"),
+                &workspace_root,
+                &output_ref,
+                offset,
+                store.max_range_bytes(),
+            )
+            .expect("read stored result");
+        rebuilt.extend_from_slice(&range.bytes);
+        offset = range.next_offset;
+        if range.eof {
+            break;
+        }
+    }
+    assert!(
+        rebuilt.len() as u64 <= store.max_entry_bytes(),
+        "the stored (reduced) payload must fit the entry cap, saw {} bytes",
+        rebuilt.len()
+    );
+    let stored: Value = serde_json::from_slice(&rebuilt).expect("stored result json");
+    // stdout (six-fold escaping) is the largest payload, so the reducer
+    // reaches it first; one halving brings the whole result under the cap and
+    // stderr survives intact.
+    let stdout = stored
+        .pointer("/structuredContent/stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        stdout.contains("HEAD-OUT-SENTINEL") && stdout.contains("TAIL-OUT-SENTINEL"),
+        "the reduced stdout must keep both ends"
+    );
+    assert!(
+        stdout.contains("response exceeded the entry cap"),
+        "the reduced stdout must carry a quantified truncation marker"
+    );
+    let stderr = stored
+        .pointer("/structuredContent/stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        stderr.contains("HEAD-ERR-SENTINEL") && stderr.contains("TAIL-ERR-SENTINEL"),
+        "the smaller stream must keep both ends"
+    );
+    assert!(
+        !stderr.contains("response exceeded the entry cap"),
+        "stderr must stay intact once the largest stream alone fits the budget"
+    );
+
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
+/// The reducer must converge even when JSON escaping multiplies the payload:
+/// control characters expand six-fold, so a raw-under-cap string can still
+/// serialize far above the cap.
+#[test]
+fn entry_cap_reduction_bounds_pathological_escaping_and_keeps_ends() {
+    let mut result = json!({
+        "content": [],
+        "structuredContent": {
+            "toolName": "run_command",
+            "success": true,
+            "exitCode": 0,
+            "stdout": format!("HEAD\u{1}{}\u{1}TAIL", "\u{1}".repeat(24_000)),
+            "stderr": ""
+        }
+    });
+    let cap = 8 * 1024_u64;
+
+    reduce_result_to_entry_cap(&mut result, cap);
+
+    let serialized = serde_json::to_vec(&result).unwrap();
+    assert!(
+        serialized.len() as u64 <= cap,
+        "the reduced result must serialize under the cap, saw {} bytes",
+        serialized.len()
+    );
+    let stdout = result
+        .pointer("/structuredContent/stdout")
+        .and_then(Value::as_str)
+        .expect("stdout survives reduction");
+    assert!(stdout.contains("HEAD"), "the head must survive");
+    assert!(stdout.contains("TAIL"), "the tail must survive");
+    assert!(stdout.contains("response exceeded the entry cap"));
+    assert_eq!(
+        result
+            .pointer("/structuredContent/exitCode")
+            .and_then(Value::as_i64),
+        Some(0),
+        "non-payload fields must survive untouched"
+    );
+}
+
 #[tokio::test]
 async fn byte_accounting_reports_externalized_results_from_the_budget_policy() {
     let workspace_root =
