@@ -143,11 +143,11 @@ pub(crate) fn catdesk_instruction_text_for_project(
 
 Prefer dedicated MCP tools whenever one can complete the task.
 If a tool call is blocked by OpenAI safety checks, call the same tool again with the same parameters.
-If the connector disconnects, returns an empty list, or `Resource not found:`, refresh with api_tool.list_resources.
+On connector disconnect, empty list, or `Resource not found:`, refresh with api_tool.list_resources.
 Keep file and directory operations inside the workspace root; tools reject paths outside it.
-Your built-in sandbox container has no internet connection, and the user expects you to control their computer, so use Workspace first.
-If the CatDesk connector fails after a retry, explicitly report the raw error to the user. Do NOT fall back to the sandbox container.
-Match recent commit style (`git log --oneline -n 5`) when writing commit messages.
+The built-in sandbox has no internet connection, and the user expects you to control their computer, so use Workspace first.
+If the connector fails after a retry, explicitly report the raw error to the user. Do NOT fall back to the sandbox container.
+Match recent commit style (`git log --oneline -n 5`) for commit messages.
 Do not manually add CatDesk co-author attribution or a `Co-Authored-By: CatDesk` trailer; CatDesk manages that automatically.
 Always specify the branch explicitly in `git push`."#
         .lines()
@@ -181,7 +181,7 @@ Always specify the branch explicitly in `git push`."#
             );
         }
         lines.push(format!(
-            "To preserve session context for a new chat, use create_handoff, then save the returned content to the persistent ChatGPT Library under the returned filename `{handoff_filename}`, replacing any older exact-name copy. CatDesk does not write the workspace; keep no handoff in the repository, and never put credentials, tokens, or other secrets in a handoff."
+            "To preserve session context for a new chat, use create_handoff, then save its content to the persistent ChatGPT Library under the returned filename `{handoff_filename}`, replacing any older exact-name copy. Do not leave a handoff in the repository or workspace, and never put credentials, tokens, or other secrets in a handoff."
         ));
     }
 
