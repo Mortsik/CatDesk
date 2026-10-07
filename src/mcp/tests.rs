@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 
 use super::agents_state::cached_file_value;
 use super::commands::{change_scope_for_request, command_job_output_text, handle_poll_command};
-use super::file_tools::handle_create_handoff_for_project;
+use super::file_tools::{handle_create_handoff_for_project, image_tool_analyzed_response};
 use super::instruction::{
     CATDESK_INSTRUCTION_REQUIRED_CODE, CATDESK_INSTRUCTION_REQUIRED_MESSAGE,
     CATDESK_INSTRUCTION_REQUIRED_WIDGET_MESSAGE,
@@ -6277,4 +6277,103 @@ async fn result_retrieval_reconstructs_multi_megabyte_payload_through_bounded_mc
     assert_eq!(offset, payload.len() as u64);
     assert_eq!(rebuilt, payload);
     std::fs::remove_dir_all(workspace_root).ok();
+}
+
+// ── read_image vision description cap (catdesk-080, audit finding F1) ───────
+
+fn analyzed_response_for_description(
+    workspace_root: &Path,
+    analysis: String,
+) -> (JsonRpcResponse, workspace_tools::ReadImageOutput) {
+    let image_path = workspace_root.join("cap-check.png");
+    write_test_image(&image_path, image::ImageFormat::Png, 24, 12);
+    let output = workspace_tools::read_image(
+        &workspace_root.to_string_lossy(),
+        "cap-check.png",
+        None,
+        None,
+    )
+    .expect("read test image");
+    let config = crate::vision::VisionConfig {
+        backend: crate::vision::VisionBackend::Gemini,
+        model: "test-model".to_string(),
+        api_key: "test-key".to_string(),
+    };
+    let req = tool_call_request("read_image", json!({}));
+    let response = image_tool_analyzed_response(&req, &output, &config, analysis);
+    (response, output)
+}
+
+#[test]
+fn analyzed_read_image_caps_vision_description_and_keeps_image_bytes() {
+    let workspace_root = read_workspace("vision-description-cap");
+    let long_analysis = format!("VISION-HEAD{}", "detail ".repeat(40_000));
+
+    let (response, output) = analyzed_response_for_description(&workspace_root, long_analysis);
+    let result = response.result.expect("analyzed result");
+
+    // The serialized response stays bounded even though the model emitted a
+    // ~280 KB description: only the capped preview travels inline.
+    let serialized = serde_json::to_vec(&result).expect("serialize result");
+    let cap = crate::mcp::response_budget::ANALYSIS_DESCRIPTION_PREVIEW_BYTES;
+    assert!(
+        serialized.len() < cap + 8 * 1024,
+        "analyzed response must stay near the description cap, got {} bytes",
+        serialized.len()
+    );
+
+    // Multimodal exemption invariant: the native image content is untouched.
+    let content_image = &result["content"][0];
+    assert_eq!(content_image["type"], "image");
+    let encoded = content_image["data"].as_str().expect("image data");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("decode image"),
+        output.data,
+        "image bytes must survive untouched"
+    );
+
+    // The description is the deterministic head+tail preview with a
+    // self-contained omission note (there is no outputRef on this surface).
+    let description = result["structuredContent"]["analysis"]["description"]
+        .as_str()
+        .expect("capped description");
+    assert!(description.starts_with("VISION-HEAD"));
+    assert!(description.contains("full text not retained"));
+    assert!(
+        description.len() <= cap + 256,
+        "capped description must not exceed the preview budget, got {} bytes",
+        description.len()
+    );
+    assert_eq!(
+        result["structuredContent"]["analysis"]["analysisTruncated"],
+        json!(true)
+    );
+
+    // Deterministic: the same input produces the same capped description.
+    let (replay, _) = analyzed_response_for_description(
+        &workspace_root,
+        format!("VISION-HEAD{}", "detail ".repeat(40_000)),
+    );
+    assert_eq!(
+        replay.result.expect("replayed result")["structuredContent"]["analysis"]["description"],
+        description
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn analyzed_read_image_short_description_passes_through_untouched() {
+    let workspace_root = read_workspace("vision-description-short");
+    let analysis = "A crisp red rectangle on white.".to_string();
+
+    let (response, _) = analyzed_response_for_description(&workspace_root, analysis.clone());
+    let analysis_struct =
+        &response.result.expect("analyzed result")["structuredContent"]["analysis"];
+    assert_eq!(analysis_struct["description"], json!(analysis));
+    assert_eq!(analysis_struct["analysisTruncated"], json!(false));
+
+    let _ = std::fs::remove_dir_all(workspace_root);
 }
