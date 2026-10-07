@@ -877,11 +877,18 @@ mod tests {
             let mut process = spawn_linux_sandboxed_for_test("sleep 2", &root, &root)
                 .await
                 .expect("spawn sandboxed command");
+            let mut stderr = process.take_stderr().expect("sandbox stderr");
             let premature = timeout(Duration::from_millis(350), process.wait()).await;
-            assert!(
-                premature.is_err(),
-                "bwrap died when the transient blocking-pool thread retired: {premature:?}"
-            );
+            if premature.is_ok() {
+                let mut diagnostic = String::new();
+                stderr
+                    .read_to_string(&mut diagnostic)
+                    .await
+                    .expect("read sandbox stderr");
+                panic!(
+                    "bwrap died when the transient blocking-pool thread retired: {premature:?}; stderr={diagnostic:?}"
+                );
+            }
             process.terminate_tree().await;
             let _ = process.wait().await;
         });

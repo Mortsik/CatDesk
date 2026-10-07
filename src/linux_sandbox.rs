@@ -490,6 +490,20 @@ fn bubblewrap_executable_in_paths(
 }
 
 fn bubblewrap_executable(workspace: &Path) -> Option<PathBuf> {
+    // Bubblewrap is the confinement boundary, so prefer the distro/admin binary
+    // over per-user PATH shims that may rewrite its argv or environment.
+    // Keep PATH as a fallback for systems that install bwrap elsewhere.
+    if let Some(system) = bubblewrap_executable_in_paths(
+        [
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+            PathBuf::from("/usr/local/bin"),
+        ],
+        workspace,
+    ) {
+        return Some(system);
+    }
+
     let path = std::env::var_os("PATH")?;
     bubblewrap_executable_in_paths(std::env::split_paths(&path), workspace)
 }
@@ -645,6 +659,21 @@ fn systemd_run_executable(workspace: &Path) -> Option<PathBuf> {
     executable_on_path(workspace, "systemd-run")
 }
 
+fn systemd_user_bus_available_at(runtime_dir: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(runtime_dir.join("bus")).is_ok()
+}
+
+fn systemd_user_bus_available() -> bool {
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+        && systemd_user_bus_available_at(&runtime_dir)
+    {
+        return true;
+    }
+
+    let default_runtime = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
+    systemd_user_bus_available_at(&default_runtime)
+}
+
 /// Memory ceilings for a single sandboxed command, applied through cgroup v2
 /// (transient systemd user scope). WSL2 died twice on 2026-09-23 because
 /// unbounded agent workloads (poe_pricer evals at 1.3-1.5 G RSS each, nested
@@ -694,14 +723,18 @@ fn memory_limit_from_env(variable: &str, default: &str) -> String {
 /// on setups that have a user manager (WSL2/systemd), they are not a
 /// confinement boundary. The executable is resolved outside the workspace like
 /// `bwrap`, so a hijacked copy cannot run anything unsandboxed.
-/// Jedna decyzja o transient scope: `Some(systemd-run)` gdy unit powstanie
-/// (limity pamięci włączone ORAZ `systemd-run` na `PATH`), `None` dla plain
-/// bwrap. Marker `CATDESK_SANDBOX_UNIT` w [`bubblewrap_argv`] i wrapper w
-/// [`sandbox_command`] muszą wynikać z tej samej decyzji — inaczej przy
-/// fail-open (brak systemd-run) sandbox dostałby marker nieistniejącego
-/// scope'a (Sol r2 b74ec89e).
+/// Jedna decyzja o transient scope: `Some(systemd-run)` gdy limity pamięci są
+/// włączone, `systemd-run` jest na `PATH` i osiągalny jest systemd user bus.
+/// Sam klient na PATH nie wystarcza: np. WSL/test shell może mieć binarkę bez
+/// `/run/user/<uid>/bus`, wtedy `systemd-run --user` kończy się natychmiast.
+/// W takim środowisku fail-open do plain bwrap zachowuje confinement, tylko bez
+/// dodatkowych limitów cgroup. Marker `CATDESK_SANDBOX_UNIT` i wrapper muszą
+/// wynikać z tej samej decyzji.
 fn sandbox_scope_systemd_run(workspace: &Path) -> Option<PathBuf> {
     sandbox_memory_limits()?;
+    if !systemd_user_bus_available() {
+        return None;
+    }
     systemd_run_executable(workspace)
 }
 
@@ -1545,6 +1578,45 @@ mod tests {
         );
         assert_eq!(command.get_program(), Path::new("/usr/bin/bwrap"));
         assert_eq!(command.get_args().count(), 1);
+    }
+
+    #[test]
+    fn systemd_user_bus_probe_distinguishes_missing_and_live_socket() {
+        let runtime = PathBuf::from(format!("/tmp/cdbus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&runtime);
+        std::fs::create_dir_all(&runtime).expect("create runtime");
+
+        assert!(!systemd_user_bus_available_at(&runtime));
+        let _listener = std::os::unix::net::UnixListener::bind(runtime.join("bus"))
+            .expect("bind fake user bus");
+        assert!(systemd_user_bus_available_at(&runtime));
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    #[test]
+    fn sandbox_scope_fails_open_when_systemd_user_bus_is_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tree = TempTree::new();
+        let bin = tree.path().join("bin");
+        let runtime = tree.path().join("runtime");
+        std::fs::create_dir_all(&bin).expect("create bin");
+        std::fs::create_dir_all(&runtime).expect("create runtime");
+        let systemd_run = bin.join("systemd-run");
+        std::fs::write(&systemd_run, b"#!/bin/sh\nexit 0\n").expect("write systemd-run stub");
+        std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod systemd-run stub");
+
+        let _env = EnvGuards::set_many(&[
+            ("PATH", bin.as_path()),
+            ("XDG_RUNTIME_DIR", runtime.as_path()),
+            ("CATDESK_SANDBOX_MEMORY", Path::new("on")),
+        ]);
+
+        assert!(
+            sandbox_scope_systemd_run(Path::new(".")).is_none(),
+            "systemd-run on PATH is insufficient when the user bus cannot be reached"
+        );
     }
 
     #[test]
