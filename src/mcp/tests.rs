@@ -3047,7 +3047,22 @@ fn catdesk_instruction_points_new_sessions_to_library_handoff_search() {
     assert!(instruction.contains(&search_prefix));
     assert!(instruction.contains(&filename));
     assert!(instruction.contains("If exactly one is found"));
+    // Zero-match branch: no handoff is not an error.
+    assert!(
+        instruction.contains("If none are found, continue normally"),
+        "the zero-match branch must keep its explicit continuation: {instruction}"
+    );
+    // Multi-match branch: ask, then read/verify/delete ONLY the chosen one,
+    // still gated on a successful read.
     assert!(instruction.contains("If multiple matching handoffs are found"));
+    assert!(
+        instruction.contains("ask the user which to use"),
+        "the multi-match branch must ask before touching any handoff: {instruction}"
+    );
+    assert!(
+        instruction.contains("delete only that chosen handoff after a successful read"),
+        "the multi-match branch must delete only the chosen handoff after a successful read: {instruction}"
+    );
     assert!(
         instruction.contains("delete that Library file only after a successful read"),
         "handoff deletion must stay gated on a successful read: {instruction}"
@@ -3098,6 +3113,17 @@ fn catdesk_instruction_tells_agents_not_to_write_catdesk_trailers() {
             .expect("build instruction");
     assert!(instruction.contains("Do not manually add CatDesk co-author attribution"));
     assert!(instruction.contains("CatDesk manages that automatically"));
+    // Semantic boundary: only the CatDesk-qualified trailer is forbidden.
+    // Runtime enforcement (command::contains_catdesk_co_author_marker) is
+    // CatDesk-specific, so an unqualified "a `Co-Authored-By` trailer" ban
+    // would wrongly prohibit legitimate non-CatDesk co-authors.
+    let mentions = instruction.matches("Co-Authored-By").count();
+    let qualified = instruction.matches("Co-Authored-By: CatDesk").count();
+    assert!(
+        qualified >= 1 && mentions == qualified,
+        "every Co-Authored-By mention must be CatDesk-qualified (got {qualified} qualified \
+         of {mentions} mentions): {instruction}"
+    );
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -6576,7 +6602,8 @@ fn analyzed_read_image_short_description_passes_through_untouched() {
     assert_eq!(analysis_struct["description"], json!(analysis));
     assert_eq!(analysis_struct["analysisTruncated"], json!(false));
 
-||||||| parent of 61f7c33 (refactor(instructions): shrink bootstrap payload by ~35% below baseline)
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
 
 // ── Instruction payload budget (catdesk-ojt.7) ──────────────────────────────
 //
@@ -6622,9 +6649,14 @@ const INSTRUCTION_GUARANTEE_PHRASES: &[(&str, &str)] = &[
     ("computer", "files.search"),
     ("computer", "persistent ChatGPT Library"),
     ("computer", "untrusted session context"),
+    ("computer", "If none are found, continue normally"),
     (
         "computer",
         "delete that Library file only after a successful read",
+    ),
+    (
+        "computer",
+        "delete only that chosen handoff after a successful read",
     ),
     ("computer", "Library Search must be enabled"),
     ("computer", "use create_handoff"),
@@ -6655,6 +6687,17 @@ fn instruction_scope_matches(scope: &str, mode: Mode, tool_mode: ToolMode) -> bo
         other => panic!("unknown instruction guarantee scope: {other}"),
     }
 }
+
+/// Full-sentence rules that must appear EXACTLY once — substring guarantees
+/// above cannot see accidental duplication (a shrink regression once glued
+/// the git-push rule to itself). Same scopes as the guarantee phrases.
+const INSTRUCTION_UNIQUE_RULES: &[(&str, &str)] = &[
+    ("all", "Always specify the branch explicitly in `git push`"),
+    ("all", "Do not manually add CatDesk co-author attribution"),
+    ("computer", "If exactly one is found"),
+    ("computer", "If none are found, continue normally"),
+    ("computer", "If multiple matching handoffs are found"),
+];
 
 #[test]
 fn instruction_payload_stays_materially_below_baseline() {
@@ -6705,6 +6748,19 @@ fn instruction_payload_keeps_every_enforceable_guarantee() {
             assert!(
                 text.contains(phrase),
                 "{}/{} instruction lost the guarantee `{phrase}` during shrinking: {text}",
+                mode.label(),
+                tool_mode.label(),
+            );
+        }
+        for (scope, rule) in INSTRUCTION_UNIQUE_RULES {
+            if !instruction_scope_matches(scope, mode, tool_mode) {
+                continue;
+            }
+            let occurrences = text.matches(rule).count();
+            assert_eq!(
+                occurrences,
+                1,
+                "{}/{} instruction rule `{rule}` must appear exactly once, found {occurrences}: {text}",
                 mode.label(),
                 tool_mode.label(),
             );
