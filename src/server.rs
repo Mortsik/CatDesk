@@ -2827,6 +2827,67 @@ mod tests {
     }
 
     #[test]
+    fn turn_token_usage_fallback_stays_bounded_for_subthreshold_exempt_range() {
+        // Sol rework: a LEGAL read_result range whose serialized result stays
+        // UNDER the 128 KiB size cap used to slip through it — a homogeneous
+        // zero-padding range (base64 of a padded/sparse source) measured 36 s
+        // and a non-repetitive range 1.3 s pre-fix, both ~109 KiB. The exempt
+        // path now estimates bytewise at any size; the bound is an
+        // order-of-magnitude assertion, jitter-tolerant on purpose.
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "read_result",
+                "arguments": { "result_id": "probe", "offset": 0, "max_bytes": 81920 }
+            }),
+        };
+        // Non-repetitive bytes: deterministic LCG output, newline-free base64.
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        let mut raw = Vec::with_capacity(81_920);
+        for _ in 0..81_920 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            raw.push((state & 0xFF) as u8);
+        }
+        use base64::Engine as _;
+        let shapes = [
+            (
+                "non-repetitive",
+                base64::engine::general_purpose::STANDARD.encode(&raw),
+            ),
+            ("zero-padding", "A".repeat(109_234)),
+        ];
+        for (label, data_base64) in shapes {
+            let result = json!({
+                "content": [],
+                "structuredContent": { "dataBase64": data_base64 }
+            });
+            let serialized_len = serde_json::to_string(&result).expect("serialize").len();
+            // EXACT_TOKENIZATION_LIMIT_BYTES = 2 × the 64 KiB inline budget.
+            assert!(
+                serialized_len < 128 * 1024,
+                "[{label}] probe must stay UNDER the size cap, got {serialized_len}"
+            );
+
+            let started = std::time::Instant::now();
+            let usage = turn_token_usage_for_response(&req, Some(&result));
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed.as_secs_f64() < 2.0,
+                "[{label}] sub-threshold exempt range must not block on exact                  tokenization, took {elapsed:?}"
+            );
+            let (_, output_tokens) = usage.expect("missing usage");
+            // Bytewise ballpark: serialized bytes / 4.
+            let expected = serialized_len as u64 / 4;
+            assert_eq!(output_tokens, expected, "[{label}] bytewise estimate");
+        }
+    }
+
+    #[test]
     fn turn_token_usage_fallback_stays_bounded_for_oversize_exempt_result() {
         // Audit F6: exempt tools (read_result/search_result) carry no widget
         // meta, so every one of their responses takes this fallback — which
