@@ -195,7 +195,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 
 # 工具
 
-CatDesk 有兩種本機工具模式：`multi-tools` 提供 12 個工具，`read-only` 提供 5 個工具。
+CatDesk 有兩種本機工具模式：`multi-tools` 提供 14 個工具，`read-only` 提供 7 個工具。
 
 在 `multi-tools` 模式下，CatDesk 的本機工具如下：
 
@@ -205,6 +205,8 @@ CatDesk 有兩種本機工具模式：`multi-tools` 提供 12 個工具，`read-
 | `read`                  | 讀取  | 從 workspace 讀取一個或多個文字檔                                       |
 | `read_image`            | 讀取  | 以原生 MCP 圖像內容讀取 workspace 圖片，供視覺分析使用                  |
 | `search`                | 讀取  | 使用 `rg`、`grep` 或內建搜尋器搜尋 workspace 文字                        |
+| `read_result`           | 讀取  | 讀取已儲存大型結果的有限位元組範圍                                      |
+| `search_result`         | 讀取  | 以有限片段搜尋已儲存的大型結果                                          |
 | `write`                 | 寫入  | 建立或覆寫檔案                                                           |
 | `edit`                  | 寫入  | 原子化套用受保護的 replace/range 編輯                                   |
 | `create_handoff`        | 讀取  | 準備 workspace 專屬的 Library handoff，不修改 workspace                  |
@@ -218,7 +220,7 @@ CatDesk 有兩種本機工具模式：`multi-tools` 提供 12 個工具，`read-
 
 長時間執行的指令刻意與 MCP HTTP request 的生命週期分離。Build、compile、dependency installation、長時間 test suite 與 development server 應使用 `start_command`，接著以回傳的 cursor 呼叫 `poll_command`。Poll response 有大小限制；如果 `hasMoreOutput` 為 true，即使 job 已經結束，也要持續用 `nextCursor` 輪詢，直到把剩餘輸出讀完。`run_command` 適合較短的指令，而且 timeout 上限為 120 秒。
 
-如果啟用了瀏覽器模式，CatDesk 還可以公開額外的 browser/devtools 工具。這些工具由 browser bridge 提供，所以實際工具列表取決於你的環境。
+如果啟用了瀏覽器模式，CatDesk 還可以公開額外的 browser/devtools 工具。這些工具由 browser bridge 提供，所以實際工具列表取決於你的環境，而且會隨 @latest 的 chrome-devtools-mcp 變動（同一日兩次啟動曾觀察到 28 與 30 個工具）。
 
 `search` 會優先使用 `rg`，如果沒有則退回 `grep`，最後才使用 CatDesk 內建搜尋器。安裝 ripgrep 並非必要，但能提供最佳的搜尋效能與行為。
 

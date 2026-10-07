@@ -198,7 +198,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 
 # Tools
 
-CatDesk has two local tool modes: `multi-tools` exposes 12 tools, and `read-only` exposes 5 tools.
+CatDesk has two local tool modes: `multi-tools` exposes 14 tools, and `read-only` exposes 7 tools.
 
 CatDesk's local tools in `multi-tools` mode are:
 
@@ -208,6 +208,8 @@ CatDesk's local tools in `multi-tools` mode are:
 | `read`                | Read  | Reads one or more text files from the workspace                            |
 | `read_image`          | Read  | Reads a workspace image as native MCP image content for vision analysis    |
 | `search`              | Read  | Searches workspace text with `rg`, `grep`, or built-in search              |
+| `read_result`         | Read  | Reads a bounded byte range from a stored large result                      |
+| `search_result`       | Read  | Searches a stored large result with bounded snippets                       |
 | `write`               | Write | Creates or overwrites a file                                               |
 | `edit`                | Write | Applies guarded replace/range edits atomically                             |
 | `create_handoff`      | Read  | Prepares a workspace-specific Library handoff without changing the workspace |
@@ -221,7 +223,7 @@ CatDesk's local tools in `multi-tools` mode are:
 
 Long-running commands are deliberately decoupled from the lifetime of an MCP HTTP request. Builds, compilation, dependency installation, long test suites, and development servers should use `start_command`, then `poll_command` with the returned cursor. Poll responses are bounded; if `hasMoreOutput` is true, keep polling with `nextCursor` even after the command reaches a terminal state to drain the remaining buffered output. `run_command` remains the simpler path for short commands and has a 120-second maximum timeout.
 
-If browser mode is enabled, CatDesk can also expose extra browser/devtools tools. Those are provided by the browser bridge, so the exact list depends on your environment.
+If browser mode is enabled, CatDesk can also expose extra browser/devtools tools. Those are provided by the browser bridge, so the exact list depends on your environment and drifts with the pinned @latest chrome-devtools-mcp (we observed 28 vs 30 tools between two runs on the same day).
 
 `search` uses `rg` when it is available, falls back to `grep`, then falls back to CatDesk's built-in scanner. Installing ripgrep is optional, but gives the best search performance and behavior.
 
