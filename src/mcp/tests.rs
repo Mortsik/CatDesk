@@ -6038,6 +6038,169 @@ async fn shared_tools_call_boundary_externalizes_oversized_result_losslessly() {
 }
 
 #[tokio::test]
+async fn byte_accounting_reports_externalized_results_from_the_budget_policy() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-accounting-external-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    std::fs::write(
+        workspace_root.join("big.txt"),
+        format!("HEAD\n{}\nTAIL", "ż中🙂".repeat(30_000)),
+    )
+    .expect("write file");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = LargeResultStore::new_default().expect("create result store");
+    let before = tool_result_metrics::snapshot();
+    let req = tool_call_request("read", json!({ "paths": ["big.txt"] }));
+
+    let response = handle_tools_call_with_result_store(
+        &req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+
+    let inline = response.result.as_ref().expect("missing result");
+    let expected_raw = inline
+        .pointer("/responseBudget/originalBytes")
+        .and_then(Value::as_u64)
+        .expect("externalized result must carry the budget manifest");
+    let my_inline = serde_json::to_vec(inline).unwrap().len() as u64;
+
+    // The registry is process-global and parallel tests observe their own
+    // calls too, so only this call's contribution (>=) is asserted here;
+    // exact per-class and per-byte accounting is covered by unit tests.
+    let after = tool_result_metrics::snapshot();
+    let slot = perf_metrics::tool_index(Some("read"));
+    let delta = tool_result_metrics::totals_delta(&before[slot], &after[slot]);
+    assert!(delta.count >= 1, "the externalized read must be counted");
+    assert!(
+        delta.externalized_count >= 1,
+        "the externalized read must land in the externalized class"
+    );
+    assert_eq!(
+        delta.raw_bytes >= expected_raw && delta.externalized_bytes >= expected_raw,
+        true,
+        "raw and externalized totals must include the stored payload"
+    );
+    assert!(
+        delta.inline_bytes >= my_inline,
+        "inline totals must include the sent preview"
+    );
+    assert!(
+        delta.raw_bytes >= delta.inline_bytes,
+        "raw >= inline must hold per record and therefore under summation"
+    );
+
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
+#[tokio::test]
+async fn byte_accounting_records_small_and_failed_retrieval_results() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-accounting-small-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    std::fs::write(workspace_root.join("tiny.txt"), "tiny payload").expect("write file");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = LargeResultStore::new_default().expect("create result store");
+    let before = tool_result_metrics::snapshot();
+
+    let small_req = tool_call_request("read", json!({ "paths": ["tiny.txt"] }));
+    let small = handle_tools_call_with_result_store(
+        &small_req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+    let small_inline = small
+        .result
+        .as_ref()
+        .map(|result| serde_json::to_vec(result).unwrap().len() as u64)
+        .unwrap_or(0);
+    assert!(
+        small
+            .result
+            .as_ref()
+            .is_some_and(|result| result.get("responseBudget").is_none()),
+        "a small result must be sent untouched"
+    );
+
+    let retrieval_req = tool_call_request(
+        "read_result",
+        json!({ "result_id": "result_missing-accounting-probe", "max_bytes": 4 }),
+    );
+    let retrieval = handle_tools_call_with_result_store(
+        &retrieval_req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        retrieval
+            .result
+            .as_ref()
+            .and_then(|result| result.get("isError")),
+        Some(&json!(true)),
+        "an unknown result id must surface a tool error"
+    );
+
+    let after = tool_result_metrics::snapshot();
+    let read_slot = perf_metrics::tool_index(Some("read"));
+    let read_delta = tool_result_metrics::totals_delta(&before[read_slot], &after[read_slot]);
+    assert!(read_delta.count >= 1);
+    assert!(
+        read_delta.small_count >= 1,
+        "the untouched small read must land in the small class"
+    );
+    assert!(
+        read_delta.inline_bytes >= small_inline && read_delta.raw_bytes >= small_inline,
+        "small responses must account raw == inline == the sent size"
+    );
+    assert!(
+        read_delta.raw_bytes >= read_delta.inline_bytes,
+        "raw >= inline must hold per record and therefore under summation"
+    );
+
+    // Retrieval success is derivable from the retrieval tools' error counts.
+    let retrieval_slot = perf_metrics::tool_index(Some("read_result"));
+    let retrieval_delta =
+        tool_result_metrics::totals_delta(&before[retrieval_slot], &after[retrieval_slot]);
+    assert!(retrieval_delta.count >= 1);
+    assert!(
+        retrieval_delta.error_count >= 1,
+        "the failed retrieval must count toward the read_result error total"
+    );
+
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
+#[tokio::test]
 async fn result_retrieval_reconstructs_multi_megabyte_payload_through_bounded_mcp_calls() {
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-result-rebuild-{}", Uuid::new_v4()));

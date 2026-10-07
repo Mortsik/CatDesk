@@ -1,7 +1,7 @@
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
-use crate::result_store::{LargeResultStore, ResultMetadata, StoreError};
+use crate::result_store::{LargeResultStore, StoreError};
 
 pub(crate) const DEFAULT_INLINE_RESPONSE_BYTES: usize = 64 * 1024;
 const POLICY_NAME: &str = "catdesk-mcp-v1";
@@ -80,6 +80,17 @@ pub(crate) struct BudgetCandidate {
     is_error: bool,
 }
 
+/// Byte accounting for one externalized result, straight from the policy's
+/// own serialization — callers must not re-measure a stored payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BudgetOutcome {
+    pub(crate) output_ref: String,
+    /// Serialized size of the original result retained in the store.
+    pub(crate) raw_bytes: u64,
+    /// Bytes actually written to the large-result store.
+    pub(crate) externalized_bytes: u64,
+}
+
 impl BudgetCandidate {
     pub(crate) fn payload(&self) -> &[u8] {
         &self.original
@@ -147,11 +158,12 @@ pub(crate) fn apply_response_budget(
     store: &LargeResultStore,
     owner_session: Option<&str>,
     workspace_root: &Path,
-) -> Result<Option<ResultMetadata>, StoreError> {
+) -> Result<Option<BudgetOutcome>, StoreError> {
     let Some(candidate) = prepare_response_budget(result, is_error) else {
         return Ok(None);
     };
 
+    let raw_bytes = candidate.payload().len() as u64;
     let stored = store.put(
         owner_session,
         workspace_root,
@@ -160,7 +172,11 @@ pub(crate) fn apply_response_budget(
     )?;
     let metadata = stored.metadata;
     *result = candidate.finish(&metadata.result_id);
-    Ok(Some(metadata))
+    Ok(Some(BudgetOutcome {
+        output_ref: metadata.result_id,
+        raw_bytes,
+        externalized_bytes: metadata.size_bytes,
+    }))
 }
 
 pub(crate) fn prepare_response_budget(result: &Value, is_error: bool) -> Option<BudgetCandidate> {
@@ -915,7 +931,7 @@ mod tests {
         let expected = serde_json::to_vec(&original).unwrap();
         let mut inline = original;
 
-        let metadata =
+        let outcome =
             apply_response_budget(&mut inline, false, &store, Some("session-a"), &workspace)
                 .expect("budget application")
                 .expect("must externalize");
@@ -925,7 +941,7 @@ mod tests {
             inline
                 .pointer("/responseBudget/outputRef")
                 .and_then(Value::as_str),
-            Some(metadata.result_id.as_str())
+            Some(outcome.output_ref.as_str())
         );
         assert_eq!(
             inline
@@ -947,7 +963,7 @@ mod tests {
                 .read_range(
                     Some("session-a"),
                     &workspace,
-                    &metadata.result_id,
+                    &outcome.output_ref,
                     offset,
                     store.max_range_bytes(),
                 )
@@ -963,6 +979,49 @@ mod tests {
             serde_json::from_slice::<Value>(&rebuilt).unwrap(),
             serde_json::from_slice::<Value>(&expected).unwrap()
         );
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn budget_outcome_reports_raw_and_externalized_bytes_from_the_policy() {
+        let workspace =
+            std::env::temp_dir().join(format!("catdesk-budget-outcome-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let store = crate::result_store::LargeResultStore::new_default().expect("create store");
+        let original = json!({
+            "content": [],
+            "structuredContent": {
+                "toolName": "run_command",
+                "success": true,
+                "stdout": "o".repeat(200_000),
+                "stderr": "e".repeat(4_000)
+            }
+        });
+        let expected_bytes = serde_json::to_vec(&original).unwrap().len() as u64;
+        let mut inline = original;
+
+        let outcome =
+            apply_response_budget(&mut inline, false, &store, Some("session-a"), &workspace)
+                .expect("budget application")
+                .expect("must externalize");
+
+        assert_eq!(
+            outcome.raw_bytes, expected_bytes,
+            "raw is the policy's own serialization of the full result"
+        );
+        assert_eq!(
+            outcome.externalized_bytes, expected_bytes,
+            "the store retains the full raw payload"
+        );
+        assert_eq!(
+            inline
+                .pointer("/responseBudget/originalBytes")
+                .and_then(Value::as_u64),
+            Some(outcome.raw_bytes),
+            "the inline manifest and the telemetry outcome must agree"
+        );
+        assert!(serde_json::to_vec(&inline).unwrap().len() <= DEFAULT_INLINE_RESPONSE_BYTES);
 
         std::fs::remove_dir_all(workspace).ok();
     }

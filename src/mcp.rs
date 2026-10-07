@@ -10,6 +10,7 @@ use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::result_store::LargeResultStore;
 use crate::state::{Mode, ShowDetailMode, TokenStatsLayout, ToolMode, WidgetCornerStyle};
+use crate::tool_result_metrics;
 
 mod agents_state;
 mod commands;
@@ -490,19 +491,22 @@ async fn handle_tools_call_with_result_store(
         }
     }
 
+    let mut budget_outcome: Option<response_budget::BudgetOutcome> = None;
     if !matches!(tool_name.as_str(), "read_result" | "search_result")
         && let Some(result) = response.result.as_mut()
     {
         // Store first and replace only after a successful lossless write. If the
         // store is unavailable or rejects the payload, the original response is
         // left untouched rather than silently losing capability.
-        let _ = response_budget::apply_response_budget(
+        budget_outcome = response_budget::apply_response_budget(
             result,
             is_error,
             result_store,
             session_namespace,
             Path::new(workspace_root),
-        );
+        )
+        .ok()
+        .flatten();
     }
 
     if let Some(result) = response.result.as_mut()
@@ -512,6 +516,29 @@ async fn handle_tools_call_with_result_store(
         attach_turn_token_usage(result, &turn_token_usage);
         attach_tool_call_count(result, 1);
     }
+
+    // Byte accounting: when the budget externalized the result, its own
+    // serialization is the source of truth for the raw size; an untouched
+    // result was sent byte-for-byte, so raw equals the final inline size.
+    // Transport-level decorations applied later in server.rs are excluded.
+    let inline_bytes = response
+        .result
+        .as_ref()
+        .and_then(|result| serde_json::to_vec(result).ok())
+        .map_or(0, |bytes| bytes.len() as u64);
+    let (raw_bytes, externalized_bytes) = match budget_outcome {
+        Some(outcome) => (outcome.raw_bytes, outcome.externalized_bytes),
+        None => (inline_bytes, 0),
+    };
+    tool_result_metrics::observe(
+        Some(&tool_name),
+        tool_result_metrics::ToolResultMeasurement {
+            raw_bytes,
+            inline_bytes,
+            externalized_bytes,
+            is_error,
+        },
+    );
 
     response
 }
