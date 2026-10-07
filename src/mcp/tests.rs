@@ -31,7 +31,9 @@ use super::instruction::{
     catdesk_instruction_widget_payload_with_cards,
     handle_catdesk_instruction_with_show_detail_mode,
 };
-use super::result_tools::{handle_read_result, handle_search_result};
+use super::result_tools::{
+    MAX_SEARCH_RESULT_QUERY_CHARS, handle_read_result, handle_search_result,
+};
 use super::token_usage::{TokenUsage, sanitize_result_for_turn_token_count};
 use super::tool_catalog::handle_tools_list;
 use super::widget::{
@@ -5865,6 +5867,15 @@ async fn result_retrieval_tool_schemas_are_read_only_and_bounded() {
             .expect("missing search required"),
         &vec![json!("result_id"), json!("query")]
     );
+    assert_eq!(
+        search
+            .get("inputSchema")
+            .and_then(|schema| schema.get("properties"))
+            .and_then(|properties| properties.get("query"))
+            .and_then(|query| query.get("maxLength"))
+            .and_then(Value::as_u64),
+        Some(MAX_SEARCH_RESULT_QUERY_CHARS as u64)
+    );
 }
 
 #[tokio::test]
@@ -6067,6 +6078,88 @@ fn result_retrieval_hides_foreign_refs_and_reports_bounded_errors() {
             .get("errorCode")
             .and_then(Value::as_str),
         Some("range_too_large")
+    );
+
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
+#[tokio::test]
+async fn search_result_rejects_oversized_query_and_caps_echo() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-result-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = mcp_result_store();
+    let stored = store
+        .put(
+            Some("session-a"),
+            &workspace_root,
+            b"alpha beta",
+            Some("text/plain"),
+        )
+        .expect("store result");
+
+    // An oversized query is rejected before the search runs and cannot leak
+    // into the response (F3: store-range tools self-bound their responses).
+    let oversized = "x".repeat(MAX_SEARCH_RESULT_QUERY_CHARS + 1);
+    let oversized_req = tool_call_request(
+        "search_result",
+        json!({
+            "result_id": stored.metadata.result_id,
+            "query": oversized
+        }),
+    );
+    let oversized_response = handle_search_result(
+        &oversized_req,
+        &workspace_root_str,
+        &store,
+        Some("session-a"),
+    );
+    let oversized_result = oversized_response.result.as_ref().expect("missing result");
+    assert_eq!(
+        oversized_result.get("isError").and_then(Value::as_bool),
+        Some(true)
+    );
+    let oversized_structured = oversized_result
+        .get("structuredContent")
+        .expect("missing oversized structured content");
+    assert_eq!(
+        oversized_structured
+            .get("errorCode")
+            .and_then(Value::as_str),
+        Some("invalid_arguments")
+    );
+    assert!(
+        !serde_json::to_string(oversized_result)
+            .expect("serialize response")
+            .contains(&"x".repeat(256)),
+        "oversized query leaked into the response"
+    );
+
+    // A query exactly at the cap stays legal and echoes back within it.
+    let at_cap = "n".repeat(MAX_SEARCH_RESULT_QUERY_CHARS);
+    let cap_req = tool_call_request(
+        "search_result",
+        json!({
+            "result_id": stored.metadata.result_id,
+            "query": at_cap
+        }),
+    );
+    let cap_response =
+        handle_search_result(&cap_req, &workspace_root_str, &store, Some("session-a"));
+    let cap_structured = cap_response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("structuredContent"))
+        .expect("missing capped search structured content");
+    assert_eq!(
+        cap_structured
+            .get("query")
+            .and_then(Value::as_str)
+            .expect("missing echoed query")
+            .chars()
+            .count(),
+        MAX_SEARCH_RESULT_QUERY_CHARS
     );
 
     std::fs::remove_dir_all(workspace_root).ok();
