@@ -1,11 +1,12 @@
 use serde_json::{Value, json};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
 use crate::change_tracking::{ChangeSession, FileChange};
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
+use crate::result_store::LargeResultStore;
 use crate::state::{Mode, ShowDetailMode, TokenStatsLayout, ToolMode, WidgetCornerStyle};
 
 mod agents_state;
@@ -14,6 +15,7 @@ mod file_tools;
 mod instruction;
 mod jsonrpc;
 mod resources;
+mod result_tools;
 mod token_usage;
 mod tool_catalog;
 mod widget;
@@ -29,6 +31,7 @@ use file_tools::{
     handle_create_handoff_for_project, handle_delete_path, handle_edit_file, handle_read_files,
     handle_read_image, handle_search_text, handle_write_file,
 };
+use result_tools::{handle_read_result, handle_search_result};
 
 use commands::{
     change_scope_for_request, command_job_id_from_response, forward_to_devtools,
@@ -272,6 +275,41 @@ async fn handle_tools_call_with_session(
     session_namespace: Option<&str>,
     active_project: Option<&Path>,
 ) -> JsonRpcResponse {
+    static FALLBACK_RESULT_STORE: OnceLock<LargeResultStore> = OnceLock::new();
+    let result_store = FALLBACK_RESULT_STORE.get_or_init(|| {
+        LargeResultStore::new_default().expect("create fallback large-result store")
+    });
+    handle_tools_call_with_result_store(
+        req,
+        workspace_root,
+        mascot_seed,
+        mode,
+        tool_mode,
+        set_catdesk_as_co_author,
+        command_jobs,
+        devtools,
+        show_detail_mode,
+        result_store,
+        session_namespace,
+        active_project,
+    )
+    .await
+}
+
+async fn handle_tools_call_with_result_store(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    mascot_seed: u64,
+    mode: Mode,
+    tool_mode: ToolMode,
+    set_catdesk_as_co_author: bool,
+    command_jobs: &CommandJobManager,
+    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    show_detail_mode: ShowDetailMode,
+    result_store: &LargeResultStore,
+    session_namespace: Option<&str>,
+    active_project: Option<&Path>,
+) -> JsonRpcResponse {
     let params = &req.params;
     let tool_name = params
         .get("name")
@@ -346,6 +384,12 @@ async fn handle_tools_call_with_session(
                     "read" => handle_read_files(req, workspace_root),
                     "read_image" => handle_read_image(req, workspace_root).await,
                     "search" => handle_search_text(req, workspace_root),
+                    "read_result" => {
+                        handle_read_result(req, workspace_root, result_store, session_namespace)
+                    }
+                    "search_result" => {
+                        handle_search_result(req, workspace_root, result_store, session_namespace)
+                    }
                     "create_handoff" => {
                         handle_create_handoff_for_project(req, workspace_root, active_project)
                     }

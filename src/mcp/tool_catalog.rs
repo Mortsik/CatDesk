@@ -143,6 +143,71 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
+        "read_result" => {
+            for field in ["resultId", "kind", "dataBase64"] {
+                properties.insert(field.to_string(), json!({ "type": "string" }));
+            }
+            properties.insert(
+                "contentType".to_string(),
+                json!({ "type": ["string", "null"] }),
+            );
+            properties.insert("text".to_string(), json!({ "type": "string" }));
+            for field in [
+                "sizeBytes",
+                "createdAtMs",
+                "expiresAtMs",
+                "offset",
+                "bytesReturned",
+                "nextOffset",
+            ] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert("eof".to_string(), json!({ "type": "boolean" }));
+            properties.insert("errorCode".to_string(), json!({ "type": "string" }));
+        }
+        "search_result" => {
+            for field in ["resultId", "kind", "query"] {
+                properties.insert(field.to_string(), json!({ "type": "string" }));
+            }
+            properties.insert(
+                "contentType".to_string(),
+                json!({ "type": ["string", "null"] }),
+            );
+            for field in [
+                "sizeBytes",
+                "createdAtMs",
+                "expiresAtMs",
+                "startOffset",
+                "matchCount",
+                "nextOffset",
+            ] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert("eof".to_string(), json!({ "type": "boolean" }));
+            properties.insert("errorCode".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "matches".to_string(),
+                json!({
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "offset": { "type": "integer", "minimum": 0 },
+                            "endOffset": { "type": "integer", "minimum": 0 },
+                            "snippetOffset": { "type": "integer", "minimum": 0 },
+                            "snippet": { "type": "string" }
+                        },
+                        "required": ["offset", "endOffset", "snippetOffset", "snippet"]
+                    }
+                }),
+            );
+        }
         "write" => {
             properties.insert("path".to_string(), json!({ "type": "string" }));
             properties.insert(
@@ -579,6 +644,48 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
                     "no_ignore": { "type": "boolean", "description": "Do not respect ignore files" }
                 },
                 "required": ["pattern"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+
+        tools.push(json!({
+            "name": "read_result",
+            "title": "Read stored result range",
+            "description": "Read a bounded byte range from a CatDesk large-result reference. Offsets are bytes. dataBase64 is always lossless; text is included when the selected bytes are valid UTF-8.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "result_id": { "type": "string", "minLength": 1, "description": "Opaque CatDesk result ID" },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Byte offset (default 0)" },
+                    "max_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": crate::result_store::DEFAULT_MAX_RANGE_BYTES,
+                        "description": format!("Maximum bytes to return (default and maximum {})", crate::result_store::DEFAULT_MAX_RANGE_BYTES)
+                    }
+                },
+                "required": ["result_id"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
+            "name": "search_result",
+            "title": "Search stored text result",
+            "description": "Search a UTF-8 CatDesk large-result reference using an exact literal query without loading the whole result into one MCP response. Matches are byte offsets with bounded snippets; continue from nextOffset until eof.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "result_id": { "type": "string", "minLength": 1, "description": "Opaque CatDesk result ID" },
+                    "query": { "type": "string", "minLength": 1, "description": "Exact literal text to search for" },
+                    "start_offset": { "type": "integer", "minimum": 0, "description": "Byte offset to begin searching (default 0)" },
+                    "max_matches": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": crate::result_store::DEFAULT_MAX_SEARCH_MATCHES,
+                        "description": format!("Maximum matches to return (default 20, maximum {})", crate::result_store::DEFAULT_MAX_SEARCH_MATCHES)
+                    }
+                },
+                "required": ["result_id", "query"]
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
         }));

@@ -27,6 +27,7 @@ use super::instruction::{
     catdesk_instruction_widget_payload_with_cards,
     handle_catdesk_instruction_with_show_detail_mode,
 };
+use super::result_tools::{handle_read_result, handle_search_result};
 use super::token_usage::{TokenUsage, sanitize_result_for_turn_token_count};
 use super::tool_catalog::handle_tools_list;
 use super::widget::{
@@ -39,6 +40,7 @@ use crate::command_jobs::{CommandJobSnapshot, CommandJobState};
 use crate::mascot;
 use crate::perf_metrics;
 use crate::perf_metrics::CacheKind;
+use crate::result_store::{LargeResultStore, LargeResultStoreConfig};
 
 /// `git` is resolved through `PATH` at spawn time and `PATH` is
 /// process-global: linux_sandbox tests rewrite it while they run, which
@@ -1566,6 +1568,8 @@ async fn multi_tools_list_exposes_run_command_mv_without_move_path_tool() {
             "read",
             "read_image",
             "search",
+            "read_result",
+            "search_result",
             "write",
             "edit",
             "create_handoff",
@@ -1634,6 +1638,8 @@ async fn local_tools_list_exposes_output_schemas_except_multimodal_read_image() 
         ("catdesk_instruction", "instructionText"),
         ("read", "files"),
         ("search", "searchResults"),
+        ("read_result", "dataBase64"),
+        ("search_result", "matches"),
         ("write", "bytesWritten"),
         ("edit", "operationCount"),
         ("create_handoff", "content"),
@@ -1930,6 +1936,8 @@ async fn read_only_tools_list_exposes_only_local_read_tools() {
             "read",
             "read_image",
             "search",
+            "read_result",
+            "search_result",
             "create_handoff"
         ]
     );
@@ -5465,4 +5473,283 @@ fn base_widget_payload_serializes_all_show_detail_modes() {
             Some(expected)
         );
     }
+}
+
+fn mcp_result_store() -> LargeResultStore {
+    let mut config = LargeResultStoreConfig::default();
+    config.max_range_bytes = 16;
+    config.max_search_matches = 4;
+    config.search_chunk_bytes = 8;
+    LargeResultStore::new(config).expect("create result store")
+}
+
+#[tokio::test]
+async fn result_retrieval_tool_schemas_are_read_only_and_bounded() {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!("req-result-tools")),
+        method: "tools/list".into(),
+        params: json!({}),
+    };
+    let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+    let tools = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("tools"))
+        .and_then(Value::as_array)
+        .expect("missing tools");
+
+    let read = tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("read_result"))
+        .expect("missing read_result");
+    assert_eq!(
+        read.get("annotations")
+            .and_then(|value| value.get("readOnlyHint"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let read_schema = read
+        .get("inputSchema")
+        .and_then(Value::as_object)
+        .expect("missing read_result input schema");
+    assert_eq!(
+        read_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("missing required fields"),
+        &vec![json!("result_id")]
+    );
+    assert!(
+        read_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("missing read properties")
+            .contains_key("max_bytes")
+    );
+
+    let search = tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("search_result"))
+        .expect("missing search_result");
+    assert_eq!(
+        search
+            .get("annotations")
+            .and_then(|value| value.get("readOnlyHint"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        search
+            .get("inputSchema")
+            .and_then(|schema| schema.get("required"))
+            .and_then(Value::as_array)
+            .expect("missing search required"),
+        &vec![json!("result_id"), json!("query")]
+    );
+}
+
+#[tokio::test]
+async fn result_retrieval_dispatches_lossless_ranges_and_paginated_search() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-result-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = mcp_result_store();
+    let payload = b"alpha needle beta needle omega";
+    let stored = store
+        .put(
+            Some("session-a"),
+            &workspace_root,
+            payload,
+            Some("text/plain"),
+        )
+        .expect("store result");
+
+    let read_req = tool_call_request(
+        "read_result",
+        json!({
+            "result_id": stored.metadata.result_id,
+            "offset": 6,
+            "max_bytes": 12
+        }),
+    );
+    let read_response = handle_tools_call_with_result_store(
+        &read_req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+    let read_structured = read_response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("structuredContent"))
+        .expect("missing read structured content");
+    assert_eq!(
+        read_structured.get("toolName").and_then(Value::as_str),
+        Some("read_result")
+    );
+    assert_eq!(
+        read_structured.get("bytesReturned").and_then(Value::as_u64),
+        Some(12)
+    );
+    assert_eq!(
+        read_structured.get("nextOffset").and_then(Value::as_u64),
+        Some(18)
+    );
+    let encoded = read_structured
+        .get("dataBase64")
+        .and_then(Value::as_str)
+        .expect("missing lossless data");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("decode range"),
+        payload[6..18]
+    );
+
+    let search_req = tool_call_request(
+        "search_result",
+        json!({
+            "result_id": stored.metadata.result_id,
+            "query": "needle",
+            "max_matches": 1
+        }),
+    );
+    let first = handle_tools_call_with_result_store(
+        &search_req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+    let first_structured = first
+        .result
+        .as_ref()
+        .and_then(|result| result.get("structuredContent"))
+        .expect("missing search structured content");
+    assert_eq!(
+        first_structured.get("matchCount").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        first_structured
+            .get("matches")
+            .and_then(Value::as_array)
+            .and_then(|matches| matches.first())
+            .and_then(|entry| entry.get("offset"))
+            .and_then(Value::as_u64),
+        Some(6)
+    );
+    assert_eq!(
+        first_structured.get("eof").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let next_offset = first_structured
+        .get("nextOffset")
+        .and_then(Value::as_u64)
+        .expect("missing next offset");
+    let second_req = tool_call_request(
+        "search_result",
+        json!({
+            "result_id": stored.metadata.result_id,
+            "query": "needle",
+            "start_offset": next_offset,
+            "max_matches": 4
+        }),
+    );
+    let second = handle_search_result(&second_req, &workspace_root_str, &store, Some("session-a"));
+    let second_structured = second
+        .result
+        .as_ref()
+        .and_then(|result| result.get("structuredContent"))
+        .expect("missing second search structured content");
+    assert_eq!(
+        second_structured
+            .get("matches")
+            .and_then(Value::as_array)
+            .and_then(|matches| matches.first())
+            .and_then(|entry| entry.get("offset"))
+            .and_then(Value::as_u64),
+        Some(18)
+    );
+    assert_eq!(
+        second_structured.get("eof").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
+#[test]
+fn result_retrieval_hides_foreign_refs_and_reports_bounded_errors() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-result-scope-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = mcp_result_store();
+    let stored = store
+        .put(Some("session-a"), &workspace_root, b"private text", None)
+        .expect("store result");
+
+    let foreign_req = tool_call_request(
+        "read_result",
+        json!({ "result_id": stored.metadata.result_id, "max_bytes": 4 }),
+    );
+    let foreign = handle_read_result(&foreign_req, &workspace_root_str, &store, Some("session-b"));
+    let foreign_structured = foreign
+        .result
+        .as_ref()
+        .and_then(|result| result.get("structuredContent"))
+        .expect("missing foreign structured content");
+    assert_eq!(
+        foreign_structured.get("success").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        foreign_structured.get("errorCode").and_then(Value::as_str),
+        Some("unavailable")
+    );
+
+    let oversized_req = tool_call_request(
+        "read_result",
+        json!({ "result_id": stored.metadata.result_id, "max_bytes": 17 }),
+    );
+    let oversized = handle_read_result(
+        &oversized_req,
+        &workspace_root_str,
+        &store,
+        Some("session-a"),
+    );
+    let oversized_structured = oversized
+        .result
+        .as_ref()
+        .and_then(|result| result.get("structuredContent"))
+        .expect("missing oversized structured content");
+    assert_eq!(
+        oversized_structured
+            .get("errorCode")
+            .and_then(Value::as_str),
+        Some("range_too_large")
+    );
+
+    std::fs::remove_dir_all(workspace_root).ok();
 }
