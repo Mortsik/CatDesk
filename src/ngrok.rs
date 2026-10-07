@@ -1,16 +1,12 @@
 use crate::state::{SharedState, load_ngrok_authtoken};
 use ngrok::prelude::*;
 use reqwest::Url;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 
 const RECONNECT_BASE_MS: u64 = 500;
 const RECONNECT_MAX_MS: u64 = 30_000;
-/// How often the session-identity watcher compares the ngrok-assigned session
-/// id. A 404/stream investigation window is ±30 s, so a renewal record lands
-/// inside it while staying far cheaper than an event-driven hook (the SDK
-/// exposes no reconnect callback).
-const SESSION_ID_POLL: Duration = Duration::from_secs(5);
 
 fn reconnect_delay(attempt: u32, jitter_seed: u64) -> Duration {
     let shift = attempt.min(6);
@@ -30,17 +26,38 @@ fn reconnect_jitter_seed(attempt: u32) -> u64 {
     nanos ^ ((std::process::id() as u64) << 32) ^ attempt as u64
 }
 
-/// Whether the ngrok-assigned session identity changed since it was last
-/// seen. The SDK re-establishes the session transparently after transport
-/// failures and rebinds the same tunnel, so a changed id is the only
-/// observable trace of an internal reconnect.
-fn session_id_renewed(seen: &mut String, id: &str) -> bool {
-    if *seen == id {
-        return false;
+/// Wrap one SDK connector invocation with reconnect evidence. The ngrok SDK
+/// calls the session connector for the initial connect (no error) and again
+/// for every reconnect attempt, passing the error that ended the previous
+/// connection; with the default connector it retries reconnects indefinitely
+/// until the session is canceled. Reconnect attempts record
+/// `tunnel_session_reconnect_attempt`, and a re-established transport records
+/// `tunnel_session_renewed` (the SDK rebinds the tunnel on top of it). The
+/// initial connect stays silent — the supervisor's own `tunnel_starting`
+/// already covers it. The delegate does the actual transport, so production
+/// wires `ngrok::session::default_connect` and connection behavior is
+/// unchanged; tests wire a recording fake.
+async fn connect_with_reconnect_evidence<D, E>(
+    delegate: D,
+    on_evidence: E,
+    host: String,
+    port: u16,
+    tls_config: Arc<rustls::ClientConfig>,
+    error: Option<ngrok::tunnel::AcceptError>,
+) -> Result<Box<dyn ngrok::session::IoStream>, ngrok::session::ConnectError>
+where
+    D: ngrok::session::Connector,
+    E: Fn(&'static str),
+{
+    let was_reconnect = error.is_some();
+    if was_reconnect {
+        on_evidence("tunnel_session_reconnect_attempt");
     }
-    seen.clear();
-    seen.push_str(id);
-    true
+    let stream = delegate.connect(host, port, tls_config, error).await?;
+    if was_reconnect {
+        on_evidence("tunnel_session_renewed");
+    }
+    Ok(stream)
 }
 
 /// Start an ngrok HTTP tunnel using the embedded Rust SDK. After the first
@@ -81,6 +98,16 @@ pub async fn start(state: SharedState) -> Result<(), String> {
 
             let session = match ngrok::Session::builder()
                 .authtoken(authtoken.clone())
+                .connector(|host, port, tls_config, error| {
+                    connect_with_reconnect_evidence(
+                        ngrok::session::default_connect,
+                        crate::diagnostics::event,
+                        host,
+                        port,
+                        tls_config,
+                        error,
+                    )
+                })
                 .connect()
                 .await
             {
@@ -168,32 +195,11 @@ pub async fn start(state: SharedState) -> Result<(), String> {
             }
             failures = 0;
 
-            // The ngrok SDK reconnects its session internally after transport
-            // failures (rebinding the same tunnel) without any callback and
-            // without ending the forwarder task, so those renewals are
-            // invisible to the supervisor loop. The server-assigned session id
-            // changes on every internal re-establishment; a watcher polls it
-            // and records the renewal. The supervisor aborts this task when
-            // the forwarder exits; if the supervisor itself is aborted at
-            // shutdown, process exit bounds the watcher instead.
-            let session_watcher = tokio::spawn({
-                let session = session.clone();
-                async move {
-                    let mut seen = session.id();
-                    loop {
-                        tokio::time::sleep(SESSION_ID_POLL).await;
-                        // Reconnects inside one poll window collapse into a
-                        // single record; the window is well inside the ±30 s
-                        // investigation budget.
-                        if session_id_renewed(&mut seen, &session.id()) {
-                            crate::diagnostics::event("tunnel_session_renewed");
-                        }
-                    }
-                }
-            });
-
+            // While the forwarder lives, SDK-internal reconnects are already
+            // visible: the connector hook installed on the session builder
+            // reports every attempt and every re-established transport as
+            // tunnel_session_* events (see connect_with_reconnect_evidence).
             let result = forwarder.join().await;
-            session_watcher.abort();
             crate::diagnostics::event(match &result {
                 Ok(Ok(())) => "tunnel_stopped",
                 Ok(Err(_)) => "tunnel_failed",
@@ -235,6 +241,7 @@ pub async fn start(state: SharedState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn reconnect_backoff_is_bounded_and_jittered() {
@@ -252,24 +259,157 @@ mod tests {
         assert!(reconnect_delay(2, 0) > reconnect_delay(1, 0));
     }
 
-    #[test]
-    fn session_id_renewal_fires_only_when_the_identity_changes() {
-        let mut seen = String::from("session-initial");
+    fn test_tls_config() -> Arc<rustls::ClientConfig> {
+        // Tests never run main(), so the process-level CryptoProvider install
+        // from main.rs is absent and rustls cannot auto-detect a provider
+        // (reqwest pulls in a second one). Build the config explicitly.
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("aws-lc-rs supports the safe default protocol versions")
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        )
+    }
+
+    type DelegateCalls = Arc<Mutex<Vec<(String, u16, bool)>>>;
+
+    /// Connector double that records every SDK invocation as
+    /// (host, port, was_reconnect) and answers with a duplex stream.
+    fn succeeding_delegate(calls: DelegateCalls) -> impl ngrok::session::Connector {
+        move |host: String,
+              port: u16,
+              _tls_config: Arc<rustls::ClientConfig>,
+              error: Option<ngrok::tunnel::AcceptError>| {
+            let calls = calls.clone();
+            async move {
+                calls.lock().unwrap().push((host, port, error.is_some()));
+                let (_server, client) = tokio::io::duplex(64);
+                Ok(Box::new(client) as Box<dyn ngrok::session::IoStream>)
+            }
+        }
+    }
+
+    /// Connector double that records the invocation and fails the transport.
+    fn failing_delegate(calls: DelegateCalls) -> impl ngrok::session::Connector {
+        move |host: String,
+              port: u16,
+              _tls_config: Arc<rustls::ClientConfig>,
+              error: Option<ngrok::tunnel::AcceptError>| {
+            let calls = calls.clone();
+            async move {
+                calls.lock().unwrap().push((host, port, error.is_some()));
+                Err(ngrok::session::ConnectError::Tcp(std::io::Error::other(
+                    "simulated transport failure",
+                )))
+            }
+        }
+    }
+
+    /// The error the SDK passes to the connector when a live connection died
+    /// and it is dialing again.
+    fn reconnect_cause() -> Option<ngrok::tunnel::AcceptError> {
+        Some(ngrok::tunnel::AcceptError::Reconnect(Arc::new(
+            ngrok::session::ConnectError::Tcp(std::io::Error::other("simulated transport loss")),
+        )))
+    }
+
+    #[tokio::test]
+    async fn initial_connect_delegates_verbatim_without_reconnect_evidence() {
+        let calls: DelegateCalls = Arc::new(Mutex::new(Vec::new()));
+        let evidence: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = {
+            let evidence = evidence.clone();
+            move |name: &'static str| evidence.lock().unwrap().push(name)
+        };
+
+        let result = connect_with_reconnect_evidence(
+            succeeding_delegate(calls.clone()),
+            recorder,
+            "connect.ngrok.com".to_string(),
+            443,
+            test_tls_config(),
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "the initial transport must pass through");
         assert!(
-            !session_id_renewed(&mut seen, "session-initial"),
-            "a stable session id must not be reported as a renewal"
+            evidence.lock().unwrap().is_empty(),
+            "the initial connect is already covered by tunnel_starting"
         );
-        assert_eq!(seen, "session-initial");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("connect.ngrok.com".to_string(), 443, false)],
+            "the delegate must receive the SDK arguments verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_reconnect_reports_attempt_then_renewal() {
+        let calls: DelegateCalls = Arc::new(Mutex::new(Vec::new()));
+        let evidence: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = {
+            let evidence = evidence.clone();
+            move |name: &'static str| evidence.lock().unwrap().push(name)
+        };
+
+        let result = connect_with_reconnect_evidence(
+            succeeding_delegate(calls.clone()),
+            recorder,
+            "connect.ngrok.com".to_string(),
+            443,
+            test_tls_config(),
+            reconnect_cause(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "the renewed transport must pass through");
+        assert_eq!(
+            *evidence.lock().unwrap(),
+            vec!["tunnel_session_reconnect_attempt", "tunnel_session_renewed"],
+            "a re-established transport must leave both traces"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("connect.ngrok.com".to_string(), 443, true)],
+            "the delegate must see the reconnect error flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reconnect_reports_the_attempt_without_renewal() {
+        let calls: DelegateCalls = Arc::new(Mutex::new(Vec::new()));
+        let evidence: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = {
+            let evidence = evidence.clone();
+            move |name: &'static str| evidence.lock().unwrap().push(name)
+        };
+
+        let result = connect_with_reconnect_evidence(
+            failing_delegate(calls.clone()),
+            recorder,
+            "connect.ngrok.com".to_string(),
+            443,
+            test_tls_config(),
+            reconnect_cause(),
+        )
+        .await;
 
         assert!(
-            session_id_renewed(&mut seen, "session-renewed"),
-            "a changed session id is the internal-reconnect trace"
+            matches!(result, Err(ngrok::session::ConnectError::Tcp(_))),
+            "the transport failure must propagate to the SDK"
         );
-        assert_eq!(seen, "session-renewed");
-        // The watcher compares against the newest id, so a second poll of the
-        // renewed session stays silent and a later change fires again.
-        assert!(!session_id_renewed(&mut seen, "session-renewed"));
-        assert!(session_id_renewed(&mut seen, "session-third"));
-        assert_eq!(seen, "session-third");
+        assert_eq!(
+            *evidence.lock().unwrap(),
+            vec!["tunnel_session_reconnect_attempt"],
+            "a failed dial must not claim renewal"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("connect.ngrok.com".to_string(), 443, true)],
+            "the delegate must see the reconnect error flag"
+        );
     }
 }
