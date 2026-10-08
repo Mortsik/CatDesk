@@ -3450,7 +3450,8 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_one_named_session_cancels_only_its_jobs_and_keeps_other_session_connected() {
-        // Spawn-dependent (`sleep 5` through PATH via CommandJobManager::start)
+        // Spawn-dependent (`sleep 5` through PATH via
+        // CommandJobManager::start_with_change_session)
         // and PATH is process-global: hold the crate env lock so an
         // env-rewriting test cannot interleave (the dr6-sweep idiom); a broken
         // spawn fails the jobs before the delete, so the
