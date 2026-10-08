@@ -17,8 +17,8 @@ duplicating host-side deferred discovery?
   summaries for later auditing: native profiles store the raw HTTP response,
   the DevTools profile stores the full `tools/list` JSON-RPC message as
   received (every field preserved, re-serialized). Command:
-  `ops/measure-tool-schemas.sh --out /tmp/catdesk-ojt8-r5`
-  (binary/tag: post-rebase main @ ca01902, worktree catdesk-ojt-8).
+  `ops/measure-tool-schemas.sh --out /tmp/catdesk-ojt8-r6`
+  (binary/tag: post-rebase main @ 13397a5, worktree catdesk-ojt-8).
 - Sizes are UTF-8 **bytes**; char counts are reported alongside because token
   figures use the compact-JSON chars/4 heuristic (a GPT-family tokenizer lands
   within roughly ±10–15% of it). An earlier revision of this document reported
@@ -58,8 +58,8 @@ duplicating host-side deferred discovery?
 
 ### Native tools, default tool mode (`toolMode = "multiTools"`), widget detail on
 
-14 tools, **25,415 bytes ≈ 6,354 tokens** of tool objects per `tools/list`
-(the serialized `tools` array is 25,430 bytes; the `result` envelope beyond
+14 tools, **25,348 bytes ≈ 6,337 tokens** of tool objects per `tools/list`
+(the serialized `tools` array is 25,363 bytes; the `result` envelope beyond
 that array: 151 bytes).
 
 | tool | bytes | ~tokens | desc | in | out | anno | meta |
@@ -67,7 +67,7 @@ that array: 151 bytes).
 | run_command | 2,645 | 661 | 390 | 450 | 1,331 | 66 | 294 |
 | read | 2,562 | 640 | 75 | 359 | 1,675 | 67 | 280 |
 | search | 2,338 | 584 | 97 | 1,120 | 661 | 67 | 284 |
-| create_handoff | 2,317 | 579 | 390 | 909 | 523 | 67 | 300 |
+| create_handoff | 2,250 | 562 | 323 | 909 | 523 | 67 | 300 |
 | poll_command | 2,311 | 578 | 573 | 451 | 807 | 68 | 296 |
 | edit | 2,265 | 566 | 271 | 1,162 | 380 | 67 | 280 |
 | start_command | 2,183 | 546 | 374 | 519 | 808 | 66 | 298 |
@@ -78,9 +78,9 @@ that array: 151 bytes).
 | write | 960 | 240 | 42 | 201 | 261 | 67 | 282 |
 | catdesk_instruction | 887 | 222 | 136 | 33 | 208 | 67 | 310 |
 | delete | 870 | 218 | 40 | 155 | 215 | 67 | 284 |
-| **TOTAL** | **25,415** | **6,354** | 2,974 | 7,198 | 9,206 | 937 | 3,500 |
+| **TOTAL** | **25,348** | **6,337** | 2,907 | 7,198 | 9,206 | 937 | 3,500 |
 
-Field shares: outputSchema 36.2%, inputSchema 28.3%, widget `_meta` 13.8%
+Field shares: outputSchema 36.3%, inputSchema 28.4%, widget `_meta` 13.8%
 (twelve tools carry ≈292 B of `openai/outputTemplate`/`ui.resourceUri` each;
 `read_result`/`search_result` carry none), descriptions 11.7%, annotations
 3.7%. `read_image` intentionally has no outputSchema so ChatGPT keeps exposing
@@ -88,8 +88,8 @@ native image content (comment at src/mcp/tool_catalog.rs:25).
 
 ### Read-only tool mode (`toolMode = "readOnly"`)
 
-7 tools, **12,648 bytes ≈ 3,162 tokens** of tool objects (serialized array:
-12,656 bytes; envelope: 151 bytes) (read, search, create_handoff,
+7 tools, **12,581 bytes ≈ 3,145 tokens** of tool objects (serialized array:
+12,589 bytes; envelope: 151 bytes) (read, search, create_handoff,
 search_result, read_image, read_result, catdesk_instruction). The command-job
 trio and the write/delete trio are absent by construction
 (`ToolMode::read_only`, src/state.rs:683).
@@ -110,7 +110,7 @@ catalog" in the issue: 14 native + 28 DevTools).
 
 ### Combined default session (default config: `Mode::Both` + `MultiTools`)
 
-**44 tools, 51,772 bytes ≈ 12,943 tokens** as tool objects (**51,818 bytes**
+**44 tools, 51,705 bytes ≈ 12,926 tokens** as tool objects (**51,751 bytes**
 serialized as arrays) — a **computed sum** of the two measured profiles
 (MultiTools + DevTools), not a single `tools/list` capture (see Method). The
 DevTools passthrough is roughly half (51%) of the footprint and is owned
@@ -122,20 +122,24 @@ of it into model context every conversation is UNVERIFIED (below).
 
 ### Deferred, not eager: the operating guidance
 
-`catdesk_instruction` returns 5,364 chars ≈ **1,341 tokens** of usage guidance
-(measured via a real `tools/call`). It is paid once per session as a tool
+`catdesk_instruction` returns 3,409 chars ≈ **852 tokens** of usage guidance
+(measured via a real `tools/call` against this snapshot; an instruction-shrink
+change landed on main between earlier revisions of this document and here,
+and the figure is remeasured per snapshot). It is paid once per session as a tool
 result because every other tool call is gated on it
 (src/mcp.rs:172 `catdesk_instruction_required_response`). This text is not
 baked into tool descriptions.
 
 ## Per-harness: when schemas are sent, and can a server defer?
 
-### ChatGPT Web Custom Connector (the primary, tested harness)
+### ChatGPT Web Custom Connector (the primary harness; flow documented, not live-tested)
 
-- `tools/list` is fetched at connector setup and on manual refresh, then
-  cached by ChatGPT. CatDesk's own product flow encodes this: schema-changing
-  releases bump `CURRENT_CHATGPT_CONNECTOR_REVISION` (currently 8,
-  src/state.rs:83) and force a "remove CatDesk, add it again" modal
+- Documented flow, not a measurement of ChatGPT itself: **as far as CatDesk's
+  own guidance and community reports describe it**, `tools/list` is fetched at
+  connector setup and on manual refresh and then cached by ChatGPT. CatDesk's
+  product flow encodes this: schema-changing releases bump
+  `CURRENT_CHATGPT_CONNECTOR_REVISION` (currently 8, src/state.rs:83) and
+  force a "remove CatDesk, add it again" modal
   (src/tui/connector_notice.rs:161). README (line 170) says the same for any
   MCP-setting change: start a new chat and refresh in ChatGPT settings; the
   most reliable way is remove + re-add.
@@ -162,7 +166,7 @@ baked into tool descriptions.
   the Responses-API MCP page does not cover ChatGPT web connectors) states
   whether the full cached schemas are injected into model context in every
   conversation where the connector is active, or a reduced representation.
-  The measured 51,772 bytes ≈ 12,943 tokens is therefore a serialized
+  The measured 51,705 bytes ≈ 12,926 tokens is therefore a serialized
   registry/schema footprint and an upper bound on per-conversation schema
   cost, not a measured context injection. ChatGPT consumes `outputSchema` for
   structured projection regardless (in-repo evidence: the `read_image`
@@ -230,7 +234,7 @@ first revision of this document:
 
 ## What is already deferred by CatDesk (no host help needed)
 
-1. Operating guidance (~1.3k tokens) is behind the mandatory
+1. Operating guidance (~0.9k tokens) is behind the mandatory
    `catdesk_instruction` call instead of baked into every descriptor.
 2. Large tool results: the shared 64-KiB inline budget
    (`DEFAULT_INLINE_RESPONSE_BYTES`, src/mcp/response_budget.rs:6) externalizes
@@ -244,8 +248,7 @@ first revision of this document:
    `tools/list`; they are never stored, and in read-only tool mode they are
    filtered to `readOnlyHint` tools server-side.
 5. `ToolMode::ReadOnly` halves the native set (7 vs 14 tools) — a deliberate,
-   documented exposure profile, though README's counts are stale (see side
-   findings).
+   documented exposure profile (README's counts already match).
 6. `ShowDetailMode::Disable` drops the widget `_meta` block from every
    descriptor (src/mcp/widget.rs:118): −3,500 B ≈ −875 tokens of the native
    footprint, an existing user setting.
@@ -331,10 +334,7 @@ worth it at the current catalog size.
 
 ### Follow-up candidates worth recording (not implemented here)
 
-1. **Docs fix (tiny):** README.md:201 says `multi-tools` exposes 12 and
-   `read-only` 5 tools; measured reality is 14 and 7 (`read_result` and
-   `search_result` were added later).
-2. **Consider pinning the DevTools MCP version:** `chrome-devtools-mcp@latest`
+1. **Consider pinning the DevTools MCP version:** `chrome-devtools-mcp@latest`
   (src/devtools.rs:26) floats 51% of the combined eager footprint (28 → 30
   tools across recent versions). Pinning stabilizes the number and the ChatGPT
   refresh cadence, at the cost of upstream fixes — a product trade-off, not a
@@ -342,14 +342,11 @@ worth it at the current catalog size.
 
 ## Side findings
 
-- `ops/soak-real-duration.sh` is currently broken: it seeds
-  `mode = "Computer"` / `toolMode = "MultiTools"`, but the config serde
-  expects camelCase variants (`"computer"` / `"multiTools"`), and
-  `load_from_path` aborts startup on the unknown variant (verified by running
-  the binary against a seeded config). The measurement script seeds the
-  lowercase forms.
-- `cargo build --release` emits a dead-code warning for
-  `DevtoolsBridge::from_child` (src/devtools.rs:158).
+Both side findings recorded by earlier revisions of this document (the soak
+script seeding capitalized config enum values, and a release dead-code
+warning for `DevtoolsBridge::from_child`) were fixed on main before this
+snapshot and are no longer reproducible here; they are dropped rather than
+kept as stale remediation items.
 
 ## UNVERIFIED / open questions
 
@@ -414,4 +411,4 @@ worth it at the current catalog size.
 - In-repo: src/mcp/tool_catalog.rs, src/mcp/resources.rs, src/mcp/widget.rs,
   src/mcp/instruction.rs, src/mcp/response_budget.rs, src/state.rs,
   src/tui/connector_notice.rs, src/server.rs, src/devtools.rs, README.md
-  (all at 96af79f).
+  (all at 13397a5, the measured post-rebase base).
