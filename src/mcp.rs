@@ -799,4 +799,6 @@ fn tool_is_read_only(tool: &Value) -> bool {
 }
 
 #[cfg(test)]
+mod e2e_transcript_gate;
+#[cfg(test)]
 mod tests;
