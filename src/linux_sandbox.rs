@@ -725,6 +725,20 @@ impl ScopeUsabilityCache {
         );
         usable
     }
+
+    /// Downgrade `executable` to a permanent negative verdict after a real
+    /// scope launch failed on the bus despite the cached positive preflight.
+    /// Same lifetime as a negative preflight: the bus will not come back
+    /// mid-process, so later commands must not re-pay a doomed launch.
+    fn record_failure(&mut self, executable: &Path) {
+        self.verdicts.insert(
+            executable.to_path_buf(),
+            ScopeVerdict {
+                usable: false,
+                decided_at: Instant::now(),
+            },
+        );
+    }
 }
 
 /// Process-wide cache. The mutex is held across the probe on purpose:
@@ -745,8 +759,9 @@ static SCOPE_USABILITY: Mutex<ScopeUsabilityCache> = Mutex::new(ScopeUsabilityCa
 /// [`SYSTEMD_SCOPE_POSITIVE_TTL`], so a bus that dies mid-process is
 /// re-probed instead of being trusted forever. Residual staleness inside the
 /// TTL window (and a bus dying between the probe and a real launch) still
-/// fails the affected command — an immediate retry-without-scope on a
-/// "Failed to connect to bus" error is tracked as a follow-up.
+/// fails the affected command; the command runner then degrades that one
+/// command to plain bubblewrap — see [`scope_launch_failed_with_bus_error`]
+/// and [`mark_scope_unusable`], wired into the retry in `process_runner`.
 fn systemd_scope_usable(executable: &Path) -> bool {
     SCOPE_USABILITY
         .lock()
@@ -798,6 +813,33 @@ fn systemd_scope_usable_within(executable: &Path, timeout: Duration) -> bool {
         }
     }
     verdict
+}
+
+/// Whether captured stderr opens with `systemd-run`'s bus-connect failure.
+///
+/// `systemd-run --scope` execs the sandbox in place, so when the bus is
+/// unreachable the client never starts the command and its failure message is
+/// the only output — it always leads stderr. Matching the prefix rather than
+/// searching anywhere keeps a user command that merely *prints* the string
+/// mid-output from triggering the retry. The literal is the upstream C-locale
+/// message: under a translated locale the match misses and the command fails
+/// exactly as it did before the retry existed — the fallback degrades, it
+/// never misfires.
+pub(crate) fn scope_launch_failed_with_bus_error(stderr: &str) -> bool {
+    stderr.trim_start().starts_with("Failed to connect to bus")
+}
+
+/// Record a launch-time bus failure for `executable`: its preflight passed,
+/// but the real `systemd-run --scope` launch could not reach the bus, so the
+/// cached positive verdict is stale. The recorded negative verdict has the
+/// same process lifetime as a negative preflight — the command runner uses it
+/// to retry once without a scope and every later command skips the doomed
+/// launch entirely.
+pub(crate) fn mark_scope_unusable(executable: &Path) {
+    SCOPE_USABILITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record_failure(executable);
 }
 
 /// Memory ceilings for a single sandboxed command, applied through cgroup v2
@@ -919,6 +961,19 @@ fn sandbox_command(
     command
 }
 
+/// A prepared sandboxed command plus the scope decision baked into it.
+///
+/// `scope` is the resolved `systemd-run` that wraps the command when a
+/// transient scope was actually decided, and `None` for plain bubblewrap. The
+/// command runner needs it to recognize a launch-time bus failure (only a
+/// scoped launch can fail that way) and to invalidate that executable's stale
+/// positive preflight before retrying without the scope.
+pub(crate) struct SandboxedCommand {
+    pub command: Command,
+    pub scratch_dir: PathBuf,
+    pub scope: Option<PathBuf>,
+}
+
 /// Build the command that runs `command` confined to `workspace`, together with
 /// the private scratch directory created for it.
 ///
@@ -927,11 +982,7 @@ fn sandbox_command(
 /// error says so, since the caller cannot run anything unconfined.
 ///
 /// The scratch directory is removed again if the command could not be prepared.
-pub fn helper_command(
-    command: &str,
-    workspace: &Path,
-    cwd: &Path,
-) -> io::Result<(Command, PathBuf)> {
+pub fn helper_command(command: &str, workspace: &Path, cwd: &Path) -> io::Result<SandboxedCommand> {
     let sandbox_id = uuid::Uuid::new_v4().to_string();
     let scratch_dir = std::env::temp_dir().join(format!("catdesk-sandbox-{sandbox_id}"));
     let mut dir_builder = std::fs::DirBuilder::new();
@@ -966,7 +1017,11 @@ pub fn helper_command(
     };
 
     match prepared {
-        Ok(prepared) => Ok((prepared, scratch_dir)),
+        Ok(prepared) => Ok(SandboxedCommand {
+            command: prepared,
+            scratch_dir,
+            scope,
+        }),
         Err(error) => {
             let _ = std::fs::remove_dir_all(&scratch_dir);
             Err(error)
@@ -1245,10 +1300,13 @@ mod tests {
         // Probe: environments with bwrap installed but user namespaces
         // blocked (container seccomp profiles) cannot run the sandbox at
         // all — skip rather than fail there.
-        let (mut probe, probe_scratch) =
+        let mut probe =
             helper_command("true", &workspace, &workspace).expect("prepare probe command");
-        let probe_ok = probe.output().is_ok_and(|status| status.status.success());
-        let _ = std::fs::remove_dir_all(probe_scratch);
+        let probe_ok = probe
+            .command
+            .output()
+            .is_ok_and(|status| status.status.success());
+        let _ = std::fs::remove_dir_all(probe.scratch_dir);
         if !probe_ok {
             for (name, value) in prev {
                 // SAFETY: still under the same lock.
@@ -1262,12 +1320,12 @@ mod tests {
             return;
         }
 
-        let (mut command, scratch) = helper_command("npm --version", &workspace, &workspace)
+        let mut command = helper_command("npm --version", &workspace, &workspace)
             .expect("prepare sandbox command");
-        let output = command.output().expect("run sandboxed npm");
+        let output = command.command.output().expect("run sandboxed npm");
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let _ = std::fs::remove_dir_all(scratch);
+        let _ = std::fs::remove_dir_all(command.scratch_dir);
 
         for (name, value) in prev {
             // SAFETY: still under the same lock.
@@ -1485,15 +1543,15 @@ mod tests {
             return;
         }
 
-        let (_command, scratch) = helper_command("true", Path::new("."), Path::new("."))
+        let command = helper_command("true", Path::new("."), Path::new("."))
             .expect("prepare sandbox helper command");
-        let mode = std::fs::metadata(&scratch)
+        let mode = std::fs::metadata(&command.scratch_dir)
             .expect("scratch metadata")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700);
-        std::fs::remove_dir_all(scratch).expect("remove scratch directory");
+        std::fs::remove_dir_all(command.scratch_dir).expect("remove scratch directory");
     }
 
     #[test]
@@ -1593,14 +1651,21 @@ mod tests {
 
         let workspace = tree.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("create workspace");
-        let (command, scratch) =
-            helper_command("true", &workspace, &workspace).expect("helper command");
+        let command = helper_command("true", &workspace, &workspace).expect("helper command");
+        assert!(
+            command.scope.is_none(),
+            "no scope decision without systemd-run"
+        );
         assert_eq!(
-            Path::new(command.get_program()).file_name(),
+            Path::new(command.command.get_program()).file_name(),
             Some(OsStr::new("bwrap")),
             "plain bwrap when systemd-run is unavailable"
         );
-        let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
+        let args: Vec<_> = command
+            .command
+            .get_args()
+            .map(|arg| arg.to_os_string())
+            .collect();
         assert!(
             !args.windows(2).any(|pair| pair[0] == OsStr::new("--setenv")
                 && pair[1] == OsStr::new("CATDESK_SANDBOX_UNIT")),
@@ -1612,7 +1677,7 @@ mod tests {
                     && pair[1] == OsStr::new("CATDESK_SANDBOX_UNIT")),
             "inherited/planted marker must be actively removed"
         );
-        std::fs::remove_dir_all(scratch).expect("remove scratch directory");
+        std::fs::remove_dir_all(command.scratch_dir).expect("remove scratch directory");
     }
 
     #[test]
@@ -1826,6 +1891,101 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "the deadline kill must be promptly enforced (elapsed {elapsed:?})"
         );
+    }
+
+    #[test]
+    fn bus_error_detection_accepts_only_leading_systemd_run_failure() {
+        // Real failure shapes: the errno suffix varies with the kernel/socket
+        // state, leading whitespace with the client version.
+        assert!(scope_launch_failed_with_bus_error(
+            "Failed to connect to bus: No medium found\n"
+        ));
+        assert!(scope_launch_failed_with_bus_error(
+            "\n Failed to connect to bus: Connection refused"
+        ));
+        // Anything that does not open with the failure is somebody else's
+        // output: another launch error must not trigger the scope fallback,
+        // and a user command that merely prints the string deeper in its
+        // output must not either.
+        assert!(!scope_launch_failed_with_bus_error(
+            "Failed to start transient service unit: Unit catdesk-sb-x.service is masked.\n"
+        ));
+        assert!(!scope_launch_failed_with_bus_error(
+            "some early noise\nFailed to connect to bus: No medium found\n"
+        ));
+        assert!(!scope_launch_failed_with_bus_error(""));
+    }
+
+    #[test]
+    fn scope_cache_launch_failure_downgrades_positive_verdict_permanently() {
+        let mut cache = ScopeUsabilityCache::new();
+        let executable = Path::new("/opt/bin/systemd-run");
+        assert!(cache.decide(
+            executable,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            &mut |_, _: Duration| true,
+        ));
+
+        cache.record_failure(executable);
+
+        // The probe must not run again: the recorded failure carries the same
+        // permanent weight as a negative preflight verdict.
+        let second = cache.decide(
+            executable,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            &mut |_, _: Duration| panic!("a recorded launch failure must not re-probe"),
+        );
+        assert!(!second);
+    }
+
+    #[test]
+    fn mark_scope_unusable_forces_subsequent_launches_without_scope() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tree = TempTree::new();
+        let bin = tree.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("create bin");
+        let systemd_run = bin.join("systemd-run");
+        // Preflight passes; only a real launch would hit the dead bus.
+        std::fs::write(&systemd_run, b"#!/bin/sh\nexit 0\n").expect("write systemd-run stub");
+        std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod systemd-run stub");
+
+        let _env = EnvGuards::set_many(&[
+            ("PATH", bin.as_path()),
+            ("CATDESK_SANDBOX_MEMORY", Path::new("on")),
+        ]);
+
+        let scoped =
+            helper_command("true", Path::new("."), Path::new(".")).expect("scoped command");
+        let resolved = scoped.scope.expect("preflight pass yields a scope");
+        std::fs::remove_dir_all(scoped.scratch_dir).expect("remove scratch directory");
+
+        mark_scope_unusable(&resolved);
+
+        let plain = helper_command("true", Path::new("."), Path::new(".")).expect("plain command");
+        assert!(
+            plain.scope.is_none(),
+            "a recorded bus failure must decide no scope"
+        );
+        assert_eq!(
+            Path::new(plain.command.get_program()).file_name(),
+            Some(OsStr::new("bwrap")),
+            "retry preparation degrades to plain bwrap"
+        );
+        let args: Vec<_> = plain
+            .command
+            .get_args()
+            .map(|arg| arg.to_os_string())
+            .collect();
+        assert!(
+            !args.windows(2).any(|pair| pair[0] == OsStr::new("--setenv")
+                && pair[1] == OsStr::new("CATDESK_SANDBOX_UNIT")),
+            "the degraded launch must not carry the scope marker"
+        );
+        std::fs::remove_dir_all(plain.scratch_dir).expect("remove scratch directory");
     }
 
     #[test]

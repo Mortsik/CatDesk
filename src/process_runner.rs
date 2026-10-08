@@ -71,6 +71,10 @@ pub struct SpawnedProcess {
     stderr: Option<ChildStderr>,
     tree: ProcessTreeGuard,
     cleanup_dir: Option<PathBuf>,
+    /// The resolved `systemd-run` that wrapped this launch, when a transient
+    /// scope was created. Read by the scoped-launch retry in
+    /// `run_shell_command` once the command's outcome is known.
+    scope: Option<PathBuf>,
 }
 
 impl SpawnedProcess {
@@ -370,6 +374,11 @@ struct PreparedShellCommand {
     command: Command,
     cwd: PathBuf,
     cleanup_dir: Option<PathBuf>,
+    /// The resolved `systemd-run` wrapping the launch when a transient scope
+    /// was actually decided; `None` on every non-scoped path (other platforms,
+    /// plain bubblewrap). Only a scoped launch can fail on a dead bus, so the
+    /// retry in `run_shell_command` keys off this.
+    scope: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -378,11 +387,12 @@ fn prepare_linux_sandbox_command(
     workspace_root: &Path,
     cwd: &Path,
 ) -> io::Result<PreparedShellCommand> {
-    let (helper, scratch_dir) = crate::linux_sandbox::helper_command(command, workspace_root, cwd)?;
+    let helper = crate::linux_sandbox::helper_command(command, workspace_root, cwd)?;
     Ok(PreparedShellCommand {
-        command: Command::from(helper),
+        command: Command::from(helper.command),
         cwd: cwd.to_path_buf(),
-        cleanup_dir: Some(scratch_dir),
+        cleanup_dir: Some(helper.scratch_dir),
+        scope: helper.scope,
     })
 }
 
@@ -408,6 +418,7 @@ fn shell_command(
             command: shell,
             cwd: cwd.to_path_buf(),
             cleanup_dir: None,
+            scope: None,
         })
     }
 
@@ -421,6 +432,7 @@ fn shell_command(
             command: shell,
             cwd: cwd.to_path_buf(),
             cleanup_dir: None,
+            scope: None,
         })
     }
 
@@ -439,6 +451,7 @@ fn shell_command(
             command: shell,
             cwd: cwd.to_path_buf(),
             cleanup_dir: None,
+            scope: None,
         })
     }
 }
@@ -446,6 +459,7 @@ fn shell_command(
 fn spawn_prepared_shell_command(prepared: PreparedShellCommand) -> io::Result<SpawnedProcess> {
     let mut shell = prepared.command;
     let cwd = prepared.cwd;
+    let scope = prepared.scope;
     let mut cleanup_dir = prepared.cleanup_dir;
     shell
         .current_dir(&cwd)
@@ -522,6 +536,7 @@ fn spawn_prepared_shell_command(prepared: PreparedShellCommand) -> io::Result<Sp
         stderr,
         tree,
         cleanup_dir,
+        scope,
     })
 }
 
@@ -575,6 +590,19 @@ pub async fn spawn_shell_command(
     workspace_root: &Path,
     cwd: &Path,
 ) -> io::Result<SpawnedProcess> {
+    spawn_shell_command_with_mode(command, workspace_root, cwd, false).await
+}
+
+/// [`spawn_shell_command`] with `force_sandbox`, mirroring
+/// [`prepare_linux_command_async`]: production Linux is always sandboxed,
+/// while the test build normally prepares a plain shell and needs the flag to
+/// exercise the real sandbox — including its scoped-launch retry — hermetically.
+async fn spawn_shell_command_with_mode(
+    command: &str,
+    workspace_root: &Path,
+    cwd: &Path,
+    force_sandbox: bool,
+) -> io::Result<SpawnedProcess> {
     // Operator-only actions are denied before spawn so the explanation lands
     // in the command's own error channel (see command_policy for the why).
     if let Err(denied) = crate::command_policy::check_vm_bounce(command) {
@@ -586,7 +614,7 @@ pub async fn spawn_shell_command(
             command.to_owned(),
             workspace_root.to_path_buf(),
             cwd.to_path_buf(),
-            false,
+            force_sandbox,
         )
         .await?;
         // On Linux the prepared command is bwrap --die-with-parent in
@@ -598,6 +626,7 @@ pub async fn spawn_shell_command(
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = force_sandbox;
         let command = command.to_owned();
         let workspace_root = workspace_root.to_path_buf();
         let cwd = cwd.to_path_buf();
@@ -709,23 +738,135 @@ pub async fn run_shell_command(
     timeout_ms: u64,
     max_capture_bytes: usize,
 ) -> ProcessRunResult {
-    let started = Instant::now();
-    let mut process = match spawn_shell_command(command, workspace_root, cwd).await {
-        Ok(process) => process,
-        Err(error) => {
-            return ProcessRunResult {
-                stdout: String::new(),
-                stderr: format!("Failed to execute: {error}"),
-                success: false,
-                exit_code: Some(EXIT_CODE_INTERNAL_ERROR),
-                elapsed_ms: started.elapsed().as_millis() as u64,
-                timed_out: false,
-                stdout_truncated: false,
-                stderr_truncated: false,
-            };
-        }
-    };
+    run_shell_command_with_mode(
+        command,
+        workspace_root,
+        cwd,
+        timeout_ms,
+        max_capture_bytes,
+        false,
+    )
+    .await
+}
 
+/// [`run_shell_command`] with `force_sandbox`, so tests can drive the real
+/// Linux sandbox (and its scoped-launch retry) through the same pipeline the
+/// production `run_shell_command` uses.
+#[cfg(all(target_os = "linux", test))]
+async fn run_sandboxed_shell_command_for_test(
+    command: &str,
+    workspace_root: &Path,
+    cwd: &Path,
+    timeout_ms: u64,
+    max_capture_bytes: usize,
+) -> ProcessRunResult {
+    run_shell_command_with_mode(
+        command,
+        workspace_root,
+        cwd,
+        timeout_ms,
+        max_capture_bytes,
+        true,
+    )
+    .await
+}
+
+async fn run_shell_command_with_mode(
+    command: &str,
+    workspace_root: &Path,
+    cwd: &Path,
+    timeout_ms: u64,
+    max_capture_bytes: usize,
+    force_sandbox: bool,
+) -> ProcessRunResult {
+    let started = Instant::now();
+    let process =
+        match spawn_shell_command_with_mode(command, workspace_root, cwd, force_sandbox).await {
+            Ok(process) => process,
+            Err(error) => {
+                return ProcessRunResult {
+                    stdout: String::new(),
+                    stderr: format!("Failed to execute: {error}"),
+                    success: false,
+                    exit_code: Some(EXIT_CODE_INTERNAL_ERROR),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                };
+            }
+        };
+
+    #[cfg(target_os = "linux")]
+    let scope = process.scope.clone();
+    let result = run_spawned_process(process, started, timeout_ms, max_capture_bytes).await;
+
+    #[cfg(target_os = "linux")]
+    if let Some(retried) = retry_scoped_launch_without_scope(
+        command,
+        workspace_root,
+        cwd,
+        timeout_ms,
+        max_capture_bytes,
+        force_sandbox,
+        scope,
+        &result,
+    )
+    .await
+    {
+        return retried;
+    }
+
+    result
+}
+
+/// One retry without the scope after a launch-time bus failure.
+///
+/// The preflight's positive verdict (45 s TTL) can go stale: the bus dies
+/// between the probe and the real `systemd-run --scope` launch, the client
+/// never starts the command, and the whole request would fail with "Failed to
+/// connect to bus" even though plain bubblewrap confinement is fully
+/// available. Recording the failure first (permanent, like a negative
+/// preflight) steers this retry spawn — and every later command — away from
+/// the doomed scope, which also keeps the `CATDESK_SANDBOX_UNIT` marker
+/// consistent: it comes from the same decision as the scope itself.
+///
+/// Only a leading bus-connect failure retries. A success has nothing to
+/// recover from, a timeout ran the real command (a second execution could
+/// repeat its side effects), and any other launch error is out of this
+/// fallback's contract.
+#[cfg(target_os = "linux")]
+async fn retry_scoped_launch_without_scope(
+    command: &str,
+    workspace_root: &Path,
+    cwd: &Path,
+    timeout_ms: u64,
+    max_capture_bytes: usize,
+    force_sandbox: bool,
+    scope: Option<PathBuf>,
+    failed: &ProcessRunResult,
+) -> Option<ProcessRunResult> {
+    let scope = scope.filter(|_| {
+        !failed.success
+            && !failed.timed_out
+            && crate::linux_sandbox::scope_launch_failed_with_bus_error(&failed.stderr)
+    })?;
+    crate::linux_sandbox::mark_scope_unusable(&scope);
+
+    let process = spawn_shell_command_with_mode(command, workspace_root, cwd, force_sandbox)
+        .await
+        .ok()?;
+    Some(run_spawned_process(process, Instant::now(), timeout_ms, max_capture_bytes).await)
+}
+
+/// Wait for an already-spawned process, capture its output and fold in the
+/// timeout/signal diagnostics.
+async fn run_spawned_process(
+    mut process: SpawnedProcess,
+    started: Instant,
+    timeout_ms: u64,
+    max_capture_bytes: usize,
+) -> ProcessRunResult {
     let stdout_task = process
         .take_stdout()
         .map(|stdout| tokio::spawn(capture_reader(stdout, max_capture_bytes)));
@@ -1054,5 +1195,217 @@ mod tests {
             "dropped command future left the process alive"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Env overrides serialized by the crate-wide env lock and restored on
+    /// drop (including on panic), mirroring `EnvGuards` in the linux_sandbox
+    /// tests. Additional `set_str` calls inside one lock scope push their own
+    /// restore entries; drop replays everything in reverse.
+    #[cfg(target_os = "linux")]
+    struct TestEnv {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TestEnv {
+        fn set(pairs: &[(&'static str, &std::path::Path)]) -> Self {
+            let guard = crate::test_serialization::lock_env();
+            let prev = pairs
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for (name, value) in pairs {
+                // SAFETY: the crate env lock is held for the struct's whole
+                // lifetime, so no other test thread reads or writes the env
+                // concurrently; drop restores while still holding the lock.
+                unsafe { std::env::set_var(name, value) };
+            }
+            Self {
+                prev,
+                _guard: guard,
+            }
+        }
+
+        fn set_str(&mut self, name: &'static str, value: &str) {
+            self.prev.push((name, std::env::var_os(name)));
+            // SAFETY: same lock discipline as `set`.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            for (name, value) in self.prev.iter().rev() {
+                // SAFETY: same lock discipline as `set`.
+                match value {
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
+
+    /// A `systemd-run` stub whose preflight probe (`--user --scope --quiet
+    /// true`, exactly four arguments ending in "true") succeeds while any real
+    /// launch writes `launch_stderr` to stderr, appends a line to `marker` and
+    /// exits nonzero — the dead-bus-between-probe-and-launch shape, without a
+    /// wall clock in sight.
+    #[cfg(target_os = "linux")]
+    fn write_systemd_run_stub(bin: &Path, launch_stderr: &str, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stub = bin.join("systemd-run");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$#\" -eq 4 ] && [ \"$4\" = \"true\" ]; then\n\
+             \x20   exit 0\n\
+             fi\n\
+             echo '{launch_stderr}' >&2\n\
+             echo launch >> '{}'\n\
+             exit 1\n",
+            marker.display()
+        );
+        std::fs::write(&stub, script).expect("write systemd-run stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod systemd-run stub");
+    }
+
+    /// Whether this host can run the sandbox at all: bwrap plus unprivileged
+    /// user namespaces can be absent or blocked (container seccomp), and the
+    /// scoped-launch tests must skip instead of failing there.
+    #[cfg(target_os = "linux")]
+    fn host_runs_plain_sandbox() -> bool {
+        std::process::Command::new("bwrap")
+            .arg("--ro-bind")
+            .arg("/")
+            .arg("/")
+            .arg("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// PATH with the stub bin PREPENDED to the real one. Tests running in
+    /// parallel spawn `python3`/`sleep` through PATH without taking the env
+    /// lock, so the override must stay fully functional — the stub only needs
+    /// to win the `systemd-run` resolution, not own the whole PATH.
+    #[cfg(target_os = "linux")]
+    fn path_with_stub_first(bin: &Path) -> PathBuf {
+        std::env::join_paths(
+            std::iter::once(bin.to_path_buf()).chain(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            )),
+        )
+        .expect("join stub PATH")
+        .into()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn scoped_launch_bus_failure_retries_once_without_scope() {
+        if !host_runs_plain_sandbox() {
+            return;
+        }
+
+        // The stub lives OUTSIDE the command's workspace: workspace-local
+        // `systemd-run` candidates are rejected by design (hijack guard), so a
+        // stub under the workspace would silently yield no scope at all.
+        let stubs = workspace("scope-stubs");
+        let bin = stubs.join("bin");
+        std::fs::create_dir_all(&bin).expect("create stub bin");
+        let marker = stubs.join("scope-launches.log");
+        write_systemd_run_stub(&bin, "Failed to connect to bus: No medium found", &marker);
+
+        let root = workspace("scope-retry");
+
+        let stub_path = path_with_stub_first(&bin);
+        let mut env = TestEnv::set(&[("PATH", &stub_path)]);
+        env.set_str("CATDESK_SANDBOX_MEMORY", "off");
+        // Probe with the scope disabled: hosts that cannot sandbox at all skip
+        // rather than fail, and the probe must not touch the stub (which would
+        // already trip the retry under test).
+        let probe = run_sandboxed_shell_command_for_test("true", &root, &root, 10_000, 1024).await;
+        if !probe.success {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&stubs);
+            return;
+        }
+        env.set_str("CATDESK_SANDBOX_MEMORY", "on");
+
+        let result =
+            run_sandboxed_shell_command_for_test("printf ok", &root, &root, 15_000, 1024).await;
+        drop(env);
+
+        assert!(
+            result.success,
+            "the bus failure must degrade to a successful plain-bwrap run; stderr: {}",
+            result.stderr
+        );
+        assert_eq!(result.stdout.trim(), "ok");
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "the retried run must report its own exit status, not the failed launch's"
+        );
+        let launches = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(
+            launches.lines().count(),
+            1,
+            "exactly one scoped launch, then the scope-less retry"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&stubs);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn scoped_launch_non_bus_failure_does_not_retry() {
+        if !host_runs_plain_sandbox() {
+            return;
+        }
+
+        let stubs = workspace("scope-stubs");
+        let bin = stubs.join("bin");
+        std::fs::create_dir_all(&bin).expect("create stub bin");
+        let marker = stubs.join("scope-launches.log");
+        write_systemd_run_stub(
+            &bin,
+            "Failed to start transient service unit: Unit catdesk-sb-x.service is masked.",
+            &marker,
+        );
+
+        let root = workspace("scope-no-retry");
+
+        let stub_path = path_with_stub_first(&bin);
+        let mut env = TestEnv::set(&[("PATH", &stub_path)]);
+        env.set_str("CATDESK_SANDBOX_MEMORY", "on");
+
+        let result =
+            run_sandboxed_shell_command_for_test("printf ok", &root, &root, 15_000, 1024).await;
+        drop(env);
+
+        assert!(
+            !result.success,
+            "non-bus launch errors stay failed: the fallback is scoped to the bus race"
+        );
+        assert!(
+            result
+                .stderr
+                .contains("Failed to start transient service unit"),
+            "the original failure must surface unchanged; stderr: {}",
+            result.stderr
+        );
+        let launches = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(
+            launches.lines().count(),
+            1,
+            "a non-bus error must not trigger the scope-less retry"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&stubs);
     }
 }
