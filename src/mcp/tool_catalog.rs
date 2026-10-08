@@ -105,6 +105,16 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                             "budgetTruncated": {
                                 "type": "boolean",
                                 "description": "Cut by the shared budget, so asking for fewer files returns more of this one. A file truncated without this is over the per-file cap and no retry returns the rest."
+                            },
+                            "startLine": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Present for ranged reads: the 1-based first line returned."
+                            },
+                            "endLine": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Present for ranged reads: the 1-based last line returned, clamped to the file's end."
                             }
                         },
                         "required": ["path", "bytes", "sizeBytes", "lineCount", "text", "truncated", "budgetTruncated"]
@@ -570,11 +580,32 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
                 "properties": {
                     "paths": {
                         "type": "array",
-                        "items": { "type": "string", "minLength": 1 },
+                        "items": {
+                            "oneOf": [
+                                { "type": "string", "minLength": 1 },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string", "minLength": 1 },
+                                        "start_line": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "description": "1-based first line to read (default 1)"
+                                        },
+                                        "end_line": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "description": "1-based inclusive last line; larger than the file is clamped to its last line"
+                                        }
+                                    },
+                                    "required": ["path"]
+                                }
+                            ]
+                        },
                         "minItems": 1,
                         "maxItems": workspace_tools::MAX_READ_BATCH_FILES,
                         "description": format!(
-                            "File paths relative to workspace root, or absolute paths within it. Paths that resolve to the same file are read once. Combined text is capped at {} bytes; files past that return metadata only.",
+                            "File paths relative to workspace root, or absolute paths within it. A string reads the whole file; an object with start_line/end_line reads that 1-based inclusive line range only, so a small range inside a huge file comes back whole. Paths that resolve to the same file and range are read once. Combined text is capped at {} bytes; entries past that return metadata only.",
                             workspace_tools::MAX_READ_BATCH_BYTES
                         )
                     }

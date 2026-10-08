@@ -4199,6 +4199,265 @@ async fn read_batch(workspace_root: &Path, paths: Value) -> Value {
     .expect("missing structured content")
 }
 
+#[tokio::test]
+async fn read_tool_line_range_returns_only_requested_lines() {
+    let workspace_root = read_workspace("line-range");
+    std::fs::write(
+        workspace_root.join("notes.txt"),
+        "first\nsecond\nthird\nfourth\nfifth\n",
+    )
+    .expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([{ "path": "notes.txt", "start_line": 2, "end_line": 4 }]),
+    )
+    .await;
+
+    let entry = &structured["files"][0];
+    assert_eq!(entry["text"].as_str(), Some("second\nthird\nfourth\n"));
+    assert_eq!(entry["truncated"].as_bool(), Some(false));
+    assert_eq!(entry["startLine"].as_u64(), Some(2));
+    assert_eq!(entry["endLine"].as_u64(), Some(4));
+    assert!(entry["error"].is_null(), "unexpected error: {structured}");
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[tokio::test]
+async fn read_tool_line_range_start_only_reads_to_end_of_file() {
+    let workspace_root = read_workspace("line-range-start-only");
+    std::fs::write(workspace_root.join("notes.txt"), "first\nsecond\nthird\n").expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([{ "path": "notes.txt", "start_line": 2 }]),
+    )
+    .await;
+
+    let entry = &structured["files"][0];
+    assert_eq!(entry["text"].as_str(), Some("second\nthird\n"));
+    assert_eq!(entry["truncated"].as_bool(), Some(false));
+    assert_eq!(entry["startLine"].as_u64(), Some(2));
+    assert_eq!(entry["endLine"].as_u64(), Some(3));
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[tokio::test]
+async fn read_tool_line_range_end_only_reads_from_the_head() {
+    let workspace_root = read_workspace("line-range-end-only");
+    std::fs::write(workspace_root.join("notes.txt"), "first\nsecond\nthird\n").expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([{ "path": "notes.txt", "end_line": 2 }]),
+    )
+    .await;
+
+    let entry = &structured["files"][0];
+    assert_eq!(entry["text"].as_str(), Some("first\nsecond\n"));
+    assert_eq!(entry["startLine"].as_u64(), Some(1));
+    assert_eq!(entry["endLine"].as_u64(), Some(2));
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[tokio::test]
+async fn read_tool_line_range_end_clamps_to_file_end() {
+    let workspace_root = read_workspace("line-range-clamp");
+    std::fs::write(workspace_root.join("notes.txt"), "first\nsecond\nthird\n").expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([{ "path": "notes.txt", "start_line": 3, "end_line": 999 }]),
+    )
+    .await;
+
+    let entry = &structured["files"][0];
+    assert_eq!(entry["text"].as_str(), Some("third\n"));
+    assert_eq!(entry["startLine"].as_u64(), Some(3));
+    assert_eq!(entry["endLine"].as_u64(), Some(3));
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[tokio::test]
+async fn read_tool_line_range_past_eof_errors_with_the_file_line_count() {
+    let workspace_root = read_workspace("line-range-past-eof");
+    std::fs::write(workspace_root.join("notes.txt"), "first\nsecond\nthird\n").expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([{ "path": "notes.txt", "start_line": 10 }]),
+    )
+    .await;
+
+    let error = structured["files"][0]["error"]
+        .as_str()
+        .expect("range error");
+    assert!(
+        error.contains("10") && error.contains("3"),
+        "error must name the requested start and the file line count: {error}"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[tokio::test]
+async fn read_tool_line_range_serves_lines_a_single_head_read_cannot_reach() {
+    let workspace_root = read_workspace("line-range-big-file");
+    let mut big = String::from("HEAD\nNEEDLE-A\nNEEDLE-B\n");
+    big.push_str(&"y".repeat(600 * 1024));
+    big.push('\n');
+    std::fs::write(workspace_root.join("big.txt"), &big).expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([{ "path": "big.txt", "start_line": 2, "end_line": 3 }]),
+    )
+    .await;
+
+    let entry = &structured["files"][0];
+    assert_eq!(entry["text"].as_str(), Some("NEEDLE-A\nNEEDLE-B\n"));
+    assert_eq!(
+        entry["truncated"].as_bool(),
+        Some(false),
+        "a small range inside a huge file must come back whole: {structured}"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[tokio::test]
+async fn read_tool_plain_string_paths_keep_working_alongside_ranges() {
+    let workspace_root = read_workspace("line-range-mixed");
+    std::fs::write(workspace_root.join("a.txt"), "a1\na2\n").expect("write file");
+    std::fs::write(workspace_root.join("b.txt"), "b1\nb2\nb3\n").expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([
+            "a.txt",
+            { "path": "b.txt", "start_line": 2, "end_line": 3 }
+        ]),
+    )
+    .await;
+
+    assert_eq!(structured["files"][0]["text"].as_str(), Some("a1\na2\n"));
+    assert_eq!(structured["files"][1]["text"].as_str(), Some("b2\nb3\n"));
+    assert_eq!(structured["files"][1]["startLine"].as_u64(), Some(2));
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+/// Invalid UTF-8 expands under lossy decoding (1 byte in, 3 out), so the
+/// decoded text can cross the per-file cap even though the disk read did
+/// not. That shortening is a truncation and must be reported as one.
+#[tokio::test]
+async fn read_tool_range_reports_truncation_when_lossy_decoding_expands_past_the_cap() {
+    let workspace_root = read_workspace("line-range-lossy");
+    let mut bytes = Vec::with_capacity(300 * 1024);
+    for index in 0..300 * 1024 {
+        bytes.push(0x80 + (index % 0x40) as u8);
+    }
+    std::fs::write(workspace_root.join("raw.bin"), &bytes).expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([{ "path": "raw.bin", "start_line": 1 }]),
+    )
+    .await;
+
+    let entry = &structured["files"][0];
+    assert_eq!(
+        entry["truncated"].as_bool(),
+        Some(true),
+        "lossy expansion past the per-file cap is a truncation: {}",
+        entry["bytes"]
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+/// endLine describes what came back, not what was asked for: a range cut by
+/// the per-file cap reports the last line actually returned.
+#[tokio::test]
+async fn read_tool_range_cut_by_the_per_file_cap_reports_the_last_returned_line() {
+    let workspace_root = read_workspace("line-range-report-end");
+    // Six 100-KiB lines: the 512-KiB per-file cap cuts the range mid-way.
+    let big_line = format!("{}\n", "z".repeat(100 * 1024));
+    std::fs::write(workspace_root.join("lines.txt"), big_line.repeat(8)).expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([{ "path": "lines.txt", "start_line": 1, "end_line": 8 }]),
+    )
+    .await;
+
+    let entry = &structured["files"][0];
+    assert_eq!(entry["truncated"].as_bool(), Some(true));
+    let reported_end = entry["endLine"].as_u64().expect("reported end line");
+    assert!(
+        reported_end < 8,
+        "endLine must reflect the returned content, got {reported_end}"
+    );
+    // The 512-KiB entry itself exceeds the 64-KiB inline budget, so the
+    // visible text is a head+tail preview; the reported bounds must instead
+    // agree with the lineCount the entry reports for what came back.
+    let line_count = entry["lineCount"].as_u64().expect("lineCount");
+    let start = entry["startLine"].as_u64().unwrap_or(1);
+    assert_eq!(
+        reported_end,
+        start + line_count - 1,
+        "endLine counts the lines the entry actually returned"
+    );
+    assert!(line_count < 8);
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+/// An exhausted batch budget must not send the ranged read scanning: the
+/// entry comes back budget-truncated and empty instead of walking the file
+/// for a range that can never be returned.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_tool_range_with_exhausted_batch_budget_skips_the_scan() {
+    let workspace_root = read_workspace("line-range-exhausted");
+    // Two full reads exhaust the 512-KiB batch budget...
+    let filler = "f".repeat(400 * 1024);
+    std::fs::write(workspace_root.join("first.bin"), &filler).expect("write file");
+    std::fs::write(workspace_root.join("second.bin"), &filler).expect("write file");
+    // ...and the sparse 1-GiB file sorts last, so its range is requested
+    // with nothing left. A scan here would walk up to a gigabyte.
+    let sparse = workspace_root.join("huge.bin");
+    let sparse_file = std::fs::File::create(&sparse).expect("create sparse");
+    sparse_file
+        .set_len(1024 * 1024 * 1024)
+        .expect("size sparse file");
+    drop(sparse_file);
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([
+            "first.bin",
+            "second.bin",
+            { "path": "huge.bin", "start_line": 500_000_000 }
+        ]),
+    )
+    .await;
+
+    let entry = &structured["files"][2];
+    assert!(
+        entry["error"].is_null(),
+        "an exhausted budget is not an error: {entry}"
+    );
+    assert_eq!(entry["text"].as_str(), Some(""));
+    assert_eq!(entry["budgetTruncated"].as_bool(), Some(true));
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
 // Line breaks keep the tokenizer off one huge pre-token; BPE is quadratic there.
 fn filler(bytes: usize) -> String {
     "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n".repeat(bytes / 41 + 1)[..bytes].to_string()
@@ -5092,10 +5351,23 @@ async fn read_tool_schema_requires_a_non_empty_paths_array() {
         "path was removed"
     );
     assert_eq!(schema["properties"]["paths"]["minItems"], json!(1));
-    assert_eq!(
-        schema["properties"]["paths"]["items"]["minLength"],
-        json!(1)
-    );
+    // Items stay strict: a bare path string, or a range object that at
+    // minimum names its path.
+    let items = &schema["properties"]["paths"]["items"];
+    let string_form = items["oneOf"]
+        .as_array()
+        .expect("paths items oneOf")
+        .iter()
+        .find(|form| form["type"] == "string")
+        .expect("string form");
+    assert_eq!(string_form["minLength"], json!(1));
+    let range_form = items["oneOf"]
+        .as_array()
+        .expect("paths items oneOf")
+        .iter()
+        .find(|form| form["type"] == "object")
+        .expect("range object form");
+    assert_eq!(range_form["required"], json!(["path"]));
 }
 
 #[tokio::test]

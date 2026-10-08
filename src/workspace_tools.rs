@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -130,6 +130,17 @@ struct ReadFileOutput {
     line_count: usize,
     text: String,
     truncated: bool,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+}
+
+/// One `read` request: a workspace path plus an optional 1-based inclusive
+/// line range. `start_line` defaults to 1, `end_line` to the file's end.
+#[derive(Clone, Debug)]
+pub struct ReadRequest {
+    pub path: String,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
 }
 
 #[derive(Clone, Serialize)]
@@ -446,38 +457,105 @@ pub fn read_image(
     })
 }
 
-fn read_file(workspace_root: &str, path: &str, budget: usize) -> Result<ReadFileOutput, String> {
+fn read_file_in_range(
+    workspace_root: &str,
+    request: &ReadRequest,
+    budget: usize,
+) -> Result<ReadFileOutput, String> {
     let root = workspace_root_path(workspace_root)?;
-    let target = resolve_target_path(workspace_root, path)?;
+    let target = resolve_target_path(workspace_root, &request.path)?;
     let size_bytes = readable_size(&target)?;
-    let mut file =
-        fs::File::open(&target).map_err(|error| format!("{error}: {}", target.display()))?;
-    // A single read() may come back short on a network filesystem, and
-    // line_count is derived from what was read.
-    // Whatever the batch cannot keep would be read and then thrown away, so
-    // the read stops at the budget. The open still happens, which is what lets
-    // a file that cannot be read report its own error instead of a budget cut.
-    let cap = budget.min(MAX_READ_BYTES);
-    let mut buf = Vec::with_capacity(cap + 1);
-    let read_n = file
-        .by_ref()
-        .take((cap + 1) as u64)
-        .read_to_end(&mut buf)
-        .map_err(|e| e.to_string())?;
-    let mut truncated = read_n > cap;
-    let data = &buf[..read_n.min(cap)];
-    let mut text = String::from_utf8_lossy(data).into_owned();
-    // from_utf8_lossy expands one invalid byte into three, so the text can
-    // exceed the cap even when the file did not. Cutting it here keeps that a
-    // per-file limit rather than something the batch blames on its budget.
-    if text.len() > MAX_READ_BYTES {
-        let keep = floor_char_boundary(&text, MAX_READ_BYTES);
-        text.truncate(keep);
-        truncated = true;
-    }
-    // Over what was read, not the whole file: a full scan costs the entire
-    // file in disk reads to return at most MAX_READ_BYTES.
-    let line_count = count_lines(&text);
+
+    let (mut text, truncated, line_count, start_line, end_line) =
+        match (request.start_line, request.end_line) {
+            (None, None) => {
+                let mut file = fs::File::open(&target)
+                    .map_err(|error| format!("{error}: {}", target.display()))?;
+                // A single read() may come back short on a network filesystem, and
+                // line_count is derived from what was read.
+                // Whatever the batch cannot keep would be read and then thrown
+                // away, so the read stops at the budget. The open still happens,
+                // which is what lets a file that cannot be read report its own
+                // error instead of a budget cut.
+                let cap = budget.min(MAX_READ_BYTES);
+                let mut buf = Vec::with_capacity(cap + 1);
+                let read_n = file
+                    .by_ref()
+                    .take((cap + 1) as u64)
+                    .read_to_end(&mut buf)
+                    .map_err(|e| e.to_string())?;
+                let mut truncated = read_n > cap;
+                let data = &buf[..read_n.min(cap)];
+                let mut text = String::from_utf8_lossy(data).into_owned();
+                // from_utf8_lossy expands one invalid byte into three, so the text
+                // can exceed the cap even when the file did not. Cutting it here
+                // keeps that a per-file limit rather than something the batch
+                // blames on its budget.
+                if text.len() > MAX_READ_BYTES {
+                    let keep = floor_char_boundary(&text, MAX_READ_BYTES);
+                    text.truncate(keep);
+                    truncated = true;
+                }
+                // Over what was read, not the whole file: a full scan costs the
+                // entire file in disk reads to return at most MAX_READ_BYTES.
+                let line_count = count_lines(&text);
+                (text, truncated, line_count, None, None)
+            }
+            (start_line, end_line) => {
+                let start_line = start_line.unwrap_or(1);
+                let cap = budget.min(MAX_READ_BYTES);
+                if cap == 0 {
+                    // The batch cannot keep a single byte of the range: skip
+                    // the offset scan (locating a range can walk the whole
+                    // file) and report the same budget cut a head read gets.
+                    return Ok(ReadFileOutput {
+                        path: to_workspace_relative(&root, &target),
+                        size_bytes,
+                        line_count: 0,
+                        text: String::new(),
+                        truncated: true,
+                        start_line: None,
+                        end_line: None,
+                    });
+                }
+                let (start_offset, end_offset, resolved_end) =
+                    line_range_byte_offsets(&target, start_line, end_line)?;
+                let mut file = fs::File::open(&target)
+                    .map_err(|error| format!("{error}: {}", target.display()))?;
+                file.seek(std::io::SeekFrom::Start(start_offset))
+                    .map_err(|e| e.to_string())?;
+                let slice_len = end_offset.saturating_sub(start_offset);
+                let want = (cap as u64).min(slice_len);
+                // One extra byte past the cap detects a budget-cut range; within
+                // the cap the slice itself is the exact end of the read.
+                let lookahead = u64::from(slice_len > cap as u64);
+                let mut buf = Vec::with_capacity(want as usize + 1);
+                let read_n = file
+                    .by_ref()
+                    .take(want + lookahead)
+                    .read_to_end(&mut buf)
+                    .map_err(|e| e.to_string())?;
+                let mut truncated = (read_n as u64) > want;
+                let data = &buf[..read_n.min(want as usize)];
+                let mut text = String::from_utf8_lossy(data).into_owned();
+                // The same lossy-expansion cut the head read applies: decoded
+                // text can cross the per-file cap the disk read never did.
+                if text.len() > MAX_READ_BYTES {
+                    let keep = floor_char_boundary(&text, MAX_READ_BYTES);
+                    text.truncate(keep);
+                    truncated = true;
+                }
+                let line_count = count_lines(&text);
+                (
+                    text,
+                    truncated,
+                    line_count,
+                    Some(start_line),
+                    Some(resolved_end),
+                )
+            }
+        };
+    text.shrink_to_fit();
 
     Ok(ReadFileOutput {
         path: to_workspace_relative(&root, &target),
@@ -485,7 +563,80 @@ fn read_file(workspace_root: &str, path: &str, budget: usize) -> Result<ReadFile
         line_count,
         text,
         truncated,
+        start_line,
+        end_line,
     })
+}
+
+/// Byte offsets of a 1-based inclusive line range, found by a forward scan
+/// that stops as soon as both bounds are known: a small range inside a huge
+/// file never reads the rest of it. `end_line` clamps to the file's line
+/// count; a `start_line` past the end is an error naming that count.
+/// Returns `(start_offset, end_offset, resolved_end_line)`.
+fn line_range_byte_offsets(
+    target: &Path,
+    start_line: usize,
+    end_line: Option<usize>,
+) -> Result<(u64, u64, usize), String> {
+    if start_line == 0 {
+        return Err("range line numbers are 1-based and must be at least 1".into());
+    }
+    if let Some(end_line) = end_line
+        && end_line < start_line
+    {
+        return Err(format!(
+            "range start_line ({start_line}) must not exceed end_line ({end_line})"
+        ));
+    }
+
+    let file = fs::File::open(target).map_err(|error| format!("{error}: {}", target.display()))?;
+    let mut reader = BufReader::new(file);
+
+    // Line 1 starts at the first byte; every other line starts right after
+    // the newline that completed the line before it.
+    let mut start_offset: Option<u64> = (start_line == 1).then_some(0);
+    let mut end_offset: Option<u64> = None;
+    let mut offset: u64 = 0;
+    let mut line_count: usize = 0;
+    let mut last_byte: Option<u8> = None;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        // Both bounds are known: a scan that stopped here never read the tail.
+        if let (Some(start_offset), Some(end_offset)) = (start_offset, end_offset) {
+            return Ok((start_offset, end_offset, end_line.unwrap_or(line_count)));
+        }
+        let read_n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
+        if read_n == 0 {
+            break;
+        }
+        for &byte in &chunk[..read_n] {
+            if byte == b'\n' {
+                line_count += 1;
+                if line_count + 1 == start_line {
+                    start_offset = Some(offset + 1);
+                }
+                if let Some(end_line) = end_line
+                    && line_count == end_line
+                {
+                    end_offset = Some(offset + 1);
+                }
+            }
+            last_byte = Some(byte);
+            offset += 1;
+        }
+    }
+    // The final unterminated run is a line of its own unless the file ends
+    // in a newline (or is empty, which has no lines at all).
+    if last_byte.is_some_and(|byte| byte != b'\n') {
+        line_count += 1;
+    }
+    if line_count < start_line {
+        return Err(format!(
+            "range start_line ({start_line}) exceeds file line count ({line_count})"
+        ));
+    }
+    let resolved_end = end_line.map_or(line_count, |end_line| end_line.min(line_count));
+    Ok((start_offset.unwrap_or(0), offset, resolved_end))
 }
 
 #[derive(Clone, Serialize)]
@@ -503,6 +654,11 @@ pub struct ReadBatchEntry {
     /// returns more of it. A file over the per-file cap sets `truncated`
     /// without this: no retry returns the rest.
     pub budget_truncated: bool,
+    /// The resolved 1-based inclusive line range, present for ranged reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
 }
 
 pub struct ReadBatchOutput {
@@ -544,6 +700,8 @@ fn failed_entry(path: &str, error: String) -> ReadBatchEntry {
         text: String::new(),
         truncated: false,
         budget_truncated: false,
+        start_line: None,
+        end_line: None,
     }
 }
 
@@ -582,41 +740,45 @@ fn read_order(planned: &[PlannedRead]) -> Vec<usize> {
 }
 
 /// Entries come back in the order requested, whatever order they were read in.
-pub fn read_files(workspace_root: &str, paths: &[String]) -> Result<ReadBatchOutput, String> {
-    if paths.is_empty() {
+pub fn read_files(
+    workspace_root: &str,
+    requests: &[ReadRequest],
+) -> Result<ReadBatchOutput, String> {
+    if requests.is_empty() {
         return Err("paths must contain at least one path".into());
     }
-    if paths.len() > MAX_READ_BATCH_FILES {
+    if requests.len() > MAX_READ_BATCH_FILES {
         return Err(format!(
             "paths must contain at most {MAX_READ_BATCH_FILES} entries (got {})",
-            paths.len()
+            requests.len()
         ));
     }
     let root = workspace_root_path(workspace_root)?;
 
-    let planned: Vec<PlannedRead> = paths
+    let planned: Vec<PlannedRead> = requests
         .iter()
-        .map(|path| plan_read(workspace_root, path))
+        .map(|request| plan_read(workspace_root, &request.path))
         .collect();
 
-    let mut entries: Vec<Option<ReadBatchEntry>> = (0..paths.len()).map(|_| None).collect();
+    let mut entries: Vec<Option<ReadBatchEntry>> = (0..requests.len()).map(|_| None).collect();
     let mut remaining = MAX_READ_BATCH_BYTES;
     let mut batch_truncated = false;
     let mut total_bytes = 0_usize;
     let mut total_line_count = 0_usize;
 
     // A symlink and its target canonicalize to the same place, as does the
-    // same string twice. Reading it twice would charge the budget twice.
-    let mut already_read: HashSet<PathBuf> = HashSet::new();
+    // same request twice. Reading it twice would charge the budget twice; the
+    // same file under two different ranges is two distinct reads.
+    let mut already_read: HashSet<(PathBuf, Option<usize>, Option<usize>)> = HashSet::new();
 
     for index in read_order(&planned) {
-        let path = &paths[index];
+        let request = &requests[index];
         if let Some(target) = &planned[index].target
-            && already_read.contains(target)
+            && already_read.contains(&(target.clone(), request.start_line, request.end_line))
         {
             continue;
         }
-        match read_file(workspace_root, path, remaining) {
+        match read_file_in_range(workspace_root, request, remaining) {
             Ok(output) => {
                 let keep = floor_char_boundary(&output.text, remaining);
                 let text_cut = keep < output.text.len();
@@ -637,8 +799,19 @@ pub fn read_files(workspace_root: &str, paths: &[String]) -> Result<ReadBatchOut
                 total_bytes += keep;
                 total_line_count += line_count;
                 if let Some(target) = &planned[index].target {
-                    already_read.insert(target.clone());
+                    already_read.insert((target.clone(), request.start_line, request.end_line));
                 }
+                // Reported bounds describe what came back: a whole range keeps
+                // its resolved end, a cut range counts the lines actually
+                // returned, and nothing returned reports nothing.
+                let (start_line, end_line) = match (output.start_line, truncated, line_count) {
+                    (Some(start), true, lines) if lines > 0 => {
+                        (Some(start), Some(start + lines - 1))
+                    }
+                    (Some(_), true, _) => (None, None),
+                    (start, false, _) => (start, output.end_line),
+                    (None, true, _) => (None, None),
+                };
                 entries[index] = Some(ReadBatchEntry {
                     path: output.path,
                     error: None,
@@ -648,11 +821,13 @@ pub fn read_files(workspace_root: &str, paths: &[String]) -> Result<ReadBatchOut
                     text,
                     truncated,
                     budget_truncated: budget_cut,
+                    start_line,
+                    end_line,
                 });
             }
             Err(error) => {
                 entries[index] = Some(failed_entry(
-                    &entry_path(&root, &planned[index], path),
+                    &entry_path(&root, &planned[index], &request.path),
                     error,
                 ))
             }
@@ -665,10 +840,10 @@ pub fn read_files(workspace_root: &str, paths: &[String]) -> Result<ReadBatchOut
         .filter_map(|(index, entry)| match (entry, &planned[index].error) {
             (Some(entry), _) => Some(entry),
             (None, Some(error)) => Some(failed_entry(
-                &entry_path(&root, &planned[index], &paths[index]),
+                &entry_path(&root, &planned[index], &requests[index].path),
                 error.clone(),
             )),
-            // Deduplicated: an earlier path named the same file.
+            // Deduplicated: an earlier request named the same file and range.
             (None, None) => None,
         })
         .collect();

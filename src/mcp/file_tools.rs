@@ -16,31 +16,78 @@ use crate::mcp::response_budget::{
     ANALYSIS_DESCRIPTION_PREVIEW_BYTES, preview_text_without_output_ref,
 };
 
-pub(crate) fn parse_read_paths(arguments: &Value) -> Result<Vec<String>, String> {
+/// `paths` items are either a plain path string or an object with a `path`
+/// plus an optional 1-based inclusive `start_line`/`end_line` range (same
+/// line contract as the `edit` range operation).
+pub(crate) fn parse_read_requests(
+    arguments: &Value,
+) -> Result<Vec<workspace_tools::ReadRequest>, String> {
     let items = arguments
         .get("paths")
         .ok_or_else(|| "Missing required parameter: paths".to_string())?
         .as_array()
         .ok_or_else(|| "Parameter paths must be an array".to_string())?;
-    let mut paths = Vec::with_capacity(items.len());
-    for item in items {
-        let path = item
-            .as_str()
-            .ok_or_else(|| "Parameter paths must contain only strings".to_string())?;
-        if path.is_empty() {
-            return Err("Parameter paths must not contain empty strings".into());
+    let mut requests = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let position = format!("paths[{index}]");
+        if let Some(path) = item.as_str() {
+            if path.is_empty() {
+                return Err(format!("Parameter {position} must not be an empty string"));
+            }
+            requests.push(workspace_tools::ReadRequest {
+                path: path.to_string(),
+                start_line: None,
+                end_line: None,
+            });
+            continue;
         }
-        paths.push(path.to_string());
+        let object = item.as_object().ok_or_else(|| {
+            format!("Parameter {position} must be a path string or an object with a path")
+        })?;
+        let path = object
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Parameter {position}.path must be a non-empty string"))?;
+        if path.is_empty() {
+            return Err(format!("Parameter {position}.path must not be empty"));
+        }
+        let read_line = |field: &str| -> Result<Option<usize>, String> {
+            match object.get(field) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        format!("Parameter {position}.{field} must be a positive integer")
+                    }),
+            }
+        };
+        let start_line = read_line("start_line")?;
+        let end_line = read_line("end_line")?;
+        if let (Some(start_line), Some(end_line)) = (start_line, end_line)
+            && end_line < start_line
+        {
+            return Err(format!(
+                "Parameter {position}.start_line ({start_line}) must not exceed end_line ({end_line})"
+            ));
+        }
+        requests.push(workspace_tools::ReadRequest {
+            path: path.to_string(),
+            start_line,
+            end_line,
+        });
     }
-    Ok(paths)
+    Ok(requests)
 }
 
 pub(crate) fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
-    let paths = match parse_read_paths(&tool_arguments(req)) {
-        Ok(paths) => paths,
+    let requests = match parse_read_requests(&tool_arguments(req)) {
+        Ok(requests) => requests,
         Err(error) => return tool_error_response(req, error),
     };
-    match workspace_tools::read_files(workspace_root, &paths) {
+    match workspace_tools::read_files(workspace_root, &requests) {
         Ok(output) => {
             let structured = json!({
                 "toolName": "read",
