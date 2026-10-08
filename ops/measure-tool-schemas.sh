@@ -486,10 +486,11 @@ EOF
     fi
 
     echo "== profile $PROFILE: tools/list schema footprint =="
+    # Always write this run's summary to $TMP (the Combined helper reads only
+    # $TMP so it can never mix another run's numbers) and copy it to --out.
+    python3 "$TMP/measure.py" "$BODY_FILE" "$TMP/summary-$PROFILE.json"
     if [[ -n "$OUT" ]]; then
-        python3 "$TMP/measure.py" "$BODY_FILE" "$OUT/summary-$PROFILE.json"
-    else
-        python3 "$TMP/measure.py" "$BODY_FILE" "$TMP/summary-$PROFILE.json"
+        cp "$TMP/summary-$PROFILE.json" "$OUT/summary-$PROFILE.json"
     fi
     echo
 done
@@ -504,13 +505,15 @@ if python3 - "$SUM_FILE" "${OUT:-}" "$TMP" <<'PYEOF'
 import json, os, sys
 
 sum_path, out_dir, tmp_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+# Load ONLY this run's summaries from the throwaway dir. Reading --out here
+# could silently mix summaries left over from earlier runs in the same
+# directory, so a partial-profile run never fabricates a "combined" figure
+# from another run's numbers.
 summaries = {}
 for name in ("MultiTools", "DevTools"):
-    for candidate in (os.path.join(out_dir, f"summary-{name}.json") if out_dir else None,
-                      os.path.join(tmp_dir, f"summary-{name}.json")):
-        if candidate and os.path.exists(candidate):
-            summaries[name] = json.load(open(candidate))
-            break
+    candidate = os.path.join(tmp_dir, f"summary-{name}.json")
+    if os.path.exists(candidate):
+        summaries[name] = json.load(open(candidate))
 if len(summaries) != 2:
     sys.exit(1)
 mt, dt = summaries["MultiTools"], summaries["DevTools"]
