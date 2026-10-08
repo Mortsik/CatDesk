@@ -3479,9 +3479,12 @@ fn oversized_agents_layer_never_rides_catdesk_instruction_inline() {
         !instruction.contains("TAIL-SENTINEL"),
         "an arbitrarily large AGENTS.md must not be inlined into the instruction"
     );
-    assert!(instruction.contains("full text not retained"));
     assert!(
-        instruction.len() < 128 * 1024,
+        instruction.contains("AGENTS.md truncated"),
+        "the layer cap must disclose the cut in the instruction text"
+    );
+    assert!(
+        instruction.len() < 32 * 1024,
         "instruction must stay near the template plus one bounded layer, got {} bytes",
         instruction.len()
     );
@@ -8734,21 +8737,23 @@ async fn devtools_passthrough_big_result_goes_through_shared_budget() {
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
-// ── catdesk_instruction externalization (catdesk-ojt.5, finding F5) ─────────
+// ── catdesk_instruction AGENTS.md layer bound (finding F5 follow-up) ─────────
 
+/// A host-controlled AGENTS.md layer is capped input-side with an explicit
+/// disclosure, so the instruction itself never gets externalized: a cut
+/// instruction hid the operating guidance behind a retrieval address the
+/// model could not see (user report 2026-10-08, "pełna instrukcja częściowo
+/// ucięta"). The answer stays inline, bounded, and honest about the cut.
 #[tokio::test]
-async fn oversized_catdesk_instruction_is_externalized_not_inlined() {
+async fn oversized_agents_layers_are_capped_inline_and_disclosed() {
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-audit-instruction-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
-    // ~1 MiB of AGENTS.md: the template itself is static, but the AGENTS.md
-    // layers (finding F5) are host-controlled and uncapped, so only the
-    // shared-budget gate may bound this response.
-    std::fs::write(
-        workspace_root.join("AGENTS.md"),
-        "INSTRUCTIONS-".repeat(80_000),
-    )
-    .expect("write oversized AGENTS.md");
+    // ~1 MiB of AGENTS.md: far past the per-layer cap, far past the inline
+    // budget that used to externalize the whole instruction.
+    let agents_bytes = "INSTRUCTIONS-".repeat(80_000);
+    std::fs::write(workspace_root.join("AGENTS.md"), &agents_bytes)
+        .expect("write oversized AGENTS.md");
     let req = tool_call_request("catdesk_instruction", json!({}));
 
     let response = handle_tools_call(
@@ -8767,22 +8772,99 @@ async fn oversized_catdesk_instruction_is_externalized_not_inlined() {
     let serialized = serde_json::to_vec(&result).expect("serialize result");
     assert!(
         serialized.len() <= crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
-        "an oversized instruction must be externalized, not inlined; got {} bytes",
+        "a capped instruction stays fully inline; got {} bytes",
         serialized.len()
     );
-    assert_eq!(
-        result
-            .pointer("/responseBudget/retrieval/tool")
-            .and_then(Value::as_str),
-        Some("read_result"),
-        "the manifest must point at the lossless retrieval tool"
+    assert!(
+        result.get("responseBudget").is_none(),
+        "the instruction must not be externalized: the layer cap bounds it input-side"
+    );
+    let instruction_text = result
+        .pointer("/structuredContent/instructionText")
+        .and_then(Value::as_str)
+        .expect("instruction text");
+    assert!(
+        instruction_text.contains("AGENTS.md truncated"),
+        "the cut layer must be disclosed in the text: …{}",
+        &instruction_text[instruction_text.len().saturating_sub(200)..]
+    );
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+/// For a layer between the instruction cap and the agents-text preview cap
+/// the file arrives verbatim, so the disclosure can name the true size.
+#[tokio::test]
+async fn agents_layer_over_the_cap_discloses_the_true_size() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-audit-instruction-mid-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let agents_text = "rule-line\n".repeat(2048); // 20 480 bytes
+    std::fs::write(workspace_root.join("AGENTS.md"), &agents_text).expect("write AGENTS.md");
+    let req = tool_call_request("catdesk_instruction", json!({}));
+
+    let response = handle_tools_call(
+        &req,
+        &workspace_root.to_string_lossy(),
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+    )
+    .await;
+
+    let instruction_text = response
+        .result
+        .as_ref()
+        .and_then(|result| result.pointer("/structuredContent/instructionText"))
+        .and_then(Value::as_str)
+        .expect("instruction text");
+    assert!(
+        instruction_text.contains(&format!(
+            "AGENTS.md truncated at 8192 of {} bytes",
+            agents_text.trim().len()
+        )),
+        "the disclosure must name the true original size: …{}",
+        &instruction_text[instruction_text.len().saturating_sub(200)..]
+    );
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[tokio::test]
+async fn agents_layers_under_the_cap_pass_through_verbatim() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-audit-instruction-ok-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let agents_text = "KEEP-ME-WHOLE\n".repeat(40);
+    std::fs::write(workspace_root.join("AGENTS.md"), &agents_text).expect("write AGENTS.md");
+    let req = tool_call_request("catdesk_instruction", json!({}));
+
+    let response = handle_tools_call(
+        &req,
+        &workspace_root.to_string_lossy(),
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+    )
+    .await;
+
+    let instruction_text = response
+        .result
+        .as_ref()
+        .and_then(|result| result.pointer("/structuredContent/instructionText"))
+        .and_then(Value::as_str)
+        .expect("instruction text");
+    assert!(
+        instruction_text.contains(agents_text.trim()),
+        "a layer under the cap must appear verbatim"
     );
     assert!(
-        result
-            .pointer("/responseBudget/outputRef")
-            .and_then(Value::as_str)
-            .is_some_and(|output_ref| !output_ref.is_empty()),
-        "the manifest must carry a lossless outputRef"
+        !instruction_text.contains("AGENTS.md truncated"),
+        "no disclosure without a cut"
     );
     let _ = std::fs::remove_dir_all(workspace_root);
 }

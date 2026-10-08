@@ -116,10 +116,38 @@ fn instruction_agents_layers(
         }
         seen.push(identity);
         if let Some(text) = cached_agents_text(&path) {
-            layers.push((label, text));
+            layers.push((label, cap_agents_layer(&text)));
         }
     }
     Ok(layers)
+}
+
+/// Input-side bound for one AGENTS.md layer inside the instruction. The
+/// instruction must stay fully inline — externalizing it hides the operating
+/// guidance behind a retrieval address harnesses drop (catdesk-t05) — so a
+/// host-controlled layer is capped here with an explicit, actionable
+/// disclosure instead of letting the shared budget cut the whole answer.
+const MAX_AGENTS_LAYER_BYTES: usize = 8 * 1024;
+
+fn cap_agents_layer(text: &str) -> String {
+    if text.len() <= MAX_AGENTS_LAYER_BYTES {
+        return text.to_string();
+    }
+    let keep = floor_char_boundary(text, MAX_AGENTS_LAYER_BYTES);
+    format!(
+        "{}\n[AGENTS.md truncated at {keep} of {} bytes — read the file for the rest]",
+        &text[..keep],
+        text.len()
+    )
+}
+
+/// Largest index at or before `index` that lies on a char boundary.
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 #[cfg(test)]
