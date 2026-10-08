@@ -1543,7 +1543,6 @@ async fn read_result_max_range_token_estimate_stays_bounded() {
             "max_bytes": crate::result_store::DEFAULT_MAX_RANGE_BYTES
         }),
     );
-    let started = std::time::Instant::now();
     let read_response = handle_tools_call_with_result_store(
         &read_req,
         &workspace_root_str,
@@ -1559,15 +1558,28 @@ async fn read_result_max_range_token_estimate_stays_bounded() {
         None,
     )
     .await;
-    let elapsed = started.elapsed();
-
-    // Order-of-magnitude bound, jitter-tolerant by design: the regression
-    // this guards against measured in tens of seconds, a healthy run stays
-    // far below one second. Assert seconds, never exact milliseconds.
-    assert!(
-        elapsed.as_secs_f64() < 2.0,
-        "max-range read_result must not block tools/call on full-payload \
-         tokenization, took {elapsed:?}"
+    // Structural replacement for the old wall-clock bound (<2 s), which a
+    // healthy run could exceed under -j 8 CPU starvation while the real
+    // regression it guarded against measured tens of seconds. The invariant
+    // is the estimator PATH, not the time: an exempt retrieval result must
+    // be estimated through the pure bytes/4 heuristic over the sanitized
+    // payload — the same call the pipeline's turn-usage accounting runs for
+    // this response (server.rs falls back to estimate_turn_token_counts).
+    // Only the bytewise branch produces this equality; a reintroduced exact
+    // o200k encode of the pathological homogeneous base64 range diverges
+    // from it deterministically, on an unloaded machine too.
+    let read_result_value = read_response.result.as_ref().expect("missing result");
+    let usage =
+        super::token_usage::estimate_turn_token_usage(&read_req, "read_result", read_result_value);
+    let sanitized = sanitize_result_for_turn_token_count(read_result_value);
+    let bytewise = serde_json::to_string(&sanitized)
+        .expect("serialize sanitized result")
+        .len() as u64
+        / 4;
+    assert_eq!(
+        usage.tool_output_tokens, bytewise,
+        "an exempt max-range result must be estimated bytewise over the \
+         sanitized payload; an exact BPE pass here is the regression"
     );
 
     // Sanity: the probe measured the real full-range path.
@@ -6712,6 +6724,11 @@ fn entry_cap_reduction_bounds_pathological_escaping_and_keeps_ends() {
 #[cfg(unix)]
 #[tokio::test]
 async fn entry_cap_reduction_is_disclosed_in_the_inline_manifest() {
+    // Spawn-dependent (sh/yes/head through PATH) and PATH is process-global:
+    // hold the crate env lock so an env-rewriting test cannot interleave
+    // (the dr6-sweep idiom); a broken spawn shrinks stdout below the entry
+    // cap and the disclosure assertions lose their subject.
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-entry-cap-disclose-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -6969,6 +6986,11 @@ fn entry_cap_telemetry_reports_the_full_pre_reduction_result_as_raw() {
 #[cfg(unix)]
 #[tokio::test]
 async fn entry_cap_telemetry_counts_the_pre_reduction_size_as_raw() {
+    // Spawn-dependent (sh/head/tr through PATH) and PATH is process-global:
+    // hold the crate env lock so an env-rewriting test cannot interleave
+    // (the dr6-sweep idiom); a broken spawn shrinks stdout below the entry
+    // cap and the disclosure assertions lose their subject.
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-entry-cap-metrics-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");

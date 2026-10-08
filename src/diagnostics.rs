@@ -658,13 +658,20 @@ mod tests {
     ///    before the retry starts, so the first attempt provably runs against
     ///    a held lock;
     /// 2. the injectable wait callback fires only after a blocked attempt, so
-    ///    its single invocation proves the first attempt failed with
+    ///    its first invocation proves the first attempt failed with
     ///    `WouldBlock`;
     /// 3. that invocation requests the release and returns only after the
     ///    holder's zero-capacity ack, sent after the lock file was dropped —
-    ///    so the next attempt provably runs against a released lock, and with
-    ///    no other contender it must succeed there. Hence exactly one blocked
-    ///    attempt.
+    ///    so the following attempt runs against a released lock.
+    ///
+    /// A later attempt can still legitimately observe `WouldBlock`: the
+    /// suite forks children from parallel test threads, and a child forked
+    /// while the lock file was open inherits the descriptor, keeping the
+    /// file description — and with it the flock — alive until its exec
+    /// closes the inherited copy (measured at sub-millisecond under a fork
+    /// storm). The loop's own retry budget absorbs that; the test asserts
+    /// at-least-one blocked attempt plus acquisition, which is the
+    /// regression shape this test exists for.
     #[test]
     fn held_log_lock_is_acquired_once_the_holder_releases() {
         let root =
@@ -699,20 +706,29 @@ mod tests {
             let retry_lock = private_file(&root.join("connections.lock")).unwrap();
             let acquired = try_lock_bounded_with(&retry_lock, LOCK_RETRY_ATTEMPTS, || {
                 blocked_attempts += 1;
-                release_request
-                    .send(())
-                    .expect("the holder must still be waiting for the release request");
-                // Returns only after the holder dropped the lock file.
-                released_ack_rx
-                    .recv()
-                    .expect("the holder must confirm the release");
+                if blocked_attempts == 1 {
+                    release_request
+                        .send(())
+                        .expect("the holder must still be waiting for the release request");
+                    // Returns only after the holder dropped the lock file.
+                    released_ack_rx
+                        .recv()
+                        .expect("the holder must confirm the release");
+                } else {
+                    // Past the acknowledged release the holder thread is
+                    // gone; a further blocked attempt can only come from a
+                    // concurrently forked child still holding the inherited
+                    // descriptor pre-exec. Back off like production instead
+                    // of rendezvousing with a holder that no longer exists.
+                    std::thread::sleep(Duration::from_millis(LOCK_RETRY_DELAY_MS));
+                }
             });
             acquired.expect("a lock released inside the retry budget must be acquired");
         }
-        assert_eq!(
-            blocked_attempts, 1,
-            "exactly the first attempt may observe the held lock; the next one \
-             runs after the acknowledged release and must acquire"
+        assert!(
+            blocked_attempts >= 1,
+            "the first attempt must observe the held lock; the acknowledged \
+             release must let a later attempt within the budget acquire"
         );
         holder.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
@@ -1236,7 +1252,7 @@ mod tests {
             &client,
             &base,
             "start_command",
-            json!({"command": "sleep 3"}),
+            json!({"command": "sleep 8"}),
         )
         .await;
         let job_id = start["result"]["structuredContent"]["jobId"]
@@ -1245,7 +1261,11 @@ mod tests {
             .to_string();
 
         // One deliberately slow poll plus fast ones running alongside it:
-        // concurrency must not lose or merge any lifecycle record.
+        // concurrency must not lose or merge any lifecycle record. The slow
+        // poll's in-flight window is bounded below by its server-side wait,
+        // so it is sized to outlive the fast polls even under heavy CPU
+        // starvation (the job itself outlives the wait, keeping the snapshot
+        // shape deterministic).
         let slow = tokio::spawn({
             let client = client.clone();
             let base = base.clone();
@@ -1255,12 +1275,30 @@ mod tests {
                     &client,
                     &base,
                     "poll_command",
-                    json!({"job_id": job_id, "wait_ms": 1_000}),
+                    json!({"job_id": job_id, "wait_ms": 5_000}),
                 )
                 .await
             }
         });
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // The fast polls may fire only once the slow poll is provably in
+        // flight in the lifecycle registry. The fixed 150 ms head start this
+        // used to sleep for was exactly the load-sensitive assumption the
+        // test flaked on: under -j 8 starvation the slow poll's registration
+        // could land after the fast polls had already completed, and no
+        // started record would carry overlap. Await the registry itself,
+        // bounded only as a hang guard.
+        let mut slow_started = false;
+        for _ in 0..100 {
+            if !log.active_requests_view().is_empty() {
+                slow_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            slow_started,
+            "the slow poll never reached the lifecycle registry"
+        );
         let mut fast = Vec::new();
         for _ in 0..4 {
             fast.push(post_tools_call(
