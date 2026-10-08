@@ -521,14 +521,6 @@ async fn soak_concurrent_tool_calls_across_scheduler_classes_stay_correlated() {
 /// the job is still pollable afterwards.
 #[tokio::test]
 async fn soak_client_disconnect_during_side_effectful_work_survives() {
-    // The job's `sleep` is resolved through the process-global `PATH` at
-    // spawn time, and the linux_sandbox tests rewrite `PATH` to their stubs
-    // while they run; an interleaved rewrite would make the long command
-    // vanish (ENOENT) and fail as "did not finish". Hold the env lock so the
-    // spawn never interleaves with an env rewrite. #[tokio::test] is
-    // current-thread, so holding a std MutexGuard across awaits cannot
-    // deadlock (same idiom as mcp/tests.rs).
-    let _env = crate::test_serialization::lock_env();
     let root =
         std::env::temp_dir().join(format!("catdesk-soak-disconnect-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
