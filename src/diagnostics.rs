@@ -173,6 +173,7 @@ mod tests {
             started: Instant::now(),
             complete: AtomicBool::new(false),
             tool: AtomicU8::new(0),
+            rpc_recorded: AtomicBool::new(false),
         };
         REQUEST
             .scope(trace, async {
@@ -244,6 +245,7 @@ mod tests {
             started: Instant::now(),
             complete: AtomicBool::new(true),
             tool: AtomicU8::new(0),
+            rpc_recorded: AtomicBool::new(false),
         };
         REQUEST
             .scope(trace, async {
@@ -293,6 +295,7 @@ mod tests {
             started: Instant::now(),
             complete: AtomicBool::new(true),
             tool: AtomicU8::new(0),
+            rpc_recorded: AtomicBool::new(false),
         };
         REQUEST
             .scope(trace, async {
@@ -325,6 +328,75 @@ mod tests {
             Ok(Some(record)) => panic!("an unscoped blocking execution must not record: {record}"),
             _ => {}
         }
+    }
+
+    #[tokio::test]
+    async fn one_request_emits_one_mcp_request_alongside_tool_result_bytes() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let log = Diagnostics {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
+            write_dropped: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicU64::new(0)),
+            active_requests: Arc::new(StdMutex::new(HashMap::new())),
+            stopping_since: Arc::new(StdMutex::new(None)),
+        };
+        let trace = RequestLog {
+            log,
+            id: "dedupe-dispatch".to_string(),
+            started: Instant::now(),
+            complete: AtomicBool::new(true),
+            tool: AtomicU8::new(0),
+            rpc_recorded: AtomicBool::new(false),
+        };
+        let body = json!({"method": "tools/call", "params": {"name": "read"}});
+        REQUEST
+            .scope(trace, async {
+                // The production shape: post_mcp_http records `mcp_request`
+                // in the async task, then dispatches `post_mcp_inner` — which
+                // calls `rpc_request` a second time — through the blocking
+                // pool wrapper. Exactly one `mcp_request` must survive.
+                rpc_request(&body);
+                let inner_body = body.clone();
+                let work = scope_future_for_blocking_pool(async move {
+                    rpc_request(&inner_body);
+                    tool_result_bytes(
+                        crate::perf_metrics::tool_index(Some("read")),
+                        "small",
+                        128,
+                        128,
+                        0,
+                        false,
+                    );
+                });
+                crate::request_workers::run_timed(work, Duration::from_secs(5), None)
+                    .await
+                    .expect("dispatched work succeeded");
+            })
+            .await;
+
+        let mut mcp_request_records = 0;
+        let mut tool_result_records = 0;
+        while let Ok(Some(record)) = receiver.recv_timeout(Duration::from_secs(5)) {
+            match record["event"].as_str() {
+                Some("mcp_request") => {
+                    mcp_request_records += 1;
+                    assert_eq!(record["request_id"], "dedupe-dispatch");
+                }
+                Some("tool_result_bytes") => {
+                    tool_result_records += 1;
+                    assert_eq!(record["request_id"], "dedupe-dispatch");
+                    assert_eq!(record["rpc_tool"], "read");
+                }
+                other => panic!("unexpected record: {other:?}"),
+            }
+        }
+        assert_eq!(mcp_request_records, 1, "one request, one mcp_request");
+        assert_eq!(
+            tool_result_records, 1,
+            "the blocking-pool tool result must still be recorded"
+        );
     }
 
     #[test]
@@ -453,6 +525,7 @@ mod tests {
             started: Instant::now(),
             complete: AtomicBool::new(false),
             tool: AtomicU8::new(0),
+            rpc_recorded: AtomicBool::new(false),
         };
         drop(make_trace("client-drop"));
         log.mark_server_stopping();
@@ -1741,6 +1814,9 @@ fn detached_request_view(request: &RequestLog) -> RequestLog {
         started: request.started,
         complete: AtomicBool::new(true),
         tool: AtomicU8::new(0),
+        // Inherit whether the outer dispatch already emitted `mcp_request`,
+        // so the inner `rpc_request` stays a no-op instead of duplicating it.
+        rpc_recorded: AtomicBool::new(request.rpc_recorded.load(Ordering::Relaxed)),
     }
 }
 
@@ -1862,6 +1938,16 @@ pub(crate) fn request_metadata(body: &Value) -> Value {
 
 pub(crate) fn rpc_request(body: &Value) {
     let _ = REQUEST.try_with(|request| {
+        // One `mcp_request` per request: both the HTTP entrypoint and
+        // `post_mcp_inner` call this (the inner call predates the
+        // blocking-pool scope wrapper, where it was silently skipped).
+        if request
+            .rpc_recorded
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
         let mut metadata = request_metadata(body);
         metadata["event"] = json!("mcp_request");
         metadata["request_id"] = json!(request.id);
@@ -1929,6 +2015,11 @@ struct RequestLog {
     complete: AtomicBool,
     /// Perf tool-counter key (`tool_index + 1`); 0 until rpc_request runs.
     tool: AtomicU8,
+    /// `rpc_request` emits at most one `mcp_request` per request even though
+    /// both the HTTP entrypoint and `post_mcp_inner` call it: the detached
+    /// blocking-pool view inherits this flag, so the inner call is a no-op
+    /// when the outer one already recorded.
+    rpc_recorded: AtomicBool,
 }
 
 impl Drop for RequestLog {
@@ -1974,6 +2065,7 @@ pub(crate) async fn http_request(
         started,
         complete: AtomicBool::new(false),
         tool: AtomicU8::new(0),
+        rpc_recorded: AtomicBool::new(false),
     };
     let active = trace.log.begin_request(&trace.id, trace.started);
     trace.log.record(
