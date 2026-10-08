@@ -464,6 +464,16 @@ mod tests {
         ))
     }
 
+    /// Unlike `peer`, this bridge carries a `LaunchSpec`, so `restart()`
+    /// respawns `sh` through `PATH` — also on later restarts triggered from
+    /// production code paths. The test-held `lock_env()` covers only spawns
+    /// made while the test runs: the current-thread runtime executes the
+    /// restart on the test's thread with the guard still held, and the
+    /// bridge dies with the test's `Arc`. That coverage is structural, not
+    /// guaranteed: a restartable bridge that outlives its test (background
+    /// task, server harness, production) spawns outside the window and
+    /// resolves `sh` against whatever `PATH` is current then — surfacing as
+    /// `devtools_restart_failed` plus backoff, never as a test panic.
     fn restartable_peer(script: &str) -> Arc<Mutex<DevtoolsBridge>> {
         let launch = LaunchSpec {
             program: "sh".to_string(),
