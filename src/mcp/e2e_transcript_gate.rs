@@ -201,11 +201,14 @@ impl GateHarness {
     }
 
     /// Capability axis: pull the externalized payload back through read_result
-    /// until EOF and return the exact stored bytes.
+    /// until EOF and return the exact stored bytes. The iteration cap turns a
+    /// non-advancing `nextOffset` (store regression) into a loud failure
+    /// instead of a hang.
     async fn reconstruct(&self, output_ref: &str) -> Vec<u8> {
+        const MAX_RECONSTRUCT_RANGES: usize = 256;
         let mut rebuilt = Vec::new();
         let mut offset = 0_u64;
-        loop {
+        for _ in 0..MAX_RECONSTRUCT_RANGES {
             let response = self
                 .call(
                     "read_result",
@@ -245,6 +248,10 @@ impl GateHarness {
                 return rebuilt;
             }
         }
+        panic!(
+            "reconstruct exceeded {MAX_RECONSTRUCT_RANGES} read_result ranges \
+             without EOF: nextOffset is not advancing for {output_ref}"
+        );
     }
 
     /// Footprint row for a response that MUST be externalized, including the
