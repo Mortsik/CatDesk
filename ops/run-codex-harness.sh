@@ -165,12 +165,12 @@ PROMPT='Work only through the "catdesk" MCP server tools (never local shell). Do
 1. Call the catdesk instruction tool (catdesk_instruction) first, as required.
 2. Call run_command with EXACTLY this command:
 awk '"'"'BEGIN { for (i = 0; i < 24000; i++) printf "S %06d - gate filler line\n", i }'"'"'
-The output is very large, so the server externalizes it. After the call, print the value of the responseBudget field of the raw tool result (especially outputRef and originalBytes) — do not print the whole stdout.
-3. If step 2 returned a responseBudget.outputRef: call read_result with result_id = that outputRef, offset 0, max_bytes 2000 (one bounded peek) and print the first line of the decoded data.
+The output is very large, so the server externalizes it. After the call, print where the result discloses the externalization: the responseBudget field (outputRef, originalBytes) and/or the outputRef/outputTruncated/outputBytes fields inside structuredContent — do not print the whole stdout.
+3. If step 2 surfaced an outputRef anywhere (responseBudget or structuredContent): call read_result with result_id = that outputRef, offset 0, max_bytes 2000 (one bounded peek) and print the first line of the decoded data.
 4. Call run_command with EXACTLY this command:
 mkdir -p gate && awk '"'"'BEGIN { for (i = 0; i < 17000; i++) printf "F %06d - gate filler line\n", i }'"'"' > gate/big.txt
-5. Call the catdesk read tool with paths ["gate/big.txt"]. Again print only the responseBudget field (outputRef, originalBytes), never the whole file text.
-6. If step 5 returned a responseBudget.outputRef: call read_result with result_id = that outputRef, offset 0, max_bytes 2000 (one bounded peek) and print the first line of the decoded data.
+5. Call the catdesk read tool with paths ["gate/big.txt"]. Again print only the externalization disclosure (responseBudget, or outputRef/outputTruncated/outputBytes in structuredContent), never the whole file text.
+6. If step 5 surfaced an outputRef anywhere: call read_result with result_id = that outputRef, offset 0, max_bytes 2000 (one bounded peek) and print the first line of the decoded data.
 7. Finish with a short summary: how many read_result calls you made, and the first line of each peek.'
 
 echo "== running codex exec against the live server =="
