@@ -110,20 +110,63 @@ impl BudgetCandidate {
 
     pub(crate) fn finish(mut self, output_ref: &str) -> Value {
         self.attach_manifest(output_ref);
+        self.attach_retrieval_hint(output_ref);
 
         if serialized_len(&self.preview) > DEFAULT_INLINE_RESPONSE_BYTES {
             self.detach_manifest();
             reduce_to_essentials(&mut self.preview, self.is_error, &mut self.omissions);
             self.attach_manifest(output_ref);
+            self.attach_retrieval_hint(output_ref);
         }
 
         if serialized_len(&self.preview) > DEFAULT_INLINE_RESPONSE_BYTES {
             self.detach_manifest();
             hard_minimal_preview(&mut self.preview, self.is_error, &mut self.omissions);
             self.attach_manifest(output_ref);
+            self.attach_retrieval_hint(output_ref);
         }
 
         self.preview
+    }
+
+    /// Duplicate the retrieval address into the surfaces harnesses actually
+    /// show the model. The manifest rides at the result root, where ChatGPT's
+    /// outputSchema projection and Codex's code_mode both drop it (measured,
+    /// ojt.10): only `structuredContent` — and, failing that, a content text
+    /// note — reliably reaches the model. Idempotent, so every compaction
+    /// level can re-attach; the field names are essential-key shaped, so the
+    /// fallback reductions keep them.
+    fn attach_retrieval_hint(&mut self, output_ref: &str) {
+        if let Some(structured) = self
+            .preview
+            .get_mut("structuredContent")
+            .and_then(Value::as_object_mut)
+        {
+            if structured.get("outputTruncated").and_then(Value::as_bool) != Some(true) {
+                structured.insert("outputTruncated".to_string(), Value::Bool(true));
+            }
+            structured
+                .entry("outputRef".to_string())
+                .or_insert_with(|| json!(output_ref));
+            structured
+                .entry("outputBytes".to_string())
+                .or_insert_with(|| json!(self.original.len()));
+            return;
+        }
+        if let Some(content) = self
+            .preview
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+        {
+            content.push(json!({
+                "type": "text",
+                "text": format!(
+                    "CatDesk: this result was too large to show in full ({} bytes). Call read_result with result_id \"{}\" to read it in bounded ranges; search_result can find text inside it.",
+                    self.original.len(),
+                    output_ref
+                )
+            }));
+        }
     }
 
     fn detach_manifest(&mut self) {
@@ -1135,6 +1178,99 @@ mod tests {
         );
 
         std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// Passthrough results (DevTools tools) carry no structuredContent, so
+    /// the retrieval hint falls back to a content text note — the only
+    /// model-visible surface such a result has.
+    #[test]
+    fn results_without_structured_content_get_a_content_text_retrieval_note() {
+        let result = json!({
+            "content": [{
+                "type": "text",
+                "text": oversized_text("BODY-HEAD", "-BODY-TAIL")
+            }]
+        });
+        let candidate = prepare_response_budget(&result, false).expect("must budget");
+        let original_bytes = candidate.original.len();
+        let preview = candidate.finish("lr_passthrough");
+
+        let notes: Vec<&Value> = preview
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("content array")
+            .iter()
+            .filter(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("read_result"))
+            })
+            .collect();
+        assert!(
+            notes.len() == 1,
+            "exactly one retrieval note expected, got {notes:?}"
+        );
+        let note = notes[0]["text"].as_str().expect("note text");
+        assert!(note.contains("lr_passthrough"), "note names the id: {note}");
+        assert!(
+            note.contains(&original_bytes.to_string()),
+            "note quantifies the original size: {note}"
+        );
+    }
+
+    /// The hint is idempotent across the compaction ladder: with forty large
+    /// fields the first compaction still exceeds the inline budget, so the
+    /// answer really descends into reduce_to_essentials — and the hint is
+    /// attached again on that deeper level.
+    #[test]
+    fn retrieval_hint_survives_the_full_compaction_ladder() {
+        let mut structured = serde_json::Map::new();
+        structured.insert("toolName".to_string(), json!("run_command"));
+        structured.insert("success".to_string(), json!(true));
+        for index in 0..40 {
+            structured.insert(
+                format!("field{index}"),
+                json!(oversized_text("HEAD", "-TAIL")),
+            );
+        }
+        let result = json!({
+            "content": [],
+            "structuredContent": Value::Object(structured)
+        });
+        let mut candidate = prepare_response_budget(&result, false).expect("must budget");
+        candidate.entry_cap = Some(EntryCapReduction {
+            original_bytes: serialized_len(&result) as u64,
+        });
+        let preview = candidate.finish("lr_ladder");
+
+        assert_eq!(
+            preview
+                .pointer("/structuredContent/outputRef")
+                .and_then(Value::as_str),
+            Some("lr_ladder")
+        );
+        assert_eq!(
+            preview
+                .pointer("/structuredContent/outputTruncated")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            preview
+                .pointer("/structuredContent/outputBytes")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "outputBytes must survive the ladder"
+        );
+        let kept = preview
+            .pointer("/structuredContent")
+            .and_then(Value::as_object)
+            .expect("structured object");
+        assert!(
+            kept.len() < 10,
+            "the deep compaction must have run: {} keys kept",
+            kept.len()
+        );
     }
 
     /// Entry-cap disclosure must live in the manifest, not the payload: the

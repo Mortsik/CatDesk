@@ -80,7 +80,10 @@ const APP_CONFIG_FILE_NAME: &str = "config.toml";
 pub use crate::usage_pricing::GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 
 /// Bump only when an existing ChatGPT connector must be removed and added again.
-pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 8;
+/// 9: read paths gained the line-range object form and budgetable tools'
+/// outputSchemas declare the outputRef/outputBytes/outputTruncated retrieval
+/// hint (catdesk-t05) — both are model-visible schema changes.
+pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 9;
 
 /// Token totals for one usage bucket.
 ///

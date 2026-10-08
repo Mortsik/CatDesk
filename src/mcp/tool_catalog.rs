@@ -391,9 +391,40 @@ fn ensure_local_tool_output_schema(tool: &mut Value) {
     else {
         return;
     };
-    let Some(schema) = local_tool_output_schema(&name) else {
+    let Some(mut schema) = local_tool_output_schema(&name) else {
         return;
     };
+    // Retrieval-hint fields (catdesk-t05): externalized results surface
+    // outputRef/outputBytes/outputTruncated inside structuredContent, and
+    // ChatGPT projects results through this schema — fields it does not
+    // declare here must not be relied on to reach the model. The two
+    // store-range tools are exempt from the budget and never externalize.
+    if !matches!(name.as_str(), "read_result" | "search_result")
+        && let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "outputRef".to_string(),
+            json!({
+                "type": "string",
+                "description": "Present when the output was externalized: the result id for read_result, which returns the full stored output in bounded ranges"
+            }),
+        );
+        properties.insert(
+            "outputBytes".to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 0,
+                "description": "Serialized size of the full stored output behind outputRef"
+            }),
+        );
+        properties.insert(
+            "outputTruncated".to_string(),
+            json!({
+                "type": "boolean",
+                "description": "true means the content you saw is a bounded preview, not the whole output"
+            }),
+        );
+    }
     tool_obj.insert("outputSchema".to_string(), schema);
 }
 

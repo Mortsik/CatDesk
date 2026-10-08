@@ -6824,6 +6824,253 @@ async fn shared_tools_call_boundary_externalizes_oversized_result_losslessly() {
     std::fs::remove_dir_all(workspace_root).ok();
 }
 
+/// Hosts that keep only `structuredContent` (ChatGPT projects through the
+/// outputSchema; Codex code_mode strips unknown top-level keys) never see the
+/// `responseBudget` manifest, so the retrieval address has to be duplicated
+/// into structuredContent itself (catdesk-t05).
+#[tokio::test]
+async fn externalized_results_surface_retrieval_inside_structured_content() {
+    let workspace_root = std::env::temp_dir().join(format!("catdesk-mcp-hint-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let full_text = format!("HEAD\n{}\nTAIL", "ż中🙂".repeat(30_000));
+    std::fs::write(workspace_root.join("big.txt"), &full_text).expect("write file");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = LargeResultStore::new_default().expect("create result store");
+    let req = tool_call_request("read", json!({ "paths": ["big.txt"] }));
+
+    let response = handle_tools_call_with_result_store(
+        &req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+
+    let inline = response.result.as_ref().expect("missing result");
+    let output_ref = inline
+        .pointer("/responseBudget/outputRef")
+        .and_then(Value::as_str)
+        .expect("missing outputRef");
+    assert_eq!(
+        inline
+            .pointer("/structuredContent/outputRef")
+            .and_then(Value::as_str),
+        Some(output_ref),
+        "structuredContent must carry the same retrieval address the manifest does"
+    );
+    assert_eq!(
+        inline
+            .pointer("/structuredContent/outputTruncated")
+            .and_then(Value::as_bool),
+        Some(true),
+        "the model must learn the shown text is a bounded preview"
+    );
+    assert_eq!(
+        inline
+            .pointer("/structuredContent/outputBytes")
+            .and_then(Value::as_u64),
+        inline
+            .pointer("/responseBudget/originalBytes")
+            .and_then(Value::as_u64),
+        "outputBytes must quote the manifest's original size"
+    );
+
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
+/// The ojt.10 live finding, reproduced end-to-end: one poll of a finished job
+/// whose whole output fits in one poll (hasMoreOutput=false) comes back with
+/// only the head and the tail of the event array. The model must still learn
+/// the middle was elided and reconstruct the full output through read_result.
+/// Output sizing: 120 KB of event text sits under the 128 KB per-poll cap
+/// (so one poll really carries everything) while the serialized answer clears
+/// the 64 KiB inline budget, and the 8 KiB reader chunks guarantee more than
+/// the 12-event preview no matter where the pipe splits.
+#[cfg(unix)]
+#[tokio::test]
+async fn poll_command_elided_middle_events_stay_recoverable() {
+    // Spawn-dependent (printf/yes/head through PATH) — hold the crate env
+    // lock like the other PATH-spawning flows.
+    let _env = env_lock();
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-poll-elide-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let store = LargeResultStore::new_default().expect("create result store");
+    let command_jobs = CommandJobManager::new();
+
+    let start_req = tool_call_request(
+        "start_command",
+        json!({ "command": "printf 'HEAD-SENTINEL\\n'; yes x | head -c 120000; printf '\\nTAIL-SENTINEL\\n'" }),
+    );
+    let start_response = handle_tools_call_with_result_store(
+        &start_req,
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &command_jobs,
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+    let job_id = start_response
+        .result
+        .as_ref()
+        .and_then(|result| result.pointer("/structuredContent/jobId"))
+        .and_then(Value::as_str)
+        .expect("missing jobId")
+        .to_string();
+
+    // Wait for the job to finish so one poll carries every event at once.
+    for _ in 0..200 {
+        let probe = tool_call_request("poll_command", json!({ "job_id": job_id, "wait_ms": 0 }));
+        let probe_response = handle_tools_call_with_result_store(
+            &probe,
+            &workspace_root_str,
+            2,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+            ShowDetailMode::Disable,
+            &store,
+            Some("session-a"),
+            None,
+        )
+        .await;
+        if probe_response
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer("/structuredContent/state"))
+            .and_then(Value::as_str)
+            == Some("succeeded")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let poll_req = tool_call_request(
+        "poll_command",
+        json!({ "job_id": job_id, "after": 0, "wait_ms": 0 }),
+    );
+    let poll_response = handle_tools_call_with_result_store(
+        &poll_req,
+        &workspace_root_str,
+        3,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &command_jobs,
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+
+    let inline = poll_response.result.as_ref().expect("missing result");
+    assert_eq!(
+        inline
+            .pointer("/structuredContent/hasMoreOutput")
+            .and_then(Value::as_bool),
+        Some(false),
+        "the job buffer is fully delivered — the elision is budget-level"
+    );
+    let output_ref = inline
+        .pointer("/structuredContent/outputRef")
+        .and_then(Value::as_str)
+        .expect("the elided poll answer must surface its retrieval address");
+    assert_eq!(
+        inline
+            .pointer("/structuredContent/outputTruncated")
+            .and_then(Value::as_bool),
+        Some(true),
+        "the model must be told the middle events were skipped"
+    );
+    // Two honest preview shapes exist: the bounded events array (head+tail),
+    // or — when even that preview overflows the inline budget — the essential
+    // key set with the retrieval hint carrying the recovery. Both must tell
+    // the model the answer is partial.
+
+    let mut rebuilt = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let range = store
+            .read_range(
+                Some("session-a"),
+                &workspace_root,
+                output_ref,
+                offset,
+                store.max_range_bytes(),
+            )
+            .expect("read stored result");
+        rebuilt.extend_from_slice(&range.bytes);
+        offset = range.next_offset;
+        if range.eof {
+            break;
+        }
+    }
+    let stored: Value = serde_json::from_slice(&rebuilt).expect("stored result json");
+    let stored_events = stored
+        .pointer("/structuredContent/events")
+        .and_then(Value::as_array)
+        .expect("stored events");
+    assert!(
+        stored_events.len() > 12,
+        "the stored original must hold the events the preview elided, got {}",
+        stored_events.len()
+    );
+    assert_eq!(
+        stored_events
+            .first()
+            .and_then(|event| event["text"].as_str()),
+        Some("HEAD-SENTINEL\n")
+    );
+    assert!(
+        stored_events
+            .last()
+            .and_then(|event| event["text"].as_str())
+            .is_some_and(|text| text.ends_with("TAIL-SENTINEL\n")),
+        "the stored tail must survive byte-for-byte"
+    );
+    if let Some(events) = inline
+        .pointer("/structuredContent/events")
+        .and_then(Value::as_array)
+    {
+        assert!(
+            events.len() <= 12,
+            "the preview keeps at most the head and the tail of the event array"
+        );
+        assert_eq!(
+            events.first().and_then(|event| event["seq"].as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            events.last().and_then(|event| event["seq"].as_u64()),
+            stored_events.last().and_then(|event| event["seq"].as_u64()),
+            "the preview's tail event must be the job's final event"
+        );
+    }
+
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
 /// Finding F2: when both output streams are full relative to the store's
 /// entry cap, the store rejects the combined result and — before this fix —
 /// the swallowed error sent the oversized payload inline. The rejected
