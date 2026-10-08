@@ -491,6 +491,19 @@ async fn handle_tools_call_with_result_store(
         }
     }
 
+    // Widget meta must ride the result through the budget gate: attached
+    // after it, the constant turnTokenUsage/toolCallCount fields could push
+    // an in-budget result past the inline cap post-decision (finding F4).
+    // Attached here they are measured — an over-budget result goes through
+    // the standard externalization path with the meta in its payload.
+    if let Some(result) = response.result.as_mut()
+        && widget_payload_meta_mut(result).is_some()
+    {
+        let turn_token_usage = estimate_turn_token_usage(req, &tool_name, result);
+        attach_turn_token_usage(result, &turn_token_usage);
+        attach_tool_call_count(result, 1);
+    }
+
     let mut budget_outcome: Option<response_budget::BudgetOutcome> = None;
     // Serialized size before the lossy entry-cap reduction, if one happened:
     // telemetry must keep reporting the full result as raw.
@@ -570,14 +583,6 @@ async fn handle_tools_call_with_result_store(
             }
             Err(_) => None,
         };
-    }
-
-    if let Some(result) = response.result.as_mut()
-        && widget_payload_meta_mut(result).is_some()
-    {
-        let turn_token_usage = estimate_turn_token_usage(req, &tool_name, result);
-        attach_turn_token_usage(result, &turn_token_usage);
-        attach_tool_call_count(result, 1);
     }
 
     // Byte accounting: when the budget externalized the result, its own

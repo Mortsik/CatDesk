@@ -8226,6 +8226,104 @@ async fn oversized_catdesk_instruction_is_externalized_not_inlined() {
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
+// ── widget meta rides the budget gate (catdesk-8o1, finding F4) ─────────────
+
+/// Fake bridge returning a `structuredContent.data` string of caller-chosen
+/// length: the test calibrates the fixed JSON framing from a small call and
+/// then lands the final answer just above the inline cap.
+#[cfg(unix)]
+const FAKE_META_FIT_SERVER_SCRIPT: &str = r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    request = json.loads(line)
+    method = request.get("method", "")
+    if method == "tools/list":
+        result = {"tools": [
+            {"name": "fake_dt_meta_fit", "annotations": {"readOnlyHint": True}},
+        ]}
+    elif method == "tools/call":
+        n = request["params"]["arguments"].get("n", 0)
+        result = {
+            "content": [],
+            "structuredContent": {"toolName": "fake_dt_meta_fit", "data": "B" * n, "success": True},
+        }
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+
+#[cfg(unix)]
+async fn fake_meta_fit_bridge()
+-> std::sync::Arc<tokio::sync::Mutex<crate::devtools::DevtoolsBridge>> {
+    crate::devtools::DevtoolsBridge::bridge_for_test(FAKE_META_FIT_SERVER_SCRIPT)
+        .await
+        .expect("spawn fake meta-fit devtools bridge")
+}
+
+#[cfg(unix)]
+async fn meta_fit_call(
+    bridge: &std::sync::Arc<tokio::sync::Mutex<crate::devtools::DevtoolsBridge>>,
+    workspace_root: &std::path::Path,
+    n: usize,
+) -> serde_json::Value {
+    let req = tool_call_request("fake_dt_meta_fit", json!({ "n": n }));
+    let response = handle_tools_call(
+        &req,
+        &workspace_root.to_string_lossy(),
+        1,
+        Mode::Browser,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &Some(bridge.clone()),
+    )
+    .await;
+    response.result.expect("meta-fit result")
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn inline_result_with_widget_meta_stays_within_inline_budget() {
+    let bridge = fake_meta_fit_bridge().await;
+    let workspace_root = std::env::temp_dir().join(format!("catdesk-meta-fit-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let cap = crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES;
+
+    // First call measures the framing around `data` for this flow, widget
+    // meta already included. The second call lands the final answer
+    // META_OVERSHOOT bytes ABOVE the cap — above it by less than the
+    // turnTokenUsage/toolCallCount attachment costs. A gate that decides on
+    // the meta-less bytes (the F4 bug) sees an in-budget result and inlines
+    // it, and the post-gate attachment pushes the shipped answer past the
+    // cap; a gate that sees the meta first externalizes the answer and the
+    // shipped inline form stays within the cap.
+    let probe = meta_fit_call(&bridge, &workspace_root, 1_024).await;
+    let probe_len = serde_json::to_vec(&probe).expect("serialize probe").len();
+    const META_OVERSHOOT: usize = 48;
+    let n = 1_024 + (cap + META_OVERSHOOT - probe_len);
+
+    let result = meta_fit_call(&bridge, &workspace_root, n).await;
+    let serialized = serde_json::to_vec(&result).expect("serialize final result");
+    assert!(
+        serialized.len() <= cap,
+        "a tool result with widget meta must stay within the inline budget, got {} bytes",
+        serialized.len()
+    );
+    let meta = result
+        .get("_meta")
+        .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+        .expect("widget meta missing from the final response");
+    assert!(
+        meta.get("turnTokenUsage").is_some() && meta.get("toolCallCount").is_some(),
+        "widget meta must keep carrying the usage fields after the budget gate"
+    );
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
 // ── read_result worst-case size (catdesk-ojt.5) ─────────────────────────────
 
 /// Puts `payload` in the dispatcher's result store and reads one maximal range
