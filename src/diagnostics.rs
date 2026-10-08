@@ -224,6 +224,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tool_result_bytes_survive_blocking_pool_dispatch() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let log = Diagnostics {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
+            write_dropped: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicU64::new(0)),
+            active_requests: Arc::new(StdMutex::new(HashMap::new())),
+            stopping_since: Arc::new(StdMutex::new(None)),
+        };
+        // complete=true keeps the drop-time http_cancelled teardown out of the
+        // channel; it is not what this test exercises.
+        let trace = RequestLog {
+            log,
+            id: "blocking-dispatch".to_string(),
+            started: Instant::now(),
+            complete: AtomicBool::new(true),
+            tool: AtomicU8::new(0),
+        };
+        REQUEST
+            .scope(trace, async {
+                // The production dispatch shape: the future is polled on a
+                // blocking-pool thread, where the async task's scope does not
+                // exist. The wrapper must re-establish it around those polls.
+                let work = scope_future_for_blocking_pool(async {
+                    tool_result_bytes(
+                        crate::perf_metrics::tool_index(Some("run_command")),
+                        "small",
+                        64,
+                        64,
+                        0,
+                        false,
+                    );
+                });
+                crate::request_workers::run_timed(work, Duration::from_secs(5), None)
+                    .await
+                    .expect("dispatched work succeeded");
+            })
+            .await;
+
+        let record = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocking-pool execution must record tool_result_bytes")
+            .unwrap();
+        assert_eq!(record["event"], "tool_result_bytes");
+        assert_eq!(record["request_id"], "blocking-dispatch");
+        assert_eq!(record["rpc_tool"], "run_command");
+    }
+
+    #[tokio::test]
+    async fn tool_result_bytes_from_an_unscoped_blocking_future_stay_silent() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let log = Diagnostics {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
+            write_dropped: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicU64::new(0)),
+            active_requests: Arc::new(StdMutex::new(HashMap::new())),
+            stopping_since: Arc::new(StdMutex::new(None)),
+        };
+        let trace = RequestLog {
+            log,
+            id: "unscoped-blocking-dispatch".to_string(),
+            started: Instant::now(),
+            complete: AtomicBool::new(true),
+            tool: AtomicU8::new(0),
+        };
+        REQUEST
+            .scope(trace, async {
+                // No wrapper: the boundary this module relies on. The call is
+                // polled on the blocking-pool thread, outside any scope, so
+                // the best-effort record is skipped, never buffered.
+                let runtime = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    runtime.block_on(async {
+                        tool_result_bytes(
+                            crate::perf_metrics::tool_index(Some("run_command")),
+                            "small",
+                            1,
+                            1,
+                            0,
+                            false,
+                        );
+                    });
+                })
+                .await
+                .unwrap();
+            })
+            .await;
+
+        // Nothing may be sent: Timeout (channel still open, empty) and
+        // Disconnected/None (sender dropped, empty) are both silence. A
+        // record would resolve Ok immediately, so the verdict does not
+        // depend on timing.
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(Some(record)) => panic!("an unscoped blocking execution must not record: {record}"),
+            _ => {}
+        }
+    }
+
     #[test]
     fn writer_persists_records_and_rotates_with_private_permissions() {
         let root =
@@ -1624,6 +1727,40 @@ pub(crate) fn current_execute_started() -> Option<crate::request_workers::Execut
 struct StageReporter {
     log: Diagnostics,
     id: String,
+}
+
+/// A detached view of the request scoped to the async handler: same id and
+/// log sink, but silent on drop — the async view owns completion and
+/// cancellation reporting, so a blocking-pool view must never emit
+/// `http_cancelled`. The tool counter starts at zero because `rpc_request`
+/// keys it in the async task before dispatch.
+fn detached_request_view(request: &RequestLog) -> RequestLog {
+    RequestLog {
+        log: request.log.clone(),
+        id: request.id.clone(),
+        started: request.started,
+        complete: AtomicBool::new(true),
+        tool: AtomicU8::new(0),
+    }
+}
+
+/// Wrap a future destined for the blocking pool in the dispatching request's
+/// scope. A task-local scope does not cross the pool boundary: a future
+/// polled by `spawn_blocking` sees no `REQUEST` context, so per-request
+/// diagnostics recorded inside it (e.g. `tool_result_bytes` for tools/call)
+/// are silently skipped. The wrapper re-establishes the scope around polls of
+/// the wrapped future wherever they happen. Outside request scope the future
+/// is returned unscoped — best-effort records stay best-effort.
+pub(crate) fn scope_future_for_blocking_pool<F>(
+    future: F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send>>
+where
+    F: std::future::Future + Send + 'static,
+{
+    match REQUEST.try_with(detached_request_view) {
+        Ok(view) => Box::pin(REQUEST.scope(view, future)),
+        Err(_) => Box::pin(future),
+    }
 }
 
 /// Identity appears exactly once per process, in this record; per-request

@@ -4644,8 +4644,13 @@ async fn post_mcp_http(
     // Telemetry-only outcome feed for the UI streak counter; `s` moves into
     // the timed request, so clone the sender up front.
     let ui_events = s.ui_events.clone();
+    // The blocking pool has no request task-local; re-establish the scope
+    // around the work future so per-request records inside it (notably
+    // `tool_result_bytes` for tools/call) attach to this request id.
     match run_timed(
-        async move { post_mcp_inner(State(s), body_bytes, &headers, None).await },
+        crate::diagnostics::scope_future_for_blocking_pool(async move {
+            post_mcp_inner(State(s), body_bytes, &headers, None).await
+        }),
         deadline,
         execute_started,
     )
