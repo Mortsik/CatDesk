@@ -3371,6 +3371,49 @@ fn oversized_agents_preview_stays_within_the_cap_for_huge_file_sizes() {
 }
 
 #[test]
+fn whitespace_padded_oversized_agents_layer_keeps_a_bounded_preview() {
+    let workspace_root = std::env::temp_dir().join(format!(
+        "catdesk-mcp-agents-text-whitespace-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+
+    // The read window (cap + 1 bytes) is ALL spaces with real content living
+    // past it: emptiness must be classified only for inline-sized files,
+    // otherwise this layer would silently vanish.
+    let agents_path = workspace_root.join("AGENTS.md");
+    let mut padded = String::new();
+    while padded.len() < 70 * 1024 {
+        padded.push(' ');
+    }
+    padded.push_str("HIDDEN-GUARANTEE");
+    std::fs::write(&agents_path, &padded).expect("write whitespace-padded agents");
+
+    let preview = super::agents_state::cached_agents_text(&agents_path)
+        .expect("an oversized layer must not vanish behind whitespace padding");
+
+    assert!(
+        preview.len() <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "the whitespace head plus note must stay within the cap, got {} bytes",
+        preview.len()
+    );
+    assert!(
+        preview.contains("full text not retained"),
+        "the bounded preview must say the full text was not kept"
+    );
+
+    // Inline-sized whitespace stays semantically empty, as before.
+    let spaces_path = workspace_root.join("spaces-only.md");
+    std::fs::write(&spaces_path, " \n\t".repeat(256)).expect("write spaces-only layer");
+    assert!(
+        super::agents_state::cached_agents_text(&spaces_path).is_none(),
+        "an inline-sized whitespace-only layer is still no layer at all"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
 fn oversized_agents_layer_never_rides_catdesk_instruction_inline() {
     let workspace_root = std::env::temp_dir().join(format!(
         "catdesk-mcp-agents-instruction-cap-{}",

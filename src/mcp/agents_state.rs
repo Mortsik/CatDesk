@@ -240,10 +240,14 @@ fn read_agents_text_result(path: &Path) -> std::io::Result<Option<String>> {
         Ok(content) => content,
         Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
     };
-    if content.trim().is_empty() {
-        return Ok(None);
-    }
+    // Oversize is settled first: the read window itself may be all whitespace
+    // padding with real content living past the cap, so an oversized file
+    // always gets the bounded preview. Only an inline-sized file may be
+    // classified as semantically empty.
     if content.len() <= AGENTS_TEXT_PREVIEW_BYTES {
+        if content.trim().is_empty() {
+            return Ok(None);
+        }
         return Ok(Some(content.trim().to_string()));
     }
 
