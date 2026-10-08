@@ -1486,6 +1486,7 @@ async fn run_command_success_keeps_content_empty() {
 #[cfg(unix)]
 #[tokio::test]
 async fn read_result_max_range_token_estimate_stays_bounded() {
+    let _env = env_lock();
     // Audit F6: read_result is exempt from the response budget, so the turn
     // usage estimate used to o200k-tokenize the FULL range. A max-range read
     // (128 KiB -> ~175 KB of newline-free base64, effectively one giant BPE
@@ -8100,6 +8101,7 @@ async fn fake_devtools_bridge()
 #[tokio::test]
 #[cfg(unix)]
 async fn devtools_passthrough_lists_dynamic_tools_and_filters_read_only() {
+    let _env = env_lock();
     let bridge = fake_devtools_bridge().await;
 
     let multi =
@@ -8128,6 +8130,7 @@ async fn devtools_passthrough_lists_dynamic_tools_and_filters_read_only() {
 #[tokio::test]
 #[cfg(unix)]
 async fn devtools_passthrough_big_result_goes_through_shared_budget() {
+    let _env = env_lock();
     let bridge = fake_devtools_bridge().await;
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-audit-devtools-{}", Uuid::new_v4()));

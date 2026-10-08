@@ -42,7 +42,7 @@ let _env = env_lock(); // per-file helper, = crate::test_serialization::lock_env
 | File | Locked before | Locked after | Still unlocked (audited: no spawn reach) |
 |---|---|---|---|
 | `command_jobs.rs` | 1 | 25 | 4 validation-only tests (no `.start(`) |
-| `mcp/tests.rs` | 1 | 32 | ~47: schema/argument-rejection (`*_rejects_*`, `read_only_mode_blocks_*`), instruction/result-tool/payload-only tests — flow stops before any spawn |
+| `mcp/tests.rs` | 1 | 35 | ~44: schema/argument-rejection (`*_rejects_*`, `read_only_mode_blocks_*`), instruction/result-tool/payload-only tests — flow stops before any spawn |
 | `server.rs` | 0 | 7 | ~29: health/ping/usage/widget and label/classification unit tests — no command execution on the path |
 | `soak.rs` | 0 | 5 | — (every scenario drives real jobs through the spawned server) |
 | `process_runner.rs` | 0 | 8 | `capture_reader_*` (in-process reader unit), `spawn_shell_command_denies_*` (denied before spawn) |
