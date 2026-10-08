@@ -105,6 +105,17 @@ on the first run.
 
 ## Verification
 
-5× full `cargo test -j 8` under parallel compile load (fresh scratch build
-cycling in the background) — see the bead `catdesk-o3h` close report for the
-per-run results; `cargo fmt --check` clean.
+5× full `cargo test -j 8` (656 tests) under parallel compile load — a fresh
+scratch build of the same tree cycling `cargo clean && cargo build -j 8` in
+the background throughout (load average ~34 on 32 cores). All five runs
+green, `0 failed`:
+
+| Run | Result | Wall |
+|---|---|---|
+| 1 | ok. 656 passed; 0 failed | 41.72 s |
+| 2 | ok. 656 passed; 0 failed | 44.99 s |
+| 3 | ok. 656 passed; 0 failed | 41.48 s |
+| 4 | ok. 656 passed; 0 failed | 43.13 s |
+| 5 | ok. 656 passed; 0 failed | 41.33 s |
+
+`cargo fmt --check` clean.
