@@ -1126,6 +1126,10 @@ async fn failed_background_command_is_pollable_without_mcp_error() {
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
+/// Unix-only: the foreground probe runs `printf`, which does not exist on the
+/// Windows PowerShell dispatch path (`process_runner.rs` shells through
+/// powershell.exe), and the exact-stdout assertion assumes unix output.
+#[cfg(unix)]
 #[tokio::test]
 async fn foreground_run_command_works_while_many_background_commands_run() {
     let _env = env_lock();
@@ -1450,6 +1454,9 @@ async fn run_command_timeout_with_stdout_keeps_timeout_reason_in_content() {
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
+/// Unix-only: `printf` does not exist on the Windows PowerShell dispatch path
+/// (`process_runner.rs` shells through powershell.exe).
+#[cfg(unix)]
 #[tokio::test]
 async fn run_command_success_keeps_content_empty() {
     let _env = env_lock();
