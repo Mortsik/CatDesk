@@ -25,6 +25,19 @@ impl LaunchSpec {
     fn devtools(selected_browser: Option<&DetectedBrowser>) -> Self {
         let mut args = vec!["-y".to_string(), "chrome-devtools-mcp@latest".to_string()];
         if let Some(browser) = selected_browser {
+            // Every branch that makes chrome-devtools-mcp SPAWN the browser
+            // gets `--isolated`: a temporary user-data-dir (upstream's only
+            // supported mechanism) so the launch cannot collide with the
+            // user's running browser on the default profile. Attaching to an
+            // already-running browser (--browserUrl) launches nothing and
+            // must leave the user's session untouched.
+            let spawns_browser = !matches!(
+                browser.remote_debug_target.as_deref(),
+                Some(target) if target != "pipe" && browser.remote_debug_active
+            );
+            if spawns_browser {
+                args.push("--isolated".to_string());
+            }
             if browser.remote_debug_active {
                 if let Some(target) = browser.remote_debug_target.as_deref() {
                     if target == "pipe" {
@@ -430,6 +443,61 @@ impl Drop for DevtoolsBridge {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn detected_browser(remote_debug_active: bool, target: Option<&str>) -> DetectedBrowser {
+        DetectedBrowser {
+            name: "Chromium".to_string(),
+            binary: "chromium".to_string(),
+            path: "/usr/bin/chromium".to_string(),
+            remote_debugging: false,
+            remote_debug_hint: String::new(),
+            mcp_supported: true,
+            support_note: String::new(),
+            remote_debug_active,
+            remote_debug_target: target.map(str::to_string),
+            remote_debug_pid: None,
+        }
+    }
+
+    /// A fresh launch spawns the browser on chrome-devtools-mcp's behalf.
+    /// Without `--isolated` it uses the browser's default user-data-dir, which
+    /// conflicts with the user's already-running browser ("profile is already
+    /// in use") — the reported DevTools/Chrome profile conflict.
+    #[test]
+    fn fresh_browser_launches_are_isolated_from_the_user_profile() {
+        let browser = detected_browser(false, None);
+        let spec = LaunchSpec::devtools(Some(&browser));
+        assert!(
+            spec.args.iter().any(|arg| arg == "--isolated"),
+            "fresh launches must not touch the default profile: {:?}",
+            spec.args
+        );
+    }
+
+    #[test]
+    fn pipe_launched_browsers_are_isolated_too() {
+        let browser = detected_browser(true, Some("pipe"));
+        let spec = LaunchSpec::devtools(Some(&browser));
+        assert!(
+            spec.args.iter().any(|arg| arg == "--isolated"),
+            "a piped fresh launch still spawns a new browser: {:?}",
+            spec.args
+        );
+    }
+
+    /// Attaching to a browser the user already started (remote debugging
+    /// port) launches nothing, so the isolation flag has no place there.
+    #[test]
+    fn browser_url_attach_does_not_request_isolation() {
+        let browser = detected_browser(true, Some("127.0.0.1:9222"));
+        let spec = LaunchSpec::devtools(Some(&browser));
+        assert!(
+            !spec.args.iter().any(|arg| arg == "--isolated"),
+            "attaching to a running browser must stay untouched: {:?}",
+            spec.args
+        );
+        assert!(spec.args.contains(&"--browserUrl".to_string()));
+    }
 
     #[test]
     fn stderr_classification_does_not_persist_raw_messages() {

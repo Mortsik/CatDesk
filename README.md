@@ -117,6 +117,8 @@ If you don't want to use CatDesk, here are some similar projects you can try:
 
    When CatDesk starts, choose `Control Computer`, `Control Browser`, or `Both`. Press `l` on the mode selection screen to switch between English and Traditional Chinese; the preference is saved in `~/.catdesk/config.toml`. Traditional Chinese is applied across the main dashboard, settings, browser selection, ngrok setup, and common runtime log messages shown in the TUI; exported logs keep their original text for debugging. If browser control is enabled, select a supported Chromium browser. On macOS, CatDesk detects standard browser app bundles in `/Applications` and `~/Applications` in addition to binaries available on `PATH`.
 
+   When CatDesk launches the browser itself, it does so with an isolated temporary profile (chrome-devtools-mcp `--isolated`), so automation can never collide with your already-running browser. Logins made through that session do not survive a restart — to automate your real profile instead, start the browser with remote debugging yourself (e.g. `google-chrome --remote-debugging-port=9222`) and CatDesk will attach to the running instance.
+
    On first launch, CatDesk will ask you to enter your **ngrok authtoken** and **ngrok static domain** (e.g. `my-app.ngrok-free.dev`). You can get both from the [ngrok dashboard](https://dashboard.ngrok.com/get-started/setup). These are saved to `~/.catdesk/config.toml` and reused on subsequent launches.
 
    By default, CatDesk listens on port `3200`. You can override it with `PORT`. The workspace root defaults to the current working directory and can be overridden with `WORKSPACE_ROOT`.
