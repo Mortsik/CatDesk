@@ -67,9 +67,9 @@ that array: 151 bytes).
 | run_command | 2,645 | 661 | 390 | 450 | 1,331 | 66 | 294 |
 | read | 2,562 | 640 | 75 | 359 | 1,675 | 67 | 280 |
 | search | 2,338 | 584 | 97 | 1,120 | 661 | 67 | 284 |
-| create_handoff | 2,250 | 562 | 323 | 909 | 523 | 67 | 300 |
 | poll_command | 2,311 | 578 | 573 | 451 | 807 | 68 | 296 |
 | edit | 2,265 | 566 | 271 | 1,162 | 380 | 67 | 280 |
+| create_handoff | 2,250 | 562 | 323 | 909 | 523 | 67 | 300 |
 | start_command | 2,183 | 546 | 374 | 519 | 808 | 66 | 298 |
 | search_result | 1,811 | 453 | 216 | 513 | 894 | 67 | 0 |
 | cancel_command | 1,533 | 383 | 92 | 145 | 809 | 67 | 300 |
@@ -239,7 +239,7 @@ first revision of this document:
 2. Large tool results: the shared 64-KiB inline budget
    (`DEFAULT_INLINE_RESPONSE_BYTES`, src/mcp/response_budget.rs:6) externalizes
    oversized results into the result store; retrieval costs two small schemas
-   bought once (`read_result` + `search_result` = 3,113 B ≈ 778 tokens) while
+   bought once (`read_result` + `search_result` = 3,155 B ≈ 789 tokens) while
    unbounded output stays out of the transcript. This is output-side
    deferral — the epic's core primitive — and it is landed.
 3. `run_command` interception of directory-listing commands replaces raw
