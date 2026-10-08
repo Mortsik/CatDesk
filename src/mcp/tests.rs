@@ -7649,6 +7649,9 @@ fn devtools_snapshot_defaults_to_non_verbose_without_overriding_explicit_verbose
 #[cfg(unix)]
 #[tokio::test]
 async fn devtools_forwarding_sends_bounded_defaults_to_upstream_peer() {
+    // python3 resolves through the process-global PATH; take the env lock so a
+    // concurrent sandbox test cannot swap PATH to stub-only while we spawn.
+    let _env = env_lock();
     let child = tokio::process::Command::new("python3")
         .args([
             "-c",
@@ -7711,6 +7714,9 @@ for line in sys.stdin:
 #[cfg(unix)]
 #[tokio::test]
 async fn devtools_forwarding_externalizes_large_network_body_through_shared_budget() {
+    // python3 resolves through the process-global PATH; take the env lock so a
+    // concurrent sandbox test cannot swap PATH to stub-only while we spawn.
+    let _env = env_lock();
     let workspace_root = read_workspace("devtools-forward-large-body");
     let store = LargeResultStore::new_default().expect("create result store");
     let child = tokio::process::Command::new("python3")
