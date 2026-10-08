@@ -560,13 +560,24 @@ async fn workflow_repeated_polling(harness: &GateHarness, footprints: &mut Vec<F
         .and_then(Value::as_u64)
         .expect("initial cursor");
 
-    // Bounded rendezvous: iterate over observable state, never wall clock.
+    // Bounded rendezvous: iterate over observable state. The budget is a
+    // hang bound only — the old 500-iteration cap was load-sensitive:
+    // zero-wait polls spin as fast as the host allows, and under parallel
+    // compile load the loop burned all 500 snapshots before the spawned
+    // printf job ever got scheduled, failing a healthy run. A deadline
+    // keeps the budget independent of how fast polls spin while the loop
+    // itself stays state-terminated (the assert fires only on a job that
+    // truly never reaches a terminal state).
     let mut polls = 0_u32;
+    let hang_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut max_poll_inline = 0_u64;
     let mut collected_output = String::new();
     loop {
         polls += 1;
-        assert!(polls <= 500, "job never reached a terminal state");
+        assert!(
+            std::time::Instant::now() < hang_deadline,
+            "job never reached a terminal state"
+        );
         let poll = harness
             .call(
                 "poll_command",
