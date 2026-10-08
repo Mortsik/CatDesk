@@ -6269,6 +6269,7 @@ async fn shared_tools_call_boundary_externalizes_oversized_result_losslessly() {
 /// the swallowed error sent the oversized payload inline. The rejected
 /// response must instead be reduced until it fits the cap and externalized,
 /// so the inline answer stays bounded no matter how large the raw output is.
+#[cfg(unix)]
 #[tokio::test]
 async fn oversized_run_command_with_both_streams_full_is_reduced_not_sent_inline() {
     let workspace_root =
@@ -6432,6 +6433,7 @@ fn entry_cap_reduction_bounds_pathological_escaping_and_keeps_ends() {
 /// still exceeds the inline budget here, so the preview is compacted again —
 /// a marker inside a string could be previewed away, while the manifest is
 /// rebuilt after every compaction level and must keep the disclosure.
+#[cfg(unix)]
 #[tokio::test]
 async fn entry_cap_reduction_is_disclosed_in_the_inline_manifest() {
     let workspace_root =
@@ -6547,6 +6549,7 @@ async fn entry_cap_reduction_is_disclosed_in_the_inline_manifest() {
 /// budget: nothing is externalized, so no manifest appears and the
 /// disclosure must ride on the inline result itself — all three fields,
 /// with original-minus-omitted still inside the inline budget.
+#[cfg(unix)]
 #[tokio::test]
 async fn sub_budget_entry_cap_reduction_discloses_loss_inline_without_a_manifest() {
     let workspace_root =
