@@ -633,6 +633,12 @@ async fn workflow_repeated_polling(harness: &GateHarness, footprints: &mut Vec<F
 #[cfg(unix)]
 #[tokio::test]
 async fn transcript_gate_bounds_footprint_and_keeps_capability() {
+    // Spawn-dependent (sh/awk through PATH in workflows a/d/e, python3 for
+    // the fake DevTools peer) and PATH is process-global: hold the crate env
+    // lock so an env-rewriting test cannot interleave (the dr6-sweep idiom).
+    // A broken spawn yields a small error result that is correctly NOT
+    // externalized, failing the gate's own assertions — a false red.
+    let _env = crate::test_serialization::lock_env();
     let mut footprints = Vec::new();
 
     let command_harness = GateHarness::new("command");
