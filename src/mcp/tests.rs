@@ -6560,6 +6560,13 @@ async fn shared_tools_call_boundary_externalizes_oversized_result_losslessly() {
 #[cfg(unix)]
 #[tokio::test]
 async fn oversized_run_command_with_both_streams_full_is_reduced_not_sent_inline() {
+    // Spawn-dependent (printf/yes/head/tr through PATH) and PATH is
+    // process-global: hold the crate env lock so an env-rewriting test
+    // cannot interleave (the dr6-sweep idiom); a broken spawn yields a
+    // small error result that is never externalized, so the outputRef
+    // assertions lose their subject — the same shape as the entry-cap
+    // disclosure pair below.
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-entry-cap-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -6845,6 +6852,12 @@ async fn entry_cap_reduction_is_disclosed_in_the_inline_manifest() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sub_budget_entry_cap_reduction_discloses_loss_inline_without_a_manifest() {
+    // Spawn-dependent (printf/head/tr through PATH) and PATH is
+    // process-global: hold the crate env lock so an env-rewriting test
+    // cannot interleave (the dr6-sweep idiom); a broken spawn yields a
+    // small result below the cap, so the entryCapTruncated disclosure
+    // assertions lose their subject.
+    let _env = env_lock();
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-entry-cap-inline-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");

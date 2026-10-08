@@ -3450,6 +3450,12 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_one_named_session_cancels_only_its_jobs_and_keeps_other_session_connected() {
+        // Spawn-dependent (`sleep 5` through PATH via CommandJobManager::start)
+        // and PATH is process-global: hold the crate env lock so an
+        // env-rewriting test cannot interleave (the dr6-sweep idiom); a broken
+        // spawn fails the jobs before the delete, so the
+        // only-session-a-cancelled assertions lose their subject.
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = unique_temp_path("catdesk-delete-session-workspace");
         let config_root = unique_temp_path("catdesk-delete-session-config");
         let config_path = config_root.join("config.toml");

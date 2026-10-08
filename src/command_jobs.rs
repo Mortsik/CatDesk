@@ -1292,6 +1292,11 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_marks_running_records_interrupted_and_rewrites_them() {
+        // Spawn-dependent (`sleep 30` through PATH) and PATH is process-global:
+        // hold the crate env lock so an env-rewriting test cannot interleave
+        // (the dr6-sweep idiom); a broken spawn never reaches Running, so the
+        // Interrupted-recovery assertions lose their subject.
+        let _env = env_lock();
         let (manager, dir) = manager_with_store();
         let started = manager
             .start_with_change_session(
@@ -1444,6 +1449,11 @@ mod tests {
 
     #[tokio::test]
     async fn background_change_report_is_deferred_and_cached_until_terminal() {
+        // Spawn-dependent (`sleep 0.5` through PATH) and PATH is
+        // process-global: hold the crate env lock so an env-rewriting test
+        // cannot interleave (the dr6-sweep idiom); a broken spawn is terminal
+        // immediately, so the deferred-changes assertion loses its subject.
+        let _env = env_lock();
         let root = workspace("deferred-changes");
         let session = ChangeSession::begin(
             &root,
@@ -1943,6 +1953,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_session_signals_only_jobs_owned_by_that_session() {
+        // Spawn-dependent (`sleep 5` through PATH) and PATH is process-global:
+        // hold the crate env lock so an env-rewriting test cannot interleave
+        // (the dr6-sweep idiom); a broken spawn fails both jobs before the
+        // cancel, so the one-job-cancelled assertion loses its subject.
+        let _env = env_lock();
         let root = workspace("cancel-session");
         let manager = CommandJobManager::new();
         let command = if cfg!(windows) {

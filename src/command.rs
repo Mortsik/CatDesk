@@ -1112,6 +1112,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_uses_platform_shell_and_cwd() {
+        // Spawn-dependent (platform shell + basename through PATH) and PATH is
+        // process-global: hold the crate env lock so an env-rewriting test
+        // cannot interleave (the dr6-sweep idiom); a broken spawn fails the
+        // command, so the success/stdout assertions lose their subject.
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = test_workspace("run-cwd");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let leaf = workspace_root
@@ -1136,6 +1141,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_command_preserves_both_ends_of_stdout_larger_than_one_mibibyte() {
+        // Spawn-dependent (printf/head/tr through PATH) and PATH is
+        // process-global: hold the crate env lock so an env-rewriting test
+        // cannot interleave (the dr6-sweep idiom); a broken spawn fails the
+        // command, so the both-ends assertions lose their subject.
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = test_workspace("run-large-stdout");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let command = "printf 'HEAD-MARKER\\n'; head -c 1100000 /dev/zero | tr '\\0' x; printf '\\nTAIL-MARKER\\n'";
@@ -1164,6 +1174,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_command_preserves_both_ends_of_stderr_larger_than_one_mibibyte() {
+        // Spawn-dependent (printf/head/tr through PATH) and PATH is
+        // process-global: hold the crate env lock so an env-rewriting test
+        // cannot interleave (the dr6-sweep idiom); a broken spawn fails the
+        // command, so the both-ends assertions lose their subject.
+        let _env = crate::test_serialization::lock_env();
         let workspace_root = test_workspace("run-large-stderr");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let command = "{ printf 'ERR-HEAD-MARKER\\n'; head -c 1100000 /dev/zero | tr '\\0' e; printf '\\nERR-TAIL-MARKER\\n'; } >&2";

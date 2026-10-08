@@ -1143,6 +1143,12 @@ mod tests {
 
     #[tokio::test]
     async fn client_disconnection_is_recorded_as_cancelled_with_a_reason() {
+        // Spawn-dependent (`sleep 3` through PATH via start_command) and PATH
+        // is process-global: hold the crate env lock so an env-rewriting test
+        // cannot interleave (the dr6-sweep idiom); a broken spawn fails the
+        // job before the poll can block, so the disconnect choreography loses
+        // its cancelled-request subject.
+        let _env = crate::test_serialization::lock_env();
         let root =
             std::env::temp_dir().join(format!("catdesk-cancel-http-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -1399,6 +1405,11 @@ mod tests {
     /// production one end to end.
     #[tokio::test]
     async fn deadline_timeout_is_recorded_through_real_http() {
+        // Spawn-dependent (`sleep 2` through PATH via run_command) and PATH is
+        // process-global: hold the crate env lock so an env-rewriting test
+        // cannot interleave (the dr6-sweep idiom); a broken spawn fails fast,
+        // so the 504/elapsed/deadline-stage assertions lose their subject.
+        let _env = crate::test_serialization::lock_env();
         let root =
             std::env::temp_dir().join(format!("catdesk-deadline-http-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
