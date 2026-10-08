@@ -21,8 +21,18 @@ pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 /// and flagged [`ModelPricing::estimated`].
 pub const FALLBACK_USAGE_BUCKET: &str = "unattributed";
 
+/// Registry bucket for turns attributed to GPT-6 Sol. Connectors do not report model
+/// metadata yet, so no turn lands here today; the entry prices future attribution
+/// (see [`bucket_for_model`]) at the published Sol-tier API list rate.
+pub const GPT_6_SOL_USAGE_BUCKET: &str = "model:gpt-6-sol";
+
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
+
+/// GPT-6 Sol API list price (the whole Sol tier shares this rate). Source: OpenRouter
+/// live model list fetched 2026-10-08, matching the published 50% Sol-tier price cut.
+const GPT_6_SOL_INPUT_USD_PER_1M: f64 = 2.0;
+const GPT_6_SOL_OUTPUT_USD_PER_1M: f64 = 10.0;
 
 /// Legacy history is real billed usage, not an estimate.
 const GPT_5_6_AND_EARLIER_MODEL_PRICING: ModelPricing = ModelPricing {
@@ -36,6 +46,13 @@ pub const FALLBACK_MODEL_PRICING: ModelPricing = ModelPricing {
     llm_input_usd_per_1m: GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M,
     llm_output_usd_per_1m: GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M,
     estimated: true,
+};
+
+/// Price-list entry, not a legacy-rate estimate.
+const GPT_6_SOL_MODEL_PRICING: ModelPricing = ModelPricing {
+    llm_input_usd_per_1m: GPT_6_SOL_INPUT_USD_PER_1M,
+    llm_output_usd_per_1m: GPT_6_SOL_OUTPUT_USD_PER_1M,
+    estimated: false,
 };
 
 /// Per-1M-token pricing for one usage bucket.
@@ -74,6 +91,7 @@ pub fn pricing_for_bucket(bucket: &str) -> Option<ModelPricing> {
     match bucket {
         GPT_5_6_AND_EARLIER_USAGE_BUCKET => Some(GPT_5_6_AND_EARLIER_MODEL_PRICING),
         FALLBACK_USAGE_BUCKET => Some(FALLBACK_MODEL_PRICING),
+        GPT_6_SOL_USAGE_BUCKET => Some(GPT_6_SOL_MODEL_PRICING),
         _ => None,
     }
 }
@@ -129,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn pricing_for_bucket_covers_legacy_and_fallback_only() {
+    fn pricing_for_bucket_covers_legacy_fallback_and_gpt_6_sol() {
         let legacy = pricing_for_bucket(GPT_5_6_AND_EARLIER_USAGE_BUCKET)
             .expect("legacy bucket must stay priced");
         assert_eq!(legacy.llm_input_usd_per_1m, 5.0);
@@ -145,6 +163,15 @@ mod tests {
             "fallback turns are estimated, not billed"
         );
 
+        let gpt_6_sol =
+            pricing_for_bucket(GPT_6_SOL_USAGE_BUCKET).expect("gpt-6-sol bucket must stay priced");
+        assert_eq!(gpt_6_sol.llm_input_usd_per_1m, 2.0);
+        assert_eq!(gpt_6_sol.llm_output_usd_per_1m, 10.0);
+        assert!(
+            !gpt_6_sol.estimated,
+            "gpt-6-sol is a price-list entry, not a legacy-rate estimate"
+        );
+
         assert_eq!(pricing_for_bucket("model:gpt-5.7"), None);
         assert_eq!(pricing_for_bucket(""), None);
     }
@@ -153,6 +180,11 @@ mod tests {
     fn bucket_for_model_falls_back_without_model_metadata() {
         assert_eq!(bucket_for_model(None), FALLBACK_USAGE_BUCKET);
         assert_eq!(bucket_for_model(Some("gpt-5.7")), "model:gpt-5.7");
+        assert_eq!(
+            bucket_for_model(Some("gpt-6-sol")),
+            GPT_6_SOL_USAGE_BUCKET,
+            "the registry bucket must match what bucket_for_model generates"
+        );
     }
 
     #[test]
