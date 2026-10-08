@@ -8,11 +8,14 @@ host overhead separated from server payload?
 
 ## Method and provenance
 
-- **Server revision:** `main` @ 266dd05 (worktree
-  `catdesk-ojt-10`, branch `feat/catdesk-ojt-10-harness-benchmark`); the live
-  binary's own build string confirms it: `0.9.2+g266dd05
-  feat/catdesk-ojt-10-harness-benchmark 2026-10-08` (recorded per run in the
-  server's diagnostics log).
+- **Server revision:** branch `feat/catdesk-ojt-10-harness-benchmark`. The
+  first runs measured `main` @ 266dd05 (binary build string
+  `0.9.2+g266dd05 feat/catdesk-ojt-10-harness-benchmark 2026-10-08`, recorded
+  per run in the server's diagnostics log); after rebasing onto the current
+  main — which moved the measured payload path (widget-meta attach and the
+  instruction cap) — every figure below was re-measured on the final snapshot
+  (binary `0.9.2+g8704ac2`, same branch), so the numbers match the code being
+  reviewed, per the same standard the ojt.8 report set for itself.
 - **Fixture:** the same five workflow families the ojt.9 transcript gate
   pins (src/mcp/e2e_transcript_gate.rs), byte-identical generators: (a)
   `run_command` emitting 2 × 24,000 filler lines (~1.4 MB stdout+stderr), (b)
@@ -71,32 +74,33 @@ across runs):
 
 | step | inline result B | HTTP body B | raw (externalized) B | reduction | read_result calls | wall s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| (a) run_command large | 15,191 | 15,231 | 1,397,651 | 98.9% | 11 | 0.171–0.262 |
-| (b) write ack | 2,758 | 2,798 | — | — | — | 0.004–0.034 |
-| (b) needle search | 1,366 | 1,406 | — | — | — | 0.009–0.038 |
-| (b) read big.txt | 6,175 | 6,215 | 493,988 | 98.7% | 4 | 0.003–0.007 |
-| (d) failing command | 1,424–1,426 | 1,464–1,466 | — | — | — | 0.099–0.153 |
-| (e) polling | max 1,436–1,439 / poll | — | — | — | — | 0.091–0.150 |
+| (a) run_command large | 15,199 | 15,239 | 1,397,795 | 98.9% | 11 | 0.171–0.262 |
+| (b) write ack | 2,760 | 2,800 | — | — | — | 0.004–0.034 |
+| (b) needle search | 1,368 | 1,408 | — | — | — | 0.009–0.038 |
+| (b) read big.txt | 6,181 | 6,221 | 494,131 | 98.7% | 4 | 0.003–0.007 |
+| (d) failing command | 1,424 | 1,464 | — | — | — | 0.099–0.153 |
+| (e) polling | max 1,436 / poll | — | — | — | — | 0.091–0.150 |
 
-Poll counts at `wait_ms = 0` were 87, 96 and 100 across the three runs
-(timing-dependent — every answer stayed inside the inline budget in all
-runs; per-poll bytes are stable). Sum of all poll answers: 123,571–142,048 B.
+Poll counts at `wait_ms = 0` drift with timing: 87, 96 and 100 across the
+first-snapshot runs, then 88 and 106 on the rebased snapshot (every answer
+stayed inside the inline budget in all runs; per-poll bytes are stable).
+Sum of all poll answers: 123,571–150,596 B across observed runs.
 
 Aggregates (acceptance-criteria view):
 
 | metric | value |
 | --- | ---: |
-| externalized original bytes (a + b-read) | 1,891,639 |
-| externalized inline bytes (previews) | 21,366 |
+| externalized original bytes (a + b-read) | 1,891,926 |
+| externalized inline bytes (previews) | 21,380 |
 | externalization reduction | 98.9% |
 | retrieval calls (read_result) | 15 |
-| retrieved bytes (byte-for-byte reconstructed) | 1,891,639 |
+| retrieved bytes (byte-for-byte reconstructed) | 1,891,926 |
 | fixture wall-clock total (sum of steps, 3 runs) | 0.44–0.67 s |
 
 For scale: inline tool-result bytes for the whole fixture (bounded steps +
-all poll answers) were 129,121–147,598 B depending on the poll-count drift,
-while the two externalizing results alone carried 1,891,639 B — the transcript
-paid ~0.11 per 10 for them (21,366 B) and bought the rest back on demand in
+all poll answers) were 123,571–150,596 B depending on the poll-count drift,
+while the two externalizing results alone carried 1,891,926 B — the transcript
+paid ~0.11 per 10 for them (21,380 B) and bought the rest back on demand in
 15 small calls.
 
 ### ReadOnly (`toolMode = "readOnly"`)
@@ -107,8 +111,8 @@ paid ~0.11 per 10 for them (21,366 B) and bought the rest back on demand in
 | `catdesk_instruction` — instruction text | 2,281 |
 | `catdesk_instruction` — full result | 11,081 |
 | (b) needle search result | 1,355 |
-| (b) read big.txt inline / raw | 6,166 / 493,988 (98.8%) |
-| (b) read retrieval | 4 calls, 493,988 B byte-for-byte |
+| (b) read big.txt inline / raw | 6,174 / 494,131 (98.8%) |
+| (b) read retrieval | 4 calls, 494,131 B byte-for-byte |
 | fixture wall-clock total | 0.028 s |
 
 Not applicable by construction (server answers `isError` "Tool run_command
@@ -217,7 +221,7 @@ upper bound on what ChatGPT could place before the model.
 | Server schema payload (native, MultiTools) | 25,348 B ≈ 6,337 tok / tools/list | this benchmark, HTTP |
 | Server schema payload (ReadOnly) | 12,581 B ≈ 3,145 tok | this benchmark, HTTP |
 | Server instruction (paid once) | 3,451 B (MultiTools) / 2,281 B (ReadOnly) | this benchmark, HTTP |
-| Server tool results, whole fixture | 21,366 B inline for 1,891,639 B raw (98.9% externalized) | this benchmark, HTTP |
+| Server tool results, whole fixture | 21,380 B inline for 1,891,926 B raw (98.9% externalized) | this benchmark, HTTP |
 | Codex schema presentation | 13,280 tokens (TS declarations) vs 6,337 tokens JSON ≈ 2.1× | Codex transcript |
 | Codex result transport | strips `responseBudget`/`_meta`; truncates outputs (41,520 B listing cap) | Codex transcript |
 | Codex session total | 195,732 input tok (166,912 cached), 686 out, 36 s | Codex usage |
@@ -270,7 +274,8 @@ upper bound on what ChatGPT could place before the model.
 
 ## Verification on this branch
 
-- `cargo test -j 8`: 635 passed, 0 failed (one first-run failure of
+- `cargo test -j 8`: 653 passed, 0 failed on the rebased snapshot (an
+  earlier first-run failure of
   `mcp::tests::read_result_max_range_token_estimate_stays_bounded` re-ran
   green solo and on a second full-suite pass — the known flake family,
   catdesk-d94).
