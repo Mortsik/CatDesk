@@ -530,31 +530,54 @@ pub(crate) fn load_archived_binagotchy_cards() -> std::io::Result<Vec<ArchivedBi
     load_archived_binagotchy_cards_from(&catdesk_binagotchy_root()?)
 }
 
+/// Archived-card metadata is a small TOML file CatDesk itself wrote; a larger
+/// file (or a huge `seed` string inside it) is never trusted. The metadata is
+/// read with a sentinel bound and every field that rides the response
+/// verbatim is length-checked, so a tampered archive cannot push an
+/// unbounded payload through the card feed (the shared response budget
+/// fails open above its entry cap, which would inline it).
+const MAX_ARCHIVED_CARD_METADATA_BYTES: u64 = 8 * 1024;
+/// `seed_hex` writes 16 hex characters; the slack tolerates any sane variant.
+const MAX_ARCHIVED_CARD_SEED_BYTES: usize = 64;
+
 pub(crate) fn load_archived_binagotchy_cards_from(
     root: &Path,
 ) -> std::io::Result<Vec<ArchivedBinagotchyCard>> {
-    let mut entries: Vec<PathBuf> = match fs::read_dir(root) {
-        Ok(dir) => dir
-            .map(|entry| entry.map(|value| value.path()))
-            .collect::<Result<Vec<_>, _>>()?,
+    let dir = match fs::read_dir(root) {
+        Ok(dir) => dir,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(e),
+    };
+    // Keep only the newest MAX_ARCHIVED_CARDS folders as the scan goes,
+    // never materializing the whole directory: an arbitrarily large archive
+    // costs the same bounded work before any payload cap applies.
+    let mut newest: Vec<PathBuf> = Vec::with_capacity(MAX_ARCHIVED_CARDS + 1);
+    for entry in dir {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        newest.push(path);
+        if newest.len() > MAX_ARCHIVED_CARDS {
+            newest.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+            newest.truncate(MAX_ARCHIVED_CARDS);
+        }
     }
-    .into_iter()
-    .filter(|path| path.is_dir())
-    .collect();
-    entries.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+    newest.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
 
-    Ok(entries
+    Ok(newest
         .into_iter()
         // Newest first (sorted above), so the cap keeps the freshest cards.
-        .take(MAX_ARCHIVED_CARDS)
         .filter_map(|entry| {
             let folder = entry
                 .file_name()
                 .map(|value| value.to_string_lossy().to_string())?;
-            let metadata_text = fs::read_to_string(entry.join(METADATA_FILE_NAME)).ok()?;
+            let metadata_text = read_bounded_metadata(&entry.join(METADATA_FILE_NAME))?;
             let metadata: StoredMascotMetadata = toml::from_str(&metadata_text).ok()?;
+            if metadata.seed.trim().is_empty() || metadata.seed.len() > MAX_ARCHIVED_CARD_SEED_BYTES
+            {
+                return None;
+            }
             let bytes = read_bounded_card(
                 &entry.join(CHARACTER_PNG_FILE_NAME),
                 MAX_ARCHIVED_CARD_BYTES,
@@ -569,6 +592,20 @@ pub(crate) fn load_archived_binagotchy_cards_from(
             })
         })
         .collect())
+}
+
+/// Bounded metadata read: at most `MAX_ARCHIVED_CARD_METADATA_BYTES` (plus
+/// one sentinel byte) ever reaches memory; anything larger classifies the
+/// card as oversized and it is skipped.
+fn read_bounded_metadata(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let file = File::open(path).ok()?;
+    let mut text = String::new();
+    let read_len = file
+        .take(MAX_ARCHIVED_CARD_METADATA_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    (read_len as u64 <= MAX_ARCHIVED_CARD_METADATA_BYTES).then_some(text)
 }
 
 /// Bounded card read: the file is opened exactly once and at most `limit`
@@ -1777,6 +1814,102 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&card_path);
+    }
+
+    fn card_metadata_toml(seed: &str) -> String {
+        format!(
+            "seed = \"{seed}\"\ncreated_at = \"20260101T000000000Z\"\n\
+             generator_version = \"0.1.0\"\nframe_ms = 50\nspirit = false\n\n\
+             [traits]\nfur = \"black\"\neyes = \"green\"\nheadwear = \"none\"\nspecial = \"none\"\n"
+        )
+    }
+
+    #[test]
+    fn oversized_metadata_and_overlong_seeds_never_reach_the_card_feed() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let archive_root = std::env::temp_dir().join(format!("catdesk-binagotchy-meta-{unique}"));
+
+        // An oversized metadata.toml must be skipped by its sentinel read,
+        // never fully loaded into memory.
+        write_test_card(&archive_root, "card-02", 2, b"png");
+        std::fs::write(
+            archive_root.join("card-02").join(super::METADATA_FILE_NAME),
+            card_metadata_toml(&"x".repeat(5 * 1024 * 1024)),
+        )
+        .expect("write oversized metadata");
+
+        // A small TOML with an overlong seed must be skipped too: the seed
+        // rides the response verbatim, so it is length-checked.
+        let long_seed_dir = archive_root.join("card-01");
+        std::fs::create_dir_all(&long_seed_dir).expect("create long-seed dir");
+        std::fs::write(
+            long_seed_dir.join(super::METADATA_FILE_NAME),
+            card_metadata_toml(&"s".repeat(200)),
+        )
+        .expect("write long-seed metadata");
+        std::fs::write(long_seed_dir.join(super::CHARACTER_PNG_FILE_NAME), b"png").unwrap();
+
+        // One healthy card survives.
+        write_test_card(&archive_root, "card-00", 0, b"png");
+
+        let cards = super::load_archived_binagotchy_cards_from(&archive_root).expect("load cards");
+
+        let folders = cards
+            .iter()
+            .map(|card| card.folder.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(folders, ["card-00"]);
+        assert!(
+            cards[0].seed.len() <= super::MAX_ARCHIVED_CARD_SEED_BYTES,
+            "no field emitted to the feed may exceed its bound"
+        );
+
+        let _ = std::fs::remove_dir_all(&archive_root);
+    }
+
+    #[test]
+    fn card_feed_scan_stays_bounded_on_large_archives() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let archive_root = std::env::temp_dir().join(format!("catdesk-binagotchy-scan-{unique}"));
+        for index in 0..1_000_u32 {
+            write_test_card(
+                &archive_root,
+                &format!("card-{index:04}"),
+                index as u64,
+                b"png",
+            );
+        }
+        // Non-directory entries never join the scan.
+        std::fs::write(archive_root.join("stray-notes.txt"), b"stray").unwrap();
+
+        let cards = super::load_archived_binagotchy_cards_from(&archive_root).expect("load cards");
+
+        assert_eq!(cards.len(), super::MAX_ARCHIVED_CARDS);
+        let folders = cards
+            .iter()
+            .map(|card| card.folder.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            folders,
+            [
+                "card-0999",
+                "card-0998",
+                "card-0997",
+                "card-0996",
+                "card-0995",
+                "card-0994",
+                "card-0993",
+                "card-0992"
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&archive_root);
     }
 }
 
