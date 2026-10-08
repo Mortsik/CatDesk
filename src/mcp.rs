@@ -492,6 +492,9 @@ async fn handle_tools_call_with_result_store(
     }
 
     let mut budget_outcome: Option<response_budget::BudgetOutcome> = None;
+    // Serialized size before the lossy entry-cap reduction, if one happened:
+    // telemetry must keep reporting the full result as raw.
+    let mut entry_cap_raw_bytes: Option<u64> = None;
     if !exempt_from_response_budget(&tool_name)
         && let Some(result) = response.result.as_mut()
     {
@@ -518,6 +521,7 @@ async fn handle_tools_call_with_result_store(
                     original_bytes: serde_json::to_vec(result)
                         .map_or(0, |bytes| bytes.len() as u64),
                 };
+                entry_cap_raw_bytes = Some(reduction.original_bytes);
                 reduce_result_to_entry_cap(result, result_store.max_entry_bytes());
                 match response_budget::apply_response_budget(
                     result,
@@ -585,10 +589,8 @@ async fn handle_tools_call_with_result_store(
         .as_ref()
         .and_then(|result| serde_json::to_vec(result).ok())
         .map_or(0, |bytes| bytes.len() as u64);
-    let (raw_bytes, externalized_bytes) = match budget_outcome {
-        Some(outcome) => (outcome.raw_bytes, outcome.externalized_bytes),
-        None => (inline_bytes, 0),
-    };
+    let (raw_bytes, externalized_bytes) =
+        resolve_raw_and_externalized_bytes(budget_outcome, entry_cap_raw_bytes, inline_bytes);
     tool_result_metrics::observe(
         Some(&tool_name),
         tool_result_metrics::ToolResultMeasurement {
@@ -610,6 +612,24 @@ fn read_only_blocked_response(req: &JsonRpcRequest, tool_name: &str) -> JsonRpcR
 }
 
 // ── Entry-cap reduction (finding F2) ─────────────────────────
+
+/// Resolve telemetry raw/externalized bytes for one tool result. Raw is the
+/// largest form the result ever had: the pre-reduction size for an
+/// entry-cap-reduced result (the externalized retry stores only the reduced
+/// payload, and an unreduced retry that stays inline drops bytes in-band, so
+/// it classifies as compacted rather than small), the stored payload for a
+/// lossless externalization, or the inline size when nothing trimmed it.
+fn resolve_raw_and_externalized_bytes(
+    budget_outcome: Option<response_budget::BudgetOutcome>,
+    entry_cap_raw_bytes: Option<u64>,
+    inline_bytes: u64,
+) -> (u64, u64) {
+    let (raw_bytes, externalized_bytes) = match budget_outcome {
+        Some(outcome) => (outcome.raw_bytes, outcome.externalized_bytes),
+        None => (inline_bytes, 0),
+    };
+    (entry_cap_raw_bytes.unwrap_or(raw_bytes), externalized_bytes)
+}
 
 /// Smallest string worth a trim pass; below this the truncation marker costs
 /// more than the pass saves.

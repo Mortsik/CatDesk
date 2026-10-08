@@ -6636,6 +6636,180 @@ async fn sub_budget_entry_cap_reduction_discloses_loss_inline_without_a_manifest
     std::fs::remove_dir_all(workspace_root).ok();
 }
 
+#[test]
+fn entry_cap_telemetry_reports_the_full_pre_reduction_result_as_raw() {
+    use crate::tool_result_metrics::{ResponseClass, ToolResultMeasurement};
+
+    // Externalized retry: raw is the pre-reduction size, externalized the
+    // stored reduced payload.
+    let outcome = response_budget::BudgetOutcome {
+        output_ref: "lr_reduced".to_string(),
+        raw_bytes: 70_000,
+        externalized_bytes: 70_000,
+    };
+    let (raw, externalized) =
+        super::resolve_raw_and_externalized_bytes(Some(outcome), Some(126_500), 6_400);
+    assert_eq!((raw, externalized), (126_500, 70_000));
+    let class = ToolResultMeasurement {
+        raw_bytes: raw,
+        inline_bytes: 6_400,
+        externalized_bytes: externalized,
+        is_error: false,
+    }
+    .classify();
+    assert_eq!(class, ResponseClass::Externalized);
+
+    // Inline retry below the budget: nothing is stored and bytes were
+    // dropped in-band, so the record must classify as compacted, not small.
+    let (raw, externalized) =
+        super::resolve_raw_and_externalized_bytes(None, Some(126_500), 63_500);
+    assert_eq!((raw, externalized), (126_500, 0));
+    let class = ToolResultMeasurement {
+        raw_bytes: raw,
+        inline_bytes: 63_500,
+        externalized_bytes: externalized,
+        is_error: false,
+    }
+    .classify();
+    assert_eq!(class, ResponseClass::Compacted);
+
+    // Untouched result: raw equals inline and the record stays small.
+    let (raw, externalized) = super::resolve_raw_and_externalized_bytes(None, None, 1_000);
+    assert_eq!((raw, externalized), (1_000, 0));
+    let class = ToolResultMeasurement {
+        raw_bytes: raw,
+        inline_bytes: 1_000,
+        externalized_bytes: externalized,
+        is_error: false,
+    }
+    .classify();
+    assert_eq!(class, ResponseClass::Small);
+}
+
+/// Both entry-cap reduction paths must keep reporting the full pre-reduction
+/// result as raw bytes: the externalized retry stores only the reduced
+/// payload, and the sub-budget retry sends it inline — classified compacted,
+/// never small.
+#[cfg(unix)]
+#[tokio::test]
+async fn entry_cap_telemetry_counts_the_pre_reduction_size_as_raw() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-entry-cap-metrics-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    // Cap above the inline budget: one payload lands between the two after
+    // one halving (externalized retry), the other below the inline budget
+    // (inline retry).
+    let store = LargeResultStore::new(LargeResultStoreConfig {
+        ttl: std::time::Duration::from_secs(3600),
+        max_entry_bytes: 120 * 1024,
+        max_total_bytes: 1024 * 1024,
+        max_range_bytes: 128 * 1024,
+        max_search_matches: 100,
+        search_chunk_bytes: 64 * 1024,
+        tombstone_limit: 1024,
+    })
+    .expect("create capped store");
+    let before = tool_result_metrics::snapshot();
+
+    let externalized_response = handle_tools_call_with_result_store(
+        &tool_call_request(
+            "run_command",
+            json!({
+                "command": concat!(
+                    "printf 'HEAD-OUT-SENTINEL\\n'; ",
+                    "head -c 140000 /dev/zero | tr '\\0' 'x'; ",
+                    "printf '\\nTAIL-OUT-SENTINEL\\n'"
+                )
+            }),
+        ),
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+    let externalized_inline = externalized_response
+        .result
+        .as_ref()
+        .expect("missing result");
+    let pre_externalized = externalized_inline
+        .pointer("/responseBudget/entryCapOriginalBytes")
+        .and_then(Value::as_u64)
+        .expect("externalized retry must disclose the pre-reduction size");
+    let stored_reduced = externalized_inline
+        .pointer("/responseBudget/originalBytes")
+        .and_then(Value::as_u64)
+        .expect("externalized retry must report the stored payload size");
+
+    let inline_response = handle_tools_call_with_result_store(
+        &tool_call_request(
+            "run_command",
+            json!({
+                "command": concat!(
+                    "printf 'HEAD-OUT-SENTINEL\\n'; ",
+                    "head -c 126000 /dev/zero | tr '\\0' 'x'; ",
+                    "printf '\\nTAIL-OUT-SENTINEL\\n'"
+                )
+            }),
+        ),
+        &workspace_root_str,
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        &store,
+        Some("session-a"),
+        None,
+    )
+    .await;
+    let inline_result = inline_response.result.as_ref().expect("missing result");
+    let pre_inline = inline_result
+        .get("entryCapOriginalBytes")
+        .and_then(Value::as_u64)
+        .expect("inline retry must disclose the pre-reduction size");
+
+    // The registry is process-global and parallel tests observe their own
+    // calls too, so only this test's contribution (>=) is asserted; the
+    // per-class resolution itself is covered by the unit test above.
+    let after = tool_result_metrics::snapshot();
+    let slot = perf_metrics::tool_index(Some("run_command"));
+    let delta = tool_result_metrics::totals_delta(&before[slot], &after[slot]);
+    assert!(
+        delta.raw_bytes >= pre_externalized + pre_inline,
+        "raw totals must count both pre-reduction sizes, saw {} < {} + {}",
+        delta.raw_bytes,
+        pre_externalized,
+        pre_inline
+    );
+    assert!(
+        delta.externalized_bytes >= stored_reduced,
+        "externalized totals must count the stored reduced payload, saw {} < {}",
+        delta.externalized_bytes,
+        stored_reduced
+    );
+    assert!(
+        delta.externalized_count >= 1,
+        "the externalized retry must land in the externalized class"
+    );
+    assert!(
+        delta.compacted_count >= 1,
+        "the inline retry must classify as compacted, not small"
+    );
+
+    std::fs::remove_dir_all(workspace_root).ok();
+}
+
 #[tokio::test]
 async fn byte_accounting_reports_externalized_results_from_the_budget_policy() {
     let workspace_root =
