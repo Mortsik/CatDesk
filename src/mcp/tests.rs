@@ -5805,7 +5805,7 @@ fn read_file_missing_path_emits_widget_payload_error_panel() {
 #[test]
 fn widget_resource_uri_includes_revision_for_cache_busting() {
     let uri = current_widget_resource_uri_for_tool("catdesk_instruction");
-    assert!(uri.contains("widgetRevision=6"));
+    assert!(uri.contains("widgetRevision=7"));
     assert!(uri.contains("toolName=catdesk_instruction"));
 }
 

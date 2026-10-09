@@ -587,11 +587,45 @@ pub(crate) fn load_archived_binagotchy_cards_from(
                 seed: metadata.seed,
                 image: format!(
                     "data:image/png;base64,{}",
-                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                    base64::engine::general_purpose::STANDARD
+                        .encode(compact_widget_card_png(bytes))
                 ),
             })
         })
         .collect())
+}
+
+/// Re-encode archived PNGs losslessly for transport inside the MCP widget
+/// metadata. The stored 512px image remains untouched for downloads. The
+/// dimension guard avoids decoding oversized/tampered archives in this path.
+fn compact_widget_card_png(bytes: Vec<u8>) -> Vec<u8> {
+    use image::{
+        ImageEncoder,
+        codecs::png::{CompressionType, FilterType, PngEncoder},
+    };
+
+    let dimensions =
+        image::ImageReader::with_format(Cursor::new(bytes.as_slice()), ImageFormat::Png)
+            .into_dimensions();
+    let Ok((width, height)) = dimensions else {
+        return bytes;
+    };
+    if width == 0 || height == 0 || width > ARCHIVE_OUTPUT_SIZE || height > ARCHIVE_OUTPUT_SIZE {
+        return bytes;
+    }
+    let Ok(decoded) = image::load_from_memory_with_format(&bytes, ImageFormat::Png) else {
+        return bytes;
+    };
+    let rgba = decoded.to_rgba8();
+    let mut output = Vec::new();
+    let encoded =
+        PngEncoder::new_with_quality(&mut output, CompressionType::Best, FilterType::Adaptive)
+            .write_image(rgba.as_raw(), width, height, image::ColorType::Rgba8.into());
+    if encoded.is_ok() && output.len() < bytes.len() {
+        output
+    } else {
+        bytes
+    }
 }
 
 /// Bounded metadata read: at most `MAX_ARCHIVED_CARD_METADATA_BYTES` (plus
@@ -1714,6 +1748,65 @@ mod tests {
         .expect("write metadata");
         std::fs::write(card_dir.join(super::CHARACTER_PNG_FILE_NAME), png_bytes)
             .expect("write character png");
+    }
+
+    #[test]
+    fn archived_card_feed_losslessly_compacts_pngs_for_the_widget_budget() {
+        use base64::Engine as _;
+        use image::{
+            ColorType, ImageEncoder, Rgba, RgbaImage,
+            codecs::png::{CompressionType, FilterType, PngEncoder},
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "catdesk-binagotchy-png-budget-{}",
+            std::process::id()
+        ));
+        let original_image = RgbaImage::from_fn(512, 512, |x, y| {
+            let x = x / 16;
+            let y = y / 16;
+            Rgba([
+                ((x * 73 + y * 19) % 256) as u8,
+                ((x * 13 + y * 91) % 256) as u8,
+                ((x * 31 + y * 17) % 256) as u8,
+                255,
+            ])
+        });
+        let mut unoptimized_png = Vec::new();
+        PngEncoder::new_with_quality(
+            &mut unoptimized_png,
+            CompressionType::Default,
+            FilterType::NoFilter,
+        )
+        .write_image(original_image.as_raw(), 512, 512, ColorType::Rgba8.into())
+        .expect("encode test avatar");
+        assert!(
+            unoptimized_png.len() <= super::MAX_ARCHIVED_CARD_BYTES as usize,
+            "test fixture exceeds the archived-card read cap: {}",
+            unoptimized_png.len()
+        );
+        for i in 0..super::MAX_ARCHIVED_CARDS {
+            write_test_card(&root, &format!("card-{i:02}"), i as u64, &unoptimized_png);
+        }
+
+        let cards = super::load_archived_binagotchy_cards_from(&root).expect("load cards");
+        assert_eq!(cards.len(), super::MAX_ARCHIVED_CARDS);
+        let mut encoded_bytes = 0;
+        for card in cards {
+            let encoded = card.image.strip_prefix("data:image/png;base64,").unwrap();
+            encoded_bytes += encoded.len();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .expect("decode widget card");
+            let image = image::load_from_memory(&decoded).expect("PNG must remain valid");
+            assert_eq!(image.to_rgba8(), original_image, "PNG must stay lossless");
+            assert!(decoded.len() * 4 < unoptimized_png.len() * 3);
+        }
+        assert!(
+            encoded_bytes < 48 * 1024,
+            "all eight widget cards must fit comfortably in the 64 KiB budget: {encoded_bytes}"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
