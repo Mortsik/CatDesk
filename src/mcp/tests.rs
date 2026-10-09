@@ -4227,6 +4227,57 @@ async fn read_tool_line_range_returns_only_requested_lines() {
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
+/// A file whose last line has no trailing newline: the range still resolves,
+/// and the returned last line carries no newline it never had.
+#[tokio::test]
+async fn read_tool_line_range_serves_an_unterminated_last_line() {
+    let workspace_root = read_workspace("line-range-unterminated");
+    std::fs::write(workspace_root.join("notes.txt"), "first\nsecond\nlast").expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([{ "path": "notes.txt", "start_line": 2 }]),
+    )
+    .await;
+
+    let entry = &structured["files"][0];
+    assert_eq!(entry["text"].as_str(), Some("second\nlast"));
+    assert_eq!(entry["truncated"].as_bool(), Some(false));
+    assert_eq!(entry["startLine"].as_u64(), Some(2));
+    assert_eq!(entry["endLine"].as_u64(), Some(3));
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+/// The same file under two different ranges is two distinct reads; the same
+/// request twice is one.
+#[tokio::test]
+async fn read_tool_range_dedup_keys_on_the_requested_range() {
+    let workspace_root = read_workspace("line-range-dedup");
+    std::fs::write(workspace_root.join("notes.txt"), "1\n2\n3\n4\n5\n").expect("write file");
+
+    let structured = read_batch(
+        &workspace_root,
+        json!([
+            { "path": "notes.txt", "start_line": 1, "end_line": 2 },
+            { "path": "notes.txt", "start_line": 4 },
+            { "path": "notes.txt", "start_line": 1, "end_line": 2 }
+        ]),
+    )
+    .await;
+
+    let files = structured["files"].as_array().expect("files array");
+    assert_eq!(
+        files.len(),
+        2,
+        "an exact repeat is deduplicated: {structured}"
+    );
+    assert_eq!(files[0]["text"].as_str(), Some("1\n2\n"));
+    assert_eq!(files[1]["text"].as_str(), Some("4\n5\n"));
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
 #[tokio::test]
 async fn read_tool_line_range_start_only_reads_to_end_of_file() {
     let workspace_root = read_workspace("line-range-start-only");
@@ -6825,6 +6876,61 @@ async fn shared_tools_call_boundary_externalizes_oversized_result_losslessly() {
     );
 
     std::fs::remove_dir_all(workspace_root).ok();
+}
+
+/// The structuredContent hint only helps a harness that projects results
+/// through outputSchema if the schema declares the fields: pin their
+/// presence on budgetable tools and their absence on the budget-exempt
+/// store-range tools and the multimodal read_image.
+#[tokio::test]
+async fn retrieval_hint_fields_are_declared_in_budgetable_output_schemas() {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!("req-tools-list")),
+        method: "tools/list".into(),
+        params: json!({}),
+    };
+    let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+    let tools = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("tools"))
+        .and_then(Value::as_array)
+        .expect("missing tools");
+
+    for name in [
+        "read",
+        "search",
+        "run_command",
+        "start_command",
+        "poll_command",
+        "cancel_command",
+        "catdesk_instruction",
+    ] {
+        let schema = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|tool| tool.get("outputSchema"))
+            .unwrap_or_else(|| panic!("missing outputSchema for {name}"));
+        for field in ["outputRef", "outputBytes", "outputTruncated"] {
+            assert!(
+                schema["properties"].get(field).is_some(),
+                "{name} must declare {field} so the hint survives outputSchema projection"
+            );
+        }
+    }
+    for name in ["read_result", "search_result", "read_image"] {
+        let schema = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|tool| tool.get("outputSchema"));
+        if let Some(schema) = schema {
+            assert!(
+                schema["properties"].get("outputRef").is_none(),
+                "{name} is budget-exempt and must not declare outputRef"
+            );
+        }
+    }
 }
 
 /// Hosts that keep only `structuredContent` (ChatGPT projects through the
