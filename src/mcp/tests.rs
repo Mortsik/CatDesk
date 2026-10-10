@@ -5805,7 +5805,8 @@ fn read_file_missing_path_emits_widget_payload_error_panel() {
 #[test]
 fn widget_resource_uri_includes_revision_for_cache_busting() {
     let uri = current_widget_resource_uri_for_tool("catdesk_instruction");
-    assert!(uri.contains("widgetRevision=7"));
+    assert!(uri.contains("widgetRevision=8"));
+    assert!(uri.contains("cardsRev="));
     assert!(uri.contains("toolName=catdesk_instruction"));
 }
 
@@ -6065,10 +6066,9 @@ fn catdesk_instruction_puts_binagotchy_cards_in_meta_only() {
         1,
         Mode::Both,
         ToolMode::MultiTools,
-        vec![mascot::ArchivedBinagotchyCard {
+        vec![mascot::ArchivedBinagotchyCardSummary {
             folder: "20260403T010203000Z_deadbeef".to_string(),
             seed: "deadbeef".to_string(),
-            image: "data:image/png;base64,AA==".to_string(),
         }],
     )
     .expect("widget payload");
@@ -9372,6 +9372,391 @@ async fn agents_layers_under_the_cap_pass_through_verbatim() {
         "no disclosure without a cut"
     );
     let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+// ── catdesk-2jk: instruction stays inline, cards ride the resource ──────────
+
+/// Serializes the archive-fixture tests: they populate the shared test home's
+/// `.catdesk/binagotchy/` directory, so they must not observe each other's
+/// half-written fixtures.
+static ARCHIVE_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn fixture_card_folder(seed: u64) -> String {
+    // Lexically after every real timestamp-prefixed archive folder, so the
+    // fixture cards always win the newest-first cap.
+    format!("9999fixture-{seed:02}")
+}
+
+fn fake_home_archive_root() -> PathBuf {
+    crate::state::user_home_dir()
+        .expect("test home")
+        .join(".catdesk")
+        .join("binagotchy")
+}
+
+fn write_archive_fixture_card(seed: u64, png: &[u8]) {
+    let dir = fake_home_archive_root().join(fixture_card_folder(seed));
+    std::fs::create_dir_all(&dir).expect("create fixture card dir");
+    std::fs::write(
+        dir.join("metadata.toml"),
+        format!(
+            "seed = \"{seed:016x}\"\ncreated_at = \"20260101T000000000Z\"\n\
+             generator_version = \"0.1.0\"\nframe_ms = 50\nspirit = false\n\n\
+             [traits]\nfur = \"black\"\neyes = \"green\"\nheadwear = \"none\"\nspecial = \"none\"\n"
+        ),
+    )
+    .expect("write fixture metadata");
+    std::fs::write(dir.join("character.png"), png).expect("write fixture png");
+}
+
+fn remove_archive_fixture() {
+    let root = fake_home_archive_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("9999fixture-") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Representative uncompressible 48×48 archived PNG: eight encoded images
+/// exceed the 64 KiB inline tool-result budget, reproducing the P0 payload
+/// shape without depending on a developer's local archive.
+fn representative_archive_png_bytes(seed: u64) -> Vec<u8> {
+    use image::{
+        ColorType, ImageEncoder, Rgba, RgbaImage,
+        codecs::png::{CompressionType, FilterType, PngEncoder},
+    };
+    let image = RgbaImage::from_fn(48, 48, |x, y| {
+        let mut value = (y * 48 + x) ^ seed as u32;
+        value = value.wrapping_mul(0x45d9f3b).wrapping_add(0x27100001);
+        value ^= value >> 16;
+        value = value.wrapping_mul(0x45d9f3b);
+        value ^= value >> 16;
+        Rgba([value as u8, (value >> 8) as u8, (value >> 16) as u8, 255])
+    });
+    let mut bytes = Vec::new();
+    PngEncoder::new_with_quality(&mut bytes, CompressionType::Default, FilterType::NoFilter)
+        .write_image(image.as_raw(), 48, 48, ColorType::Rgba8.into())
+        .expect("encode fixture png");
+    bytes
+}
+
+/// Acceptance A (catdesk-2jk): with the real archive shape — eight cards that
+/// together dwarf the instruction — the serialized `catdesk_instruction`
+/// result must stay within the inline budget, carry 100 % of the
+/// `instructionText` byte for byte, and never point the model at a
+/// `read_result` follow-up. Card identity rides the widget payload; card
+/// imagery rides the widget resource instead of this result.
+#[tokio::test]
+async fn catdesk_instruction_with_realistic_archive_stays_fully_inline() {
+    let _guard = ARCHIVE_FIXTURE_LOCK.lock().unwrap();
+    remove_archive_fixture();
+    for seed in 0..8_u64 {
+        let png = representative_archive_png_bytes(seed);
+        write_archive_fixture_card(seed, &png);
+    }
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-2jk-inline-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    // The builder's real AGENTS-layer bound allows an 8 KiB layer; with the
+    // base instruction this pushes instructionText beyond the response
+    // budget's diagnostic preview and reproduces actual guidance loss.
+    let agents_text = "MANDATORY-ARCHIVE-RULE-".repeat(700);
+    std::fs::write(workspace_root.join("AGENTS.md"), &agents_text)
+        .expect("write workspace AGENTS.md");
+    let req = tool_call_request("catdesk_instruction", json!({}));
+
+    let response_started = std::time::Instant::now();
+    let response = handle_tools_call_with_session(
+        &req,
+        &workspace_root.to_string_lossy(),
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Expanded,
+        None,
+        None,
+    )
+    .await;
+    let response_elapsed = response_started.elapsed();
+
+    let result = response.result.expect("instruction result");
+    let serialized = serde_json::to_vec(&result).expect("serialize result");
+    assert!(
+        serialized.len() <= crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "the instruction result with archived cards must stay fully inline; got {} bytes",
+        serialized.len()
+    );
+    assert!(
+        result.get("responseBudget").is_none(),
+        "the instruction must never be externalized behind read_result"
+    );
+    let expected_text = catdesk_instruction_text_for_project(
+        &workspace_root.to_string_lossy(),
+        Mode::Both,
+        ToolMode::MultiTools,
+        None,
+    )
+    .expect("expected instruction text");
+    let instruction_text = result
+        .pointer("/structuredContent/instructionText")
+        .and_then(Value::as_str)
+        .expect("instruction text");
+    assert_eq!(
+        instruction_text, expected_text,
+        "100 % of the instruction text must ride the structured response"
+    );
+    assert!(
+        result.pointer("/structuredContent/outputRef").is_none(),
+        "no retrieval follow-up may be required"
+    );
+
+    let cards = result
+        .pointer("/_meta/catdesk~1widgetPayload/binagotchyCards")
+        .and_then(Value::as_array)
+        .expect("widget payload cards");
+    assert_eq!(cards.len(), 8, "every archived card keeps its identity");
+    for card in cards {
+        assert!(card.get("folder").and_then(Value::as_str).is_some());
+        assert!(card.get("seed").and_then(Value::as_str).is_some());
+        assert!(
+            card.get("image").is_none(),
+            "card imagery must not ride the tool result: {card}"
+        );
+    }
+
+    // Reconstruct the pre-change result by putting the same losslessly
+    // compacted archive images back into `_meta`. This pins the actual
+    // before/after payload and token impact against the 64 KiB gate rather
+    // than relying only on the historical 100,267 B report.
+    let full_cards = mascot::load_archived_binagotchy_cards_from(&fake_home_archive_root())
+        .expect("load full fixture cards");
+    assert_eq!(full_cards.len(), 8);
+    let mut legacy_result = result.clone();
+    let legacy_cards = legacy_result
+        .pointer_mut("/_meta/catdesk~1widgetPayload/binagotchyCards")
+        .and_then(Value::as_array_mut)
+        .expect("legacy cards");
+    for card in legacy_cards {
+        let folder = card.get("folder").and_then(Value::as_str).expect("folder");
+        let image = full_cards
+            .iter()
+            .find(|archived| archived.folder == folder)
+            .map(|archived| archived.image.as_str())
+            .expect("archived image");
+        card.as_object_mut()
+            .expect("card object")
+            .insert("image".to_string(), json!(image));
+    }
+    let legacy_bytes = serde_json::to_vec(&legacy_result).expect("serialize legacy result");
+    assert!(
+        legacy_bytes.len() > crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "the archived PNG fixture must reproduce the oversized legacy result: {} bytes",
+        legacy_bytes.len()
+    );
+    let legacy_preview =
+        crate::mcp::response_budget::prepare_response_budget(&legacy_result, false)
+            .expect("legacy response should be externalized")
+            .finish("lr_catdesk_2jk_fixture");
+    let legacy_instruction_bytes = legacy_preview
+        .pointer("/structuredContent/instructionText")
+        .and_then(Value::as_str)
+        .expect("legacy instruction preview")
+        .len();
+    assert!(
+        legacy_instruction_bytes < expected_text.len(),
+        "the legacy budget preview must reproduce instruction loss"
+    );
+    assert!(
+        legacy_preview
+            .pointer("/structuredContent/outputRef")
+            .and_then(Value::as_str)
+            .is_some(),
+        "the legacy preview must require read_result to retrieve the omitted instruction"
+    );
+    let legacy_instruction = legacy_preview
+        .pointer("/structuredContent/instructionText")
+        .and_then(Value::as_str)
+        .expect("legacy instruction preview");
+    let before_tokens = super::token_usage::estimate_tokens_o200k(legacy_instruction);
+    let after_tokens = super::token_usage::estimate_tokens_o200k(instruction_text);
+
+    let disabled_started = std::time::Instant::now();
+    let disabled_response = handle_tools_call_with_session(
+        &req,
+        &workspace_root.to_string_lossy(),
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Disable,
+        None,
+        None,
+    )
+    .await;
+    let disabled_elapsed = disabled_started.elapsed();
+    let disabled_result = disabled_response
+        .result
+        .expect("disabled instruction result");
+    assert_eq!(
+        disabled_result
+            .pointer("/structuredContent/instructionText")
+            .and_then(Value::as_str),
+        Some(expected_text.as_str()),
+        "ShowDetailMode::Disable must still deliver full instructionText"
+    );
+    assert!(
+        disabled_result
+            .get("_meta")
+            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+            .is_none(),
+        "ShowDetailMode::Disable must not attach the card widget payload"
+    );
+
+    let schema_req = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!("catdesk-2jk-schema")),
+        method: "tools/list".into(),
+        params: json!({}),
+    };
+    let schema_response =
+        handle_tools_list(&schema_req, Mode::Both, ToolMode::MultiTools, &None).await;
+    let instruction_schema = schema_response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("tools"))
+        .and_then(Value::as_array)
+        .and_then(|tools| {
+            tools.iter().find(|tool| {
+                tool.get("name").and_then(Value::as_str) == Some("catdesk_instruction")
+            })
+        })
+        .and_then(|tool| tool.get("outputSchema"))
+        .expect("catdesk_instruction outputSchema");
+    assert_eq!(
+        instruction_schema
+            .pointer("/properties/instructionText/type")
+            .and_then(Value::as_str),
+        Some("string"),
+        "ChatGPT outputSchema projection must expose instructionText"
+    );
+    assert_eq!(
+        result
+            .pointer("/structuredContent/instructionText")
+            .and_then(Value::as_str),
+        Some(expected_text.as_str()),
+        "the projected structuredContent includes the complete instructionText"
+    );
+
+    eprintln!(
+        "catdesk-2jk fixture: legacy={} B (instruction={} B, ~{} text tokens, read_result follow-up required); after={} B (instruction={} B, ~{} text tokens); handler expanded={} ms, disabled={} ms; test calls=2 catdesk_instruction + 1 tools/list; separate existing resources/read path verified; legacy needs +1 read_result, fixed needs +0; cards=8",
+        legacy_bytes.len(),
+        legacy_instruction_bytes,
+        before_tokens,
+        serialized.len(),
+        instruction_text.len(),
+        after_tokens,
+        response_elapsed.as_millis(),
+        disabled_elapsed.as_millis(),
+    );
+
+    remove_archive_fixture();
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+/// Acceptance B transport (catdesk-2jk): the widget resource the host already
+/// fetches carries the archived card imagery as a seed → data-URI map, so the
+/// dashboard renders every card without the tool result shipping the bytes.
+#[test]
+fn widget_resource_inlines_archived_card_images_for_the_dashboard() {
+    let _guard = ARCHIVE_FIXTURE_LOCK.lock().unwrap();
+    remove_archive_fixture();
+    for seed in 0..8_u64 {
+        let png = representative_archive_png_bytes(seed);
+        write_archive_fixture_card(seed, &png);
+    }
+
+    let resource_started = std::time::Instant::now();
+    let response = handle_resources_read_with_show_detail_mode(
+        &resources_read_request(UI_TEMPLATE_URI),
+        None,
+        1,
+        ShowDetailMode::Expanded,
+    );
+    let resource_elapsed = resource_started.elapsed();
+    let html = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("contents"))
+        .and_then(Value::as_array)
+        .and_then(|contents| contents.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .expect("widget html");
+
+    assert!(
+        html.contains("INITIAL_BINAGOTCHY_CARDS"),
+        "the dashboard must declare the inlined card image map"
+    );
+    assert!(
+        html.contains("INITIAL_BINAGOTCHY_CARDS[card.folder]"),
+        "the dashboard must resolve each archived image by its folder identity"
+    );
+    let card_map_line = html
+        .split_once("var INITIAL_BINAGOTCHY_CARDS = ")
+        .and_then(|(_, rest)| rest.lines().next())
+        .expect("inlined archived card image map");
+    let card_map: Value =
+        serde_json::from_str(card_map_line.trim_end_matches(';')).expect("parse card image map");
+    let card_map = card_map.as_object().expect("card image map object");
+    assert_eq!(
+        card_map.len(),
+        8,
+        "every archive image must be in the resource"
+    );
+    for seed in 0..8_u64 {
+        let folder = fixture_card_folder(seed);
+        assert!(
+            card_map
+                .get(&folder)
+                .and_then(Value::as_str)
+                .is_some_and(|image| image.starts_with("data:image/png;base64,")),
+            "the resource must carry the PNG data URI for folder {folder}"
+        );
+    }
+    let html_bytes = html.len();
+    assert!(
+        html.matches("data:image/png;base64,").count() >= 11,
+        "the resource must include eight cards plus existing screenshot assets"
+    );
+    eprintln!(
+        "catdesk-2jk resource: html={} B; archived image map=8 cards; resources/read={} ms; cached follow-up fetch uses same cardsRev",
+        html_bytes,
+        resource_elapsed.as_millis(),
+    );
+
+    remove_archive_fixture();
+}
+
+/// The widget resource URI gains an archive revision (`cardsRev`) so a
+/// changed archive forces the host to re-fetch the template with fresh card
+/// imagery instead of serving a stale UI.
+#[test]
+fn widget_resource_uri_carries_the_archive_revision() {
+    let uri = current_widget_resource_uri_for_tool("catdesk_instruction");
+    assert!(
+        uri.contains("cardsRev="),
+        "the resource URI must carry the archive revision: {uri}"
+    );
 }
 
 // ── widget meta rides the budget gate (catdesk-8o1, finding F4) ─────────────

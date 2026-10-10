@@ -1781,6 +1781,13 @@
         image-rendering: pixelated;
       }
 
+      .binagotchy-browser-art-placeholder {
+        width: 100%;
+        height: 100%;
+        border-radius: 4px;
+        background: var(--overlay-weak);
+      }
+
       .binagotchy-browser-seed {
         min-width: 0;
         color: var(--text-2);
@@ -2978,6 +2985,7 @@
           "__catdeskInitialTokenStatsLayoutPlaceholder__";
         var INITIAL_TOOL_NAME = "__catdeskInitialToolNamePlaceholder__";
         var INITIAL_MASCOT_OUTLINE = __catdeskInitialMascotOutlinePlaceholder__;
+        var INITIAL_BINAGOTCHY_CARDS = __catdeskBinagotchyCardsPlaceholder__;
         var WIDGET_PAYLOAD_META_KEY = "catdesk/widgetPayload";
         var TOKEN_STATS_LAYOUT_STORAGE_KEY = "catdesk.tokenStatsLayout";
         var tokenStatsLayoutSetting = initialTokenStatsLayout();
@@ -3263,7 +3271,10 @@
           if (!isPlainObject(entry)) return null;
           var folder = readNonEmptyString(entry.folder);
           var seed = readNonEmptyString(entry.seed);
-          var image = readNonEmptyString(entry.image);
+          // Imagery is optional on the payload (catdesk-2jk): the widget
+          // resource carries the seed → data-URI map, so a card without an
+          // inline `image` resolves through INITIAL_BINAGOTCHY_CARDS.
+          var image = readOptionalStringField(entry, "image");
           var saveFolderUrl = readOptionalStringField(entry, "saveFolderUrl");
           var setPartnerUrl = readOptionalStringField(entry, "setPartnerUrl");
           var isPartner = readBoolean(entry.isPartner);
@@ -3285,6 +3296,20 @@
             setPartnerUrl: setPartnerUrl,
             isPartner: isPartner,
           };
+        }
+
+        function binagotchyCardImage(card) {
+          if (card.image) return card.image;
+          if (
+            INITIAL_BINAGOTCHY_CARDS &&
+            Object.prototype.hasOwnProperty.call(
+              INITIAL_BINAGOTCHY_CARDS,
+              card.folder,
+            )
+          ) {
+            return INITIAL_BINAGOTCHY_CARDS[card.folder];
+          }
+          return "";
         }
 
         function emptyMascotState() {
@@ -5005,19 +5030,26 @@
                     var partnerButtonClass = card.isPartner
                       ? "binagotchy-browser-action is-active"
                       : "binagotchy-browser-action";
+                    var cardImage = binagotchyCardImage(card);
+                    var cardArt =
+                      '<div class="binagotchy-browser-art">' +
+                      (cardImage
+                        ? '<img src="' +
+                          esc(cardImage) +
+                          '" alt="Binagotchy seed ' +
+                          esc(card.seed) +
+                          '">'
+                        : '<div class="binagotchy-browser-art-placeholder" aria-label="Binagotchy seed ' +
+                          esc(card.seed) +
+                          '"></div>') +
+                      "</div>";
                     return (
                       '<article class="binagotchy-browser-card' +
                       (card.isPartner ? " is-partner" : "") +
                       '" data-binagotchy-card-seed="' +
                       esc(card.seed) +
                       '">' +
-                      '<div class="binagotchy-browser-art">' +
-                      '<img src="' +
-                      esc(card.image) +
-                      '" alt="Binagotchy seed ' +
-                      esc(card.seed) +
-                      '">' +
-                      "</div>" +
+                      cardArt +
                       '<div class="binagotchy-browser-seed">' +
                       esc(card.seed) +
                       "</div>" +

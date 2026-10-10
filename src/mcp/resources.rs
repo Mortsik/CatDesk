@@ -16,7 +16,7 @@ const SERVER_VERSION: &str = "4.0.0";
 pub(crate) const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 pub(crate) const UI_TEMPLATE_URI: &str = "ui://widget/catdesk-dashboard.html";
-const WIDGET_RESOURCE_REVISION: u32 = 7;
+const WIDGET_RESOURCE_REVISION: u32 = 8;
 const UI_TEMPLATE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(crate) const WIDGET_PAYLOAD_META_KEY: &str = "catdesk/widgetPayload";
 pub(crate) const CATDESK_WIDGET_HTML: &str = include_str!("../widget/catdesk_dashboard.html");
@@ -38,6 +38,28 @@ pub(crate) const INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER: &str =
 pub(crate) const INITIAL_TOOL_NAME_PLACEHOLDER: &str = "__catdeskInitialToolNamePlaceholder__";
 pub(crate) const INITIAL_MASCOT_OUTLINE_PLACEHOLDER: &str =
     "__catdeskInitialMascotOutlinePlaceholder__";
+const BINAGOTCHY_CARDS_PLACEHOLDER: &str = "__catdeskBinagotchyCardsPlaceholder__";
+
+/// Folder → data-URI map of the archived card imagery, inlined into the
+/// widget resource (catdesk-2jk): the instruction tool result carries card
+/// identity only, so the dashboard resolves `<img>` sources here. Folder is
+/// unique even if two archives happen to share a seed. The host fetches this
+/// through its template channel — the same one that already carries the
+/// re-enable/refresh/remove screenshots — keeping every card displayable
+/// without the tool result shipping ~85 KB of base64.
+fn inlined_binagotchy_cards_json() -> String {
+    let cards = mascot::load_archived_binagotchy_cards_cached().unwrap_or_default();
+    let mut map = Map::new();
+    for card in cards {
+        map.insert(card.folder, Value::String(card.image));
+    }
+    let json = serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| "{}".to_string());
+    // Folder names come from local archive paths. Escape HTML script-closing
+    // characters before embedding JSON in an inline <script> block.
+    json.replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+}
 
 fn server_capabilities(show_detail_mode: ShowDetailMode) -> Value {
     if show_detail_mode == ShowDetailMode::Disable {
@@ -160,15 +182,19 @@ pub(crate) fn is_catdesk_widget_resource_uri(uri: &str) -> bool {
 pub(crate) fn current_widget_resource_uri_for_tool(tool_name: &str) -> String {
     let token_stats_layout = current_token_stats_layout();
     let widget_corner_style = current_widget_corner_style();
+    // `cardsRev` busts the host's template cache when the archive changes, so
+    // the inlined card imagery (catdesk-2jk) refreshes with the real archive
+    // state instead of serving a stale UI.
+    let cards_revision = mascot::archived_cards_revision();
     if tool_name.is_empty() {
         return format!(
-            "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}",
+            "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}&cardsRev={cards_revision}",
             token_stats_layout.as_str(),
             widget_corner_style.as_str()
         );
     }
     format!(
-        "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}&toolName={}",
+        "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}&cardsRev={cards_revision}&toolName={}",
         token_stats_layout.as_str(),
         widget_corner_style.as_str(),
         tool_name
@@ -228,6 +254,10 @@ fn render_widget_html(resource_uri: &str, mascot_seed: u64) -> String {
             initial_tool_name_from_resource_uri(resource_uri),
         )
         .replace(INITIAL_MASCOT_OUTLINE_PLACEHOLDER, &initial_mascot_outline)
+        .replace(
+            BINAGOTCHY_CARDS_PLACEHOLDER,
+            &inlined_binagotchy_cards_json(),
+        )
 }
 
 #[cfg(test)]

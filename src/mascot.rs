@@ -125,6 +125,16 @@ pub struct ArchivedBinagotchyCard {
     pub image: String,
 }
 
+/// Card identity without the imagery (catdesk-2jk): the instruction tool
+/// result carries only this — folder and seed drive every dashboard action —
+/// while the PNG bytes ride the widget resource the host fetches separately.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchivedBinagotchyCardSummary {
+    pub folder: String,
+    pub seed: String,
+}
+
 impl MascotPack {
     pub fn current_tui_frame(&self, now_millis: u128) -> &TuiMascotFrame {
         let idx = if self.tui_frames.is_empty() {
@@ -526,8 +536,12 @@ pub(crate) fn catdesk_downloads_root() -> std::io::Result<PathBuf> {
 pub(crate) const MAX_ARCHIVED_CARDS: usize = 8;
 pub(crate) const MAX_ARCHIVED_CARD_BYTES: u64 = 512 * 1024;
 
-pub(crate) fn load_archived_binagotchy_cards() -> std::io::Result<Vec<ArchivedBinagotchyCard>> {
-    load_archived_binagotchy_cards_from(&catdesk_binagotchy_root()?)
+/// Card summaries for the instruction payload (catdesk-2jk): identity only,
+/// no PNG reads, so a `catdesk_instruction` call never pays the archive's
+/// image decode/re-encode cost.
+pub(crate) fn load_archived_binagotchy_card_summaries()
+-> std::io::Result<Vec<ArchivedBinagotchyCardSummary>> {
+    load_archived_binagotchy_card_summaries_from(&catdesk_binagotchy_root()?)
 }
 
 /// Archived-card metadata is a small TOML file CatDesk itself wrote; a larger
@@ -543,29 +557,7 @@ const MAX_ARCHIVED_CARD_SEED_BYTES: usize = 64;
 pub(crate) fn load_archived_binagotchy_cards_from(
     root: &Path,
 ) -> std::io::Result<Vec<ArchivedBinagotchyCard>> {
-    let dir = match fs::read_dir(root) {
-        Ok(dir) => dir,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(e),
-    };
-    // Keep only the newest MAX_ARCHIVED_CARDS folders as the scan goes,
-    // never materializing the whole directory: an arbitrarily large archive
-    // costs the same bounded work before any payload cap applies.
-    let mut newest: Vec<PathBuf> = Vec::with_capacity(MAX_ARCHIVED_CARDS + 1);
-    for entry in dir {
-        let path = entry?.path();
-        if !path.is_dir() {
-            continue;
-        }
-        newest.push(path);
-        if newest.len() > MAX_ARCHIVED_CARDS {
-            newest.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
-            newest.truncate(MAX_ARCHIVED_CARDS);
-        }
-    }
-    newest.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
-
-    Ok(newest
+    Ok(newest_archive_folders(root)?
         .into_iter()
         // Newest first (sorted above), so the cap keeps the freshest cards.
         .filter_map(|entry| {
@@ -593,6 +585,148 @@ pub(crate) fn load_archived_binagotchy_cards_from(
             })
         })
         .collect())
+}
+
+/// Metadata-only variant of the card feed (catdesk-2jk): same newest-first
+/// cap and the same metadata validity rules as the heavy feed, but the PNG
+/// is never opened — the tool result carries identity only.
+pub(crate) fn load_archived_binagotchy_card_summaries_from(
+    root: &Path,
+) -> std::io::Result<Vec<ArchivedBinagotchyCardSummary>> {
+    Ok(newest_archive_folders(root)?
+        .into_iter()
+        .filter_map(|entry| {
+            let folder = entry
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())?;
+            let metadata_text = read_bounded_metadata(&entry.join(METADATA_FILE_NAME))?;
+            let metadata: StoredMascotMetadata = toml::from_str(&metadata_text).ok()?;
+            if metadata.seed.trim().is_empty() || metadata.seed.len() > MAX_ARCHIVED_CARD_SEED_BYTES
+            {
+                return None;
+            }
+            // Preserve the old feed's missing/oversized-image behavior without
+            // reading or decoding PNG bytes on the instruction path.
+            let image_metadata = fs::metadata(entry.join(CHARACTER_PNG_FILE_NAME)).ok()?;
+            if image_metadata.len() > MAX_ARCHIVED_CARD_BYTES {
+                return None;
+            }
+            Some(ArchivedBinagotchyCardSummary {
+                folder,
+                seed: metadata.seed,
+            })
+        })
+        .collect())
+}
+
+/// The archive's newest `MAX_ARCHIVED_CARDS` folders, newest first. The scan
+/// never materializes the whole directory: an arbitrarily large archive
+/// costs the same bounded work before any payload cap applies.
+fn newest_archive_folders(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let dir = match fs::read_dir(root) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    let mut newest: Vec<PathBuf> = Vec::with_capacity(MAX_ARCHIVED_CARDS + 1);
+    for entry in dir {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        newest.push(path);
+        if newest.len() > MAX_ARCHIVED_CARDS {
+            newest.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+            newest.truncate(MAX_ARCHIVED_CARDS);
+        }
+    }
+    newest.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+    Ok(newest)
+}
+
+/// Revision of the archive's folder set (catdesk-2jk): hashes the newest
+/// folder names, so archiving or removing a card moves the revision while an
+/// unchanged archive keeps it stable. Derived from directory names only —
+/// no file reads — because it is consulted for every widget resource URI.
+pub(crate) fn archived_cards_revision_from(root: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match newest_archive_folders(root) {
+        Ok(folders) => {
+            for folder in folders {
+                folder
+                    .file_name()
+                    .map(|name| name.to_string_lossy())
+                    .unwrap_or_default()
+                    .hash(&mut hasher);
+                for file_name in [METADATA_FILE_NAME, CHARACTER_PNG_FILE_NAME] {
+                    match fs::metadata(folder.join(file_name)) {
+                        Ok(metadata) => {
+                            metadata.len().hash(&mut hasher);
+                            metadata
+                                .modified()
+                                .ok()
+                                .and_then(|modified| {
+                                    modified.duration_since(std::time::UNIX_EPOCH).ok()
+                                })
+                                .map(|duration| duration.as_nanos())
+                                .hash(&mut hasher);
+                        }
+                        Err(_) => 0_u8.hash(&mut hasher),
+                    }
+                }
+            }
+        }
+        Err(_) => "unreadable-archive".hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+/// Resource-side card imagery behind a revision-keyed cache (catdesk-2jk):
+/// the widget resource is fetched per template render, and re-reading plus
+/// re-encoding eight PNGs each time would dominate that path. The cache key
+/// is the folder-set revision, matching the URI cache-buster, so a changed
+/// archive reloads from disk and an unchanged one serves the encoded images.
+pub(crate) fn load_archived_binagotchy_cards_cached_from(
+    root: &Path,
+) -> std::io::Result<Vec<ArchivedBinagotchyCard>> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    /// Archive revision plus its encoded card payload.
+    type CachedArchive = (u64, Vec<ArchivedBinagotchyCard>);
+    /// Production consults exactly one root; the bound only keeps injected
+    /// test roots from growing the map without limit.
+    const CACHE_MAX_ROOTS: usize = 8;
+    static CACHE: LazyLock<Mutex<HashMap<PathBuf, CachedArchive>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let revision = archived_cards_revision_from(root);
+    let mut cache = CACHE.lock().expect("archived cards cache lock");
+    if let Some((cached_revision, cards)) = cache.get(root)
+        && *cached_revision == revision
+    {
+        return Ok(cards.clone());
+    }
+    let cards = load_archived_binagotchy_cards_from(root)?;
+    if cache.len() >= CACHE_MAX_ROOTS && !cache.contains_key(root) {
+        cache.clear();
+    }
+    cache.insert(root.to_path_buf(), (revision, cards.clone()));
+    Ok(cards)
+}
+
+/// Production wrapper for the widget resource render path.
+pub(crate) fn load_archived_binagotchy_cards_cached() -> std::io::Result<Vec<ArchivedBinagotchyCard>>
+{
+    load_archived_binagotchy_cards_cached_from(&catdesk_binagotchy_root()?)
+}
+
+/// Production wrapper for the widget resource URI cache-buster: a home that
+/// cannot resolve collapses to a stable empty-archive revision.
+pub(crate) fn archived_cards_revision() -> u64 {
+    archived_cards_revision_from(&catdesk_binagotchy_root().unwrap_or_default())
 }
 
 /// Re-encode archived PNGs losslessly for transport inside the MCP widget
@@ -2000,6 +2134,157 @@ mod tests {
                 "card-0993",
                 "card-0992"
             ]
+        );
+
+        let _ = std::fs::remove_dir_all(&archive_root);
+    }
+
+    /// The instruction payload's card feed must carry identity only — folder
+    /// and seed drive every dashboard action — while the image bytes move to
+    /// the widget resource (catdesk-2jk). A summary must never serialize an
+    /// `image` field, and its selection must mirror the heavy feed's
+    /// newest-first, cap-bounded, validity-filtered behavior.
+    #[test]
+    fn archived_card_summaries_carry_identity_without_images() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let archive_root = std::env::temp_dir().join(format!("catdesk-binagotchy-sum-{unique}"));
+        for index in 0..10_u64 {
+            write_test_card(
+                &archive_root,
+                &format!("card-{index:02}"),
+                index,
+                b"png-bytes",
+            );
+        }
+        // Invalid metadata (oversized) must be skipped by the summary feed
+        // exactly like the heavy feed skips it.
+        std::fs::write(
+            archive_root.join("card-09").join(super::METADATA_FILE_NAME),
+            card_metadata_toml(&"x".repeat(5 * 1024 * 1024)),
+        )
+        .expect("write oversized metadata");
+        // A missing image was previously filtered by the heavy feed; the
+        // summary feed must preserve that behavior using metadata-only I/O.
+        std::fs::remove_file(
+            archive_root
+                .join("card-08")
+                .join(super::CHARACTER_PNG_FILE_NAME),
+        )
+        .expect("remove fixture image");
+
+        let summaries =
+            super::load_archived_binagotchy_card_summaries_from(&archive_root).expect("summaries");
+        let heavy = super::load_archived_binagotchy_cards_from(&archive_root).expect("heavy feed");
+        assert_eq!(summaries.len(), heavy.len());
+        let folders = summaries
+            .iter()
+            .map(|card| card.folder.as_str())
+            .collect::<Vec<_>>();
+        let heavy_folders = heavy
+            .iter()
+            .map(|card| card.folder.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(folders, heavy_folders);
+        assert_eq!(
+            folders,
+            [
+                "card-07", "card-06", "card-05", "card-04", "card-03", "card-02"
+            ]
+        );
+        assert_eq!(summaries[0].seed, format!("{:016x}", 7_u64));
+        for summary in &summaries {
+            let serialized = serde_json::to_value(summary).expect("serialize summary");
+            assert!(
+                serialized.get("image").is_none(),
+                "a card summary must not carry image bytes: {serialized}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&archive_root);
+    }
+
+    /// The archive revision keys both the widget resource URI cache-buster
+    /// and the resource-side image cache: it must be stable while the folder
+    /// set is unchanged and must move when a new archive folder appears.
+    #[test]
+    fn archived_cards_revision_tracks_the_folder_set() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let archive_root = std::env::temp_dir().join(format!("catdesk-binagotchy-rev-{unique}"));
+        write_test_card(&archive_root, "card-01", 1, b"png");
+
+        let first = super::archived_cards_revision_from(&archive_root);
+        let repeat = super::archived_cards_revision_from(&archive_root);
+        assert_eq!(
+            first, repeat,
+            "revision must be stable for a fixed folder set"
+        );
+
+        write_test_card(&archive_root, "card-02", 2, b"png");
+        let grown = super::archived_cards_revision_from(&archive_root);
+        assert_ne!(first, grown, "a new archive folder must move the revision");
+
+        let _ = std::fs::remove_dir_all(&archive_root);
+    }
+
+    /// Resource-side card images are loaded through a revision-keyed cache:
+    /// an unchanged folder set must not re-read or re-encode the PNGs, and a
+    /// changed folder set must reload from disk (catdesk-2jk acceptance B —
+    /// refresh/reconnect keeps serving the real archive state).
+    #[test]
+    fn archived_card_images_are_cached_per_revision() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let archive_root = std::env::temp_dir().join(format!("catdesk-binagotchy-cache-{unique}"));
+        write_test_card(&archive_root, "card-01", 1, b"png-one");
+
+        let first =
+            super::load_archived_binagotchy_cards_cached_from(&archive_root).expect("first load");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].folder, "card-01");
+
+        // Cache hit for an unchanged revision.
+        let cached =
+            super::load_archived_binagotchy_cards_cached_from(&archive_root).expect("cached load");
+        assert_eq!(
+            serde_json::to_value(&cached).unwrap(),
+            serde_json::to_value(&first).unwrap(),
+            "an unchanged revision must preserve the cached image payload"
+        );
+
+        // Revision miss: a new folder forces a real reload. A subsequent
+        // image removal also moves the revision and the card is skipped,
+        // preserving the heavy feed's missing-image behavior.
+        write_test_card(&archive_root, "card-02", 2, b"png-two");
+        let reloaded =
+            super::load_archived_binagotchy_cards_cached_from(&archive_root).expect("reload");
+        let folders = reloaded
+            .iter()
+            .map(|card| card.folder.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(folders, ["card-02", "card-01"]);
+        std::fs::remove_file(
+            archive_root
+                .join("card-01")
+                .join(super::CHARACTER_PNG_FILE_NAME),
+        )
+        .expect("remove card png");
+        let refreshed =
+            super::load_archived_binagotchy_cards_cached_from(&archive_root).expect("refresh");
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|card| card.folder.as_str())
+                .collect::<Vec<_>>(),
+            ["card-02"],
+            "image presence changes must invalidate the resource image cache"
         );
 
         let _ = std::fs::remove_dir_all(&archive_root);

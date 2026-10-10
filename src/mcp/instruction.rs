@@ -281,7 +281,7 @@ pub(crate) fn catdesk_instruction_widget_payload_with_cards(
     mascot_seed: u64,
     _mode: Mode,
     _tool_mode: ToolMode,
-    binagotchy_cards: Vec<mascot::ArchivedBinagotchyCard>,
+    binagotchy_cards: Vec<mascot::ArchivedBinagotchyCardSummary>,
 ) -> std::io::Result<Value> {
     let mut payload = Value::Object(base_widget_payload(
         "tool_call",
@@ -342,7 +342,10 @@ fn catdesk_instruction_widget_payload(
         mascot_seed,
         mode,
         tool_mode,
-        mascot::load_archived_binagotchy_cards()?,
+        // Card identity only (catdesk-2jk): the imagery rides the widget
+        // resource, so the instruction call never reads or re-encodes the
+        // archive PNGs and the result stays inside the inline budget.
+        mascot::load_archived_binagotchy_card_summaries()?,
     )
 }
 
