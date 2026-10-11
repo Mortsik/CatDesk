@@ -1,10 +1,11 @@
 use super::resources::{
     CATDESK_WIDGET_HTML, INITIAL_MASCOT_OUTLINE_PLACEHOLDER,
     INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER, INITIAL_TOOL_NAME_PLACEHOLDER,
-    REENABLE_WIDGET_IMAGE_PLACEHOLDER, REFRESH_CATDESK_IMAGE_PLACEHOLDER,
-    REMOVE_CATDESK_IMAGE_PLACEHOLDER, UI_TEMPLATE_URI, cached_data_uri,
-    current_widget_resource_uri_for_tool, handle_resources_list_with_show_detail_mode,
-    handle_resources_read, handle_resources_read_with_show_detail_mode, handle_server_discover,
+    INITIAL_WIDGET_MASCOT_PLACEHOLDER, REENABLE_WIDGET_IMAGE_PLACEHOLDER,
+    REFRESH_CATDESK_IMAGE_PLACEHOLDER, REMOVE_CATDESK_IMAGE_PLACEHOLDER, UI_TEMPLATE_URI,
+    cached_data_uri, current_widget_resource_uri_for_tool,
+    handle_resources_list_with_show_detail_mode, handle_resources_read,
+    handle_resources_read_with_show_detail_mode, handle_server_discover,
 };
 use super::*;
 use base64::Engine as _;
@@ -5805,8 +5806,9 @@ fn read_file_missing_path_emits_widget_payload_error_panel() {
 #[test]
 fn widget_resource_uri_includes_revision_for_cache_busting() {
     let uri = current_widget_resource_uri_for_tool("catdesk_instruction");
-    assert!(uri.contains("widgetRevision=8"));
+    assert!(uri.contains("widgetRevision=9"));
     assert!(uri.contains("cardsRev="));
+    assert!(uri.contains("mascotRev="));
     assert!(uri.contains("toolName=catdesk_instruction"));
 }
 
@@ -5908,6 +5910,8 @@ fn resources_read_includes_widget_csp_connect_domains() {
     assert!(!text.contains(INITIAL_TOOL_NAME_PLACEHOLDER));
     assert!(text.contains("var INITIAL_MASCOT_OUTLINE = {"));
     assert!(!text.contains(INITIAL_MASCOT_OUTLINE_PLACEHOLDER));
+    assert!(text.contains("var INITIAL_WIDGET_MASCOT = {"));
+    assert!(!text.contains(INITIAL_WIDGET_MASCOT_PLACEHOLDER));
     assert!(text.contains("Disable CatDesk widget?"));
     assert!(text.contains("Widget disabled"));
     assert!(text.contains("https://chatgpt.com/#settings/Plugins"));
@@ -6138,7 +6142,13 @@ fn catdesk_instruction_puts_binagotchy_cards_in_meta_only() {
             .and_then(Value::as_str),
         Some("deadbeef")
     );
-    assert!(widget_payload.get("widgetMascot").is_some());
+    assert!(widget_payload.get("widgetMascot").is_none());
+    assert_eq!(
+        widget_payload
+            .get("widgetMascotSeed")
+            .and_then(Value::as_str),
+        Some(mascot::widget_mascot_identity(1)).as_deref()
+    );
 }
 
 #[test]
@@ -9771,9 +9781,302 @@ fn widget_resource_uri_carries_the_archive_revision() {
         first.contains("cardsRev="),
         "the resource URI must carry the archive revision: {first}"
     );
+    // `mascotRev` tracks the process-global mascot seed, which concurrent
+    // tests may republish between the two reads; archive stability must not
+    // be coupled to that, so the comparison masks it out (u4u).
+    let mask_mascot_rev = |uri: &str| uri.split("&mascotRev=").next().unwrap_or(uri).to_string();
+    assert_eq!(
+        mask_mascot_rev(&first),
+        mask_mascot_rev(&second),
+        "an unchanged archive must keep the resource URI stable"
+    );
+}
+
+// ── widget mascot rides the resource, identity rides the payload (u4u) ──────
+
+/// The widget resource carries the full transport mascot for the seed it was
+/// rendered with, next to the archived card imagery: the first render (and
+/// every reconnect or cache miss) still delivers every asset the dashboard
+/// needs, so moving the frames out of the tool result costs the UI nothing.
+#[test]
+fn widget_resource_inlines_widget_mascot_for_the_dashboard() {
+    let response = handle_resources_read_with_show_detail_mode(
+        &resources_read_request(UI_TEMPLATE_URI),
+        None,
+        1,
+        ShowDetailMode::Expanded,
+    );
+    let html = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("contents"))
+        .and_then(Value::as_array)
+        .and_then(|contents| contents.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .expect("widget html");
+
+    assert!(
+        html.contains("var INITIAL_WIDGET_MASCOT = {"),
+        "the dashboard must declare the inlined widget mascot"
+    );
+    assert!(
+        html.contains("INITIAL_WIDGET_MASCOT.seed === seedIdentity"),
+        "the dashboard must resolve payload mascot identity against the resource mascot"
+    );
+    let mascot_line = html
+        .split_once("var INITIAL_WIDGET_MASCOT = ")
+        .and_then(|(_, rest)| rest.lines().next())
+        .expect("inlined widget mascot line");
+    let inlined: Value =
+        serde_json::from_str(mascot_line.trim_end_matches(';')).expect("parse inlined mascot");
+    assert_eq!(
+        inlined.get("seed").and_then(Value::as_str),
+        Some(mascot::widget_mascot_identity(1)).as_deref(),
+        "the resource mascot carries the seed identity the payload will match"
+    );
+    let mascot = inlined.get("mascot").expect("resource mascot object");
+    assert!(
+        mascot
+            .get("width")
+            .and_then(Value::as_u64)
+            .is_some_and(|w| w > 0),
+        "the inlined mascot carries dimensions"
+    );
+    let frame_count = mascot
+        .get("frames")
+        .and_then(Value::as_array)
+        .map(|frames| frames.len())
+        .unwrap_or(0);
+    assert!(frame_count > 0, "the inlined mascot carries frames");
+    assert!(
+        mascot
+            .get("sequence")
+            .and_then(Value::as_array)
+            .is_some_and(|sequence| !sequence.is_empty()),
+        "the inlined mascot carries the animation sequence"
+    );
+    let mascot_json = mascot_line.trim_end_matches(';').len();
+    eprintln!(
+        "catdesk-u4u resource mascot: identity+mascot JSON={} B (frames={}); full resource render={} B",
+        mascot_json,
+        frame_count,
+        html.len()
+    );
+}
+
+/// The resource URI gains a mascot revision (`mascotRev`) so a changed seed
+/// (partner set/reset, startup reseed) forces the host to re-fetch the
+/// template with fresh frames, while an unchanged seed keeps the URI stable.
+#[test]
+fn widget_resource_uri_tracks_the_mascot_revision() {
+    let first = current_widget_resource_uri_for_tool("catdesk_instruction");
+    let second = current_widget_resource_uri_for_tool("catdesk_instruction");
+    assert!(
+        first.contains("mascotRev="),
+        "the resource URI must carry the mascot revision: {first}"
+    );
     assert_eq!(
         first, second,
-        "an unchanged archive must keep the resource URI stable"
+        "an unchanged seed must keep the resource URI stable"
+    );
+
+    assert_ne!(
+        mascot::widget_mascot_revision(1),
+        mascot::widget_mascot_revision(2),
+        "a different seed must move the mascot revision"
+    );
+    assert_eq!(
+        mascot::widget_mascot_revision(1),
+        mascot::widget_mascot_revision(1),
+        "the mascot revision must be deterministic per seed"
+    );
+    // The URI embeds `widget_mascot_revision(current_widget_mascot_seed())`,
+    // so the publish → bust composition above is the whole invalidation
+    // story; the global itself is deliberately not flipped here because the
+    // test suite runs multi-threaded and a concurrent publisher must never
+    // turn this test (or the archive-stability one below) into a flake.
+}
+
+/// The instruction payload carries mascot identity only: no frames ride the
+/// tool result, and the result stays fully inline without read_result.
+#[tokio::test]
+async fn instruction_widget_payload_carries_mascot_identity_without_frames() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-u4u-identity-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let req = tool_call_request("catdesk_instruction", json!({}));
+
+    let response = handle_tools_call_with_session(
+        &req,
+        &workspace_root.to_string_lossy(),
+        1,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Expanded,
+        None,
+        None,
+    )
+    .await;
+
+    let result = response.result.expect("instruction result");
+    let payload = result
+        .pointer("/_meta/catdesk~1widgetPayload")
+        .and_then(Value::as_object)
+        .expect("widget payload");
+    assert!(
+        payload.get("widgetMascot").is_none(),
+        "the frames must not ride the tool result: {payload:?}"
+    );
+    assert_eq!(
+        payload.get("widgetMascotSeed").and_then(Value::as_str),
+        Some(mascot::widget_mascot_identity(1)).as_deref(),
+        "the payload carries the mascot identity the resource mascot matches"
+    );
+
+    let serialized = serde_json::to_vec(&result).expect("serialize result");
+    assert!(
+        result.get("responseBudget").is_none(),
+        "the instruction must never be externalized behind read_result"
+    );
+    // Reconstruct the pre-u4u result by shipping the frames the way the old
+    // payload did, so the byte delta is pinned against a real measurement.
+    let transport_mascot = serde_json::to_value(mascot::build_widget_mascot_cached(1))
+        .expect("serialize transport mascot");
+    let mut legacy_result = result.clone();
+    legacy_result
+        .pointer_mut("/_meta/catdesk~1widgetPayload")
+        .and_then(Value::as_object_mut)
+        .expect("legacy widget payload")
+        .insert("widgetMascot".to_string(), transport_mascot.clone());
+    let legacy_serialized = serde_json::to_vec(&legacy_result).expect("serialize legacy result");
+    assert!(
+        serialized.len() < legacy_serialized.len(),
+        "the identity-only payload must be smaller than the mascot-carrying one"
+    );
+    eprintln!(
+        "catdesk-u4u instruction result: identity-only={} B, legacy-with-mascot={} B, mascot JSON={} B",
+        serialized.len(),
+        legacy_serialized.len(),
+        serde_json::to_vec(&transport_mascot)
+            .expect("mascot bytes")
+            .len()
+    );
+}
+
+/// A spirit seed carries the 720x420 hero background — the heaviest mascot
+/// payload. It must ride the resource, never the tool result: before u4u a
+/// spirit seed could push the instruction result past the inline budget and
+/// re-externalize the mandatory guidance (the catdesk-2jk failure mode).
+#[tokio::test]
+async fn spirit_mascot_instruction_stays_fully_inline() {
+    // seed % 100 < MASCOT_SPIRIT_PERCENT selects the spirit variant; seed 0
+    // is the smallest spirit seed.
+    let spirit_seed = 0_u64;
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-u4u-spirit-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let req = tool_call_request("catdesk_instruction", json!({}));
+
+    let response = handle_tools_call_with_session(
+        &req,
+        &workspace_root.to_string_lossy(),
+        spirit_seed,
+        Mode::Both,
+        ToolMode::MultiTools,
+        false,
+        &CommandJobManager::new(),
+        &None,
+        ShowDetailMode::Expanded,
+        None,
+        None,
+    )
+    .await;
+
+    let result = response.result.expect("instruction result");
+    let serialized = serde_json::to_vec(&result).expect("serialize result");
+    assert!(
+        serialized.len() <= crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
+        "a spirit seed must keep the instruction fully inline; got {} bytes",
+        serialized.len()
+    );
+    assert!(
+        result.get("responseBudget").is_none(),
+        "the spirit hero background must never externalize the instruction"
+    );
+    assert!(
+        result
+            .pointer("/_meta/catdesk~1widgetPayload/widgetMascot")
+            .is_none(),
+        "the spirit hero background must not ride the tool result"
+    );
+
+    let resource = handle_resources_read_with_show_detail_mode(
+        &resources_read_request(UI_TEMPLATE_URI),
+        None,
+        spirit_seed,
+        ShowDetailMode::Expanded,
+    );
+    let html = resource
+        .result
+        .as_ref()
+        .and_then(|result| result.get("contents"))
+        .and_then(Value::as_array)
+        .and_then(|contents| contents.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .expect("widget html");
+    let mascot_line = html
+        .split_once("var INITIAL_WIDGET_MASCOT = ")
+        .and_then(|(_, rest)| rest.lines().next())
+        .expect("inlined widget mascot line");
+    let inlined: Value =
+        serde_json::from_str(mascot_line.trim_end_matches(';')).expect("parse inlined mascot");
+    let hero_background = inlined
+        .pointer("/mascot/spiritHeroBackground")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        hero_background.starts_with("data:image/png;base64,"),
+        "the spirit hero background must ride the resource"
+    );
+    eprintln!(
+        "catdesk-u4u spirit seed: result={} B (fully inline), resource hero background={} B",
+        serialized.len(),
+        hero_background.len()
+    );
+}
+
+/// Generating the transport mascot renders a character per pose; the seed
+/// cache keeps repeated resource renders and partner actions off that path.
+#[test]
+fn widget_mascot_frames_are_cached_per_seed() {
+    let before = perf_metrics::snapshot();
+    let first = mascot::build_widget_mascot_cached(7);
+    let again = mascot::build_widget_mascot_cached(7);
+    let after = perf_metrics::snapshot();
+    assert_eq!(
+        first.frames, again.frames,
+        "a cached seed must serve the same frames"
+    );
+    assert!(
+        after.cache_misses[CacheKind::WidgetMascot as usize]
+            >= before.cache_misses[CacheKind::WidgetMascot as usize] + 1,
+        "the first build must be a cache miss"
+    );
+    assert!(
+        after.cache_hits[CacheKind::WidgetMascot as usize]
+            >= before.cache_hits[CacheKind::WidgetMascot as usize] + 1,
+        "the second build must be a cache hit"
+    );
+
+    let other = mascot::build_widget_mascot_cached(8);
+    assert_ne!(
+        first.frames, other.frames,
+        "a different seed must not share frames"
     );
 }
 

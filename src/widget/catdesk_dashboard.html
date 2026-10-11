@@ -2986,6 +2986,7 @@
         var INITIAL_TOOL_NAME = "__catdeskInitialToolNamePlaceholder__";
         var INITIAL_MASCOT_OUTLINE = __catdeskInitialMascotOutlinePlaceholder__;
         var INITIAL_BINAGOTCHY_CARDS = __catdeskBinagotchyCardsPlaceholder__;
+        var INITIAL_WIDGET_MASCOT = __catdeskInitialWidgetMascotPlaceholder__;
         var WIDGET_PAYLOAD_META_KEY = "catdesk/widgetPayload";
         var TOKEN_STATS_LAYOUT_STORAGE_KEY = "catdesk.tokenStatsLayout";
         var tokenStatsLayoutSetting = initialTokenStatsLayout();
@@ -3324,6 +3325,27 @@
           };
         }
 
+        // Mascot frames resolve from the widget resource, not the payload
+        // (catdesk-u4u): the instruction payload carries the seed identity
+        // only, and the frames ride the resource the host fetched behind the
+        // mascotRev cache-buster. A seed mismatch (resource older than the
+        // payload) degrades to the loading outline instead of animating a
+        // stale mascot; an explicitly present-but-invalid widgetMascot is
+        // still a payload error.
+        function resolveInstructionWidgetMascot(data, seedIdentity) {
+          if (Object.prototype.hasOwnProperty.call(data, "widgetMascot")) {
+            return validateMascotState(data.widgetMascot);
+          }
+          if (
+            INITIAL_WIDGET_MASCOT &&
+            seedIdentity &&
+            INITIAL_WIDGET_MASCOT.seed === seedIdentity
+          ) {
+            return validateMascotState(INITIAL_WIDGET_MASCOT.mascot);
+          }
+          return emptyMascotState();
+        }
+
         function validateMascotState(mascot) {
           if (!isPlainObject(mascot)) return null;
           var width = readPositiveInteger(mascot.width);
@@ -3591,7 +3613,14 @@
             );
             var binagotchyApiBaseUrl = readString(data.binagotchyApiBaseUrl);
             var partnerBinagotchySeed = readString(data.partnerBinagotchySeed);
-            var widgetMascot = validateMascotState(data.widgetMascot);
+            var widgetMascotSeed = readOptionalStringField(
+              data,
+              "widgetMascotSeed",
+            );
+            var widgetMascot = resolveInstructionWidgetMascot(
+              data,
+              widgetMascotSeed,
+            );
             var binagotchyCards = validateArrayEntries(
               data.binagotchyCards,
               validateBinagotchyCard,

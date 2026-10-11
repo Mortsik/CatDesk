@@ -1123,9 +1123,12 @@ fn attach_catdesk_instruction_actions(
         "partnerBinagotchySeed".to_string(),
         json!(partner_binagotchy_seed.unwrap_or("")),
     );
+    // Mascot identity only (catdesk-u4u): the frames ride the widget resource
+    // behind the `mascotRev` URI cache-buster; this stamp used to rebuild and
+    // re-ship the full mascot on every instruction call.
     widget_payload.insert(
-        "widgetMascot".to_string(),
-        json!(crate::mascot::build_widget_mascot(mascot_seed)),
+        "widgetMascotSeed".to_string(),
+        json!(crate::mascot::widget_mascot_identity(mascot_seed)),
     );
 
     if let Some(cards) = widget_payload
@@ -1476,7 +1479,7 @@ async fn post_binagotchy_partner(
     app.partner_binagotchy_seed = Some(seed.clone());
     app.mascot_seed = parsed_seed;
     app.mascot = crate::mascot::build_workspace_mascot(parsed_seed);
-    let widget_mascot = crate::mascot::build_widget_mascot(parsed_seed);
+    let widget_mascot = crate::mascot::build_widget_mascot_cached(parsed_seed);
     if let Err(error) = app.persist_state() {
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1508,7 +1511,7 @@ async fn delete_binagotchy_partner(State(s): State<ServerState>) -> Response<Bod
     let random_seed = rand::random::<u64>();
     let random_seed_hex = format!("{random_seed:016x}");
     let mascot = crate::mascot::build_workspace_mascot(random_seed);
-    let widget_mascot = crate::mascot::build_widget_mascot(random_seed);
+    let widget_mascot = crate::mascot::build_widget_mascot_cached(random_seed);
 
     #[cfg(not(test))]
     if let Err(error) = crate::mascot::archive_startup_mascot(random_seed) {
@@ -3109,7 +3112,14 @@ mod tests {
                 .and_then(Value::as_str),
             Some("https://example.ngrok.app/secret-slug/layout/show-detail")
         );
-        assert!(widget_payload.get("widgetMascot").is_some());
+        assert!(widget_payload.get("widgetMascot").is_none());
+        assert!(
+            widget_payload
+                .get("widgetMascotSeed")
+                .and_then(Value::as_str)
+                .is_some_and(|seed| !seed.is_empty()),
+            "the actions stamp must carry the mascot identity (catdesk-u4u)"
+        );
         assert_eq!(card.get("isPartner").and_then(Value::as_bool), Some(true));
         assert_eq!(
             card.get("saveFolderUrl").and_then(Value::as_str),

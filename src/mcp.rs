@@ -154,6 +154,11 @@ pub(crate) async fn handle_request_with_session(
     session_namespace: Option<&str>,
     active_project: Option<&Path>,
 ) -> Option<JsonRpcResponse> {
+    // Publish the effective seed for the widget resource URI builders
+    // (catdesk-u4u): the server owns one seed at a time, so every request
+    // refreshes the `mascotRev` cache-buster source. Partner set/reset moves
+    // the seed, the next request republishes it, and the URI follows.
+    crate::mascot::set_current_widget_mascot_seed(mascot_seed);
     match req.method.as_str() {
         "server/discover" => Some(handle_server_discover(req, show_detail_mode)),
         m if m.starts_with("notifications/") => None,

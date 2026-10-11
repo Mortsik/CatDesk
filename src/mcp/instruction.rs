@@ -322,9 +322,16 @@ pub(crate) fn catdesk_instruction_widget_payload_with_cards(
         json!(binagotchy_path_display),
     );
     payload_obj.insert("binagotchyCards".to_string(), json!(binagotchy_cards));
+    // Mascot identity without the frames (catdesk-u4u): the imagery rides the
+    // widget resource — inlined per seed behind the `mascotRev` URI
+    // cache-buster — so a repeated catdesk_instruction call neither rebuilds
+    // the frames nor re-ships them, and a spirit hero background can no
+    // longer push the result past the inline response budget. The dashboard
+    // resolves the frames from the resource when the identity matches and
+    // degrades to the loading outline when it does not.
     payload_obj.insert(
-        "widgetMascot".to_string(),
-        json!(mascot::build_widget_mascot(mascot_seed)),
+        "widgetMascotSeed".to_string(),
+        json!(mascot::widget_mascot_identity(mascot_seed)),
     );
     payload_obj.insert("changedFiles".to_string(), json!([]));
     payload_obj.insert("hasChanges".to_string(), json!(false));

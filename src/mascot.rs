@@ -731,6 +731,91 @@ pub(crate) fn archived_cards_revision() -> u64 {
     archived_cards_revision_from(&catdesk_binagotchy_root().unwrap_or_default())
 }
 
+// ── widget mascot transport (catdesk-u4u) ───────────────────────────────────
+//
+// The mascot rides the widget resource like the archived card imagery does
+// (catdesk-2jk pattern): the resource inlines the frames for the current seed
+// and the tool-result payloads carry identity only. The functions below own
+// that identity, the URI cache-buster, and the server-side frame cache.
+
+/// Bump when mascot generation for the same seed can change (generator or
+/// palette/quantizer tweaks). Moves both the URI revision and the frame
+/// cache key, so a stale cache can never serve an outdated mascot.
+const WIDGET_MASCOT_GENERATOR_REVISION: u64 = 1;
+
+/// Stable identity for the widget mascot of `seed` — the same 16-hex form
+/// the partner seed uses — carried by instruction payloads and the inlined
+/// resource mascot so the dashboard can tell them apart.
+pub(crate) fn widget_mascot_identity(seed: u64) -> String {
+    format!("{seed:016x}")
+}
+
+/// Content-addressed revision of the widget mascot: deterministic per
+/// (seed, generator revision), so an unchanged seed keeps the host template
+/// URI stable while a partner change (or a generator bump) busts the cache.
+pub(crate) fn widget_mascot_revision(seed: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    WIDGET_MASCOT_GENERATOR_REVISION.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The seed the widget resource URI is currently addressed by. The server
+/// owns one effective seed at a time (startup random or partner seed); the
+/// MCP request path publishes it here so URI builders can address the
+/// resource without threading the seed through every call site.
+static CURRENT_WIDGET_MASCOT_SEED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn set_current_widget_mascot_seed(seed: u64) {
+    CURRENT_WIDGET_MASCOT_SEED.store(seed, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn current_widget_mascot_seed() -> u64 {
+    CURRENT_WIDGET_MASCOT_SEED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Revision for the widget resource URI: addresses the mascot the server
+/// currently serves. Partner set/reset or a generator bump moves it.
+pub(crate) fn current_widget_mascot_revision() -> u64 {
+    widget_mascot_revision(current_widget_mascot_seed())
+}
+
+/// Seed-keyed cache for the transport mascot (catdesk-u4u): generating the
+/// frames is the expensive part of the widget surfaces (a character render
+/// per pose), and the resource render plus the partner HTTP actions can hit
+/// the same seed repeatedly within a session. Entries are invalidated by the
+/// generator revision, mirroring the archive's revision-keyed image cache.
+pub(crate) fn build_widget_mascot_cached(seed: u64) -> WidgetMascot {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    /// Generator revision plus the mascot it produced.
+    type CachedMascot = (u64, WidgetMascot);
+    /// Production serves one seed at a time; the bound only keeps injected
+    /// test seeds from growing the map without limit.
+    const CACHE_MAX_SEEDS: usize = 8;
+    static CACHE: LazyLock<Mutex<HashMap<u64, CachedMascot>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let mut cache = CACHE.lock().expect("widget mascot cache lock");
+    if let Some((cached_revision, mascot)) = cache.get(&seed)
+        && *cached_revision == WIDGET_MASCOT_GENERATOR_REVISION
+    {
+        crate::perf_metrics::record_cache_hit(crate::perf_metrics::CacheKind::WidgetMascot);
+        return mascot.clone();
+    }
+    crate::perf_metrics::record_cache_miss(crate::perf_metrics::CacheKind::WidgetMascot);
+    let mascot = build_widget_mascot(seed);
+    if cache.len() >= CACHE_MAX_SEEDS && !cache.contains_key(&seed) {
+        cache.clear();
+    }
+    cache.insert(seed, (WIDGET_MASCOT_GENERATOR_REVISION, mascot.clone()));
+    mascot
+}
+
 /// Re-encode archived PNGs losslessly for transport inside the MCP widget
 /// metadata. The stored 512px image remains untouched for downloads. The
 /// dimension guard avoids decoding oversized/tampered archives in this path.

@@ -77,7 +77,7 @@ pub(crate) const TOOL_OTHER: usize = TOOL_COUNT - 1;
 const ELAPSED_SAMPLES: usize = 32;
 const STAGE_SAMPLES: usize = 16;
 /// Cache counter pairs: app config, agents text, static data URIs.
-const CACHE_KIND_COUNT: usize = 3;
+const CACHE_KIND_COUNT: usize = 4;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 /// 100% of one core in basis points; process CPU never reads higher.
 const FULL_CPU_BP: u32 = 10_000;
@@ -302,6 +302,7 @@ pub(crate) enum CacheKind {
     AppConfig = 0,
     AgentsText = 1,
     DataUri = 2,
+    WidgetMascot = 3,
 }
 
 /// One completed request-class observation.
@@ -1162,8 +1163,8 @@ mod tests {
         let mut perf = PerfSnapshot::default();
         perf.cpu_bp = Some(300); // 3% of one core
         perf.rss_kb = Some(185_344);
-        perf.cache_hits = [96, 0, 0];
-        perf.cache_misses = [4, 0, 0];
+        perf.cache_hits = [96, 0, 0, 0];
+        perf.cache_misses = [4, 0, 0, 0];
         perf.classes[CLASS_SCAN].p95_ms = Some(40);
         assert_eq!(
             format_system_line(&perf),
