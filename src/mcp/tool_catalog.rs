@@ -713,7 +713,7 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
         tools.push(json!({
             "name": "read_result",
             "title": "Read stored result range",
-            "description": "Read a bounded byte range from a CatDesk large-result reference. Offsets are bytes. dataBase64 is always lossless; text is included when the selected bytes are valid UTF-8.",
+            "description": "Read a bounded byte range from a CatDesk large-result reference. Offsets are bytes. format selects the output mode: dataBase64 is always lossless; text is included when the selected bytes are valid UTF-8; format=text ships only the text mirror and errors with text_range_not_utf8 when the range is not valid UTF-8.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -724,6 +724,12 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
                         "minimum": 1,
                         "maximum": crate::result_store::DEFAULT_MAX_RANGE_BYTES,
                         "description": format!("Maximum bytes to return (default and maximum {})", crate::result_store::DEFAULT_MAX_RANGE_BYTES)
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "base64", "both"],
+                        "default": "both",
+                        "description": "Output mode. both (default) returns lossless dataBase64 plus the text mirror when the range is valid UTF-8; text returns only the lossless UTF-8 mirror and errors with text_range_not_utf8 otherwise; base64 returns only the byte-exact dataBase64 mirror."
                     }
                 },
                 "required": ["result_id"]

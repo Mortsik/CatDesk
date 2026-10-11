@@ -6488,6 +6488,21 @@ async fn result_retrieval_tool_schemas_are_read_only_and_bounded() {
             .expect("missing read properties")
             .contains_key("max_bytes")
     );
+    // Output-mode contract: the advertised schema exposes the optional
+    // format switch with both as the backwards-compatible default.
+    let format_schema = read_schema
+        .get("properties")
+        .and_then(|properties| properties.get("format"))
+        .and_then(Value::as_object)
+        .expect("missing read_result format property");
+    assert_eq!(
+        format_schema.get("enum").and_then(Value::as_array),
+        Some(&vec![json!("text"), json!("base64"), json!("both")])
+    );
+    assert_eq!(
+        format_schema.get("default").and_then(Value::as_str),
+        Some("both")
+    );
 
     let search = tools
         .iter()
@@ -6722,6 +6737,390 @@ fn result_retrieval_hides_foreign_refs_and_reports_bounded_errors() {
     );
 
     std::fs::remove_dir_all(workspace_root).ok();
+}
+
+fn read_result_structured_with_format(
+    store: &LargeResultStore,
+    workspace_root: &std::path::Path,
+    result_id: &str,
+    format: Option<&str>,
+    offset: u64,
+    max_bytes: usize,
+) -> Value {
+    let mut arguments = json!({
+        "result_id": result_id,
+        "offset": offset,
+        "max_bytes": max_bytes
+    });
+    if let Some(format) = format {
+        arguments
+            .as_object_mut()
+            .expect("arguments must be object")
+            .insert("format".to_string(), json!(format));
+    }
+    let req = tool_call_request("read_result", arguments);
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let response = handle_read_result(&req, &workspace_root_str, store, None);
+    response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("structuredContent"))
+        .expect("missing structured content")
+        .clone()
+}
+
+fn format_test_workspace(label: &str) -> std::path::PathBuf {
+    let workspace_root = std::env::temp_dir().join(format!(
+        "catdesk-mcp-read-format-{label}-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    workspace_root
+}
+
+#[test]
+fn read_result_absent_format_matches_explicit_both() {
+    // Acceptance A: calls without the new argument must return the exact
+    // previous response shape and content — identical to format=both.
+    let store = mcp_result_store();
+    let payload = "héllö wörld";
+    let workspace_root = format_test_workspace("compat");
+    let stored = store
+        .put(
+            None,
+            &workspace_root,
+            payload.as_bytes(),
+            Some("text/plain"),
+        )
+        .expect("store result");
+
+    let absent = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        None,
+        0,
+        16,
+    );
+    let both = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        Some("both"),
+        0,
+        16,
+    );
+    assert_eq!(absent, both);
+    assert!(absent.get("dataBase64").is_some());
+    assert_eq!(
+        absent.get("text").and_then(Value::as_str),
+        Some(payload),
+        "valid UTF-8 range keeps the legacy text mirror in both mode"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn read_result_text_format_omits_base64_and_stays_lossless() {
+    // Acceptance B: text-only mode omits the duplicated dataBase64 while
+    // preserving byte offsets, pagination fields and lossless content.
+    let store = mcp_result_store();
+    let payload = "héllö wörld";
+    let workspace_root = format_test_workspace("text-lossless");
+    let stored = store
+        .put(
+            None,
+            &workspace_root,
+            payload.as_bytes(),
+            Some("text/plain"),
+        )
+        .expect("store result");
+
+    let structured = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        Some("text"),
+        0,
+        16,
+    );
+    assert_eq!(
+        structured.get("success").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        structured.get("dataBase64").is_none(),
+        "text mode must not ship the base64 mirror"
+    );
+    assert_eq!(
+        structured.get("text").and_then(Value::as_str),
+        Some(payload)
+    );
+    assert_eq!(
+        structured.get("bytesReturned").and_then(Value::as_u64),
+        Some(payload.len() as u64)
+    );
+    assert_eq!(structured.get("eof").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        structured.get("nextOffset").and_then(Value::as_u64),
+        Some(payload.len() as u64)
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn read_result_base64_format_omits_text_and_stays_byte_exact() {
+    // Acceptance B: base64-only mode stays byte-exact and drops the text
+    // mirror even when the range is valid UTF-8.
+    let store = mcp_result_store();
+    let payload = "héllö wörld";
+    let workspace_root = format_test_workspace("base64-exact");
+    let stored = store
+        .put(
+            None,
+            &workspace_root,
+            payload.as_bytes(),
+            Some("text/plain"),
+        )
+        .expect("store result");
+
+    let structured = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        Some("base64"),
+        0,
+        16,
+    );
+    assert_eq!(
+        structured.get("success").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        structured.get("text").is_none(),
+        "base64 mode must not ship the text mirror"
+    );
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(
+            structured
+                .get("dataBase64")
+                .and_then(Value::as_str)
+                .expect("missing dataBase64"),
+        )
+        .expect("valid base64");
+    assert_eq!(decoded, payload.as_bytes());
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn read_result_text_format_reconstructs_full_output_across_ranges() {
+    // Acceptance B: paginated text-mode reads reconstruct the full output
+    // without byte offsets drifting on multibyte boundaries.
+    let store = mcp_result_store();
+    let payload = "héllö wörld αβγδε";
+    let workspace_root = format_test_workspace("text-paginate");
+    let stored = store
+        .put(
+            None,
+            &workspace_root,
+            payload.as_bytes(),
+            Some("text/plain"),
+        )
+        .expect("store result");
+
+    let first = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        Some("text"),
+        0,
+        15,
+    );
+    let second = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        Some("text"),
+        15,
+        16,
+    );
+    assert_eq!(first.get("eof").and_then(Value::as_bool), Some(false));
+    let next_offset = first
+        .get("nextOffset")
+        .and_then(Value::as_u64)
+        .expect("missing nextOffset");
+    assert_eq!(next_offset, 15, "offsets stay byte-based");
+    assert_eq!(second.get("eof").and_then(Value::as_bool), Some(true));
+
+    let reconstructed = format!(
+        "{}{}",
+        first
+            .get("text")
+            .and_then(Value::as_str)
+            .expect("first text"),
+        second
+            .get("text")
+            .and_then(Value::as_str)
+            .expect("second text")
+    );
+    assert_eq!(reconstructed, payload);
+    assert!(first.get("dataBase64").is_none());
+    assert!(second.get("dataBase64").is_none());
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn read_result_text_format_errors_on_non_utf8_range() {
+    // Acceptance C: malformed UTF-8 in text mode is an explicit, predictable
+    // error — never silent loss — and the same range stays byte-exact in
+    // base64 mode.
+    let store = mcp_result_store();
+    let payload: &[u8] = b"ok\xFFbad";
+    let workspace_root = format_test_workspace("text-binary");
+    let stored = store
+        .put(
+            None,
+            &workspace_root,
+            payload,
+            Some("application/octet-stream"),
+        )
+        .expect("store result");
+
+    let structured = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        Some("text"),
+        0,
+        16,
+    );
+    assert_eq!(
+        structured.get("success").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        structured.get("errorCode").and_then(Value::as_str),
+        Some("text_range_not_utf8")
+    );
+    assert!(structured.get("text").is_none());
+    assert!(structured.get("dataBase64").is_none());
+
+    let fallback = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        Some("base64"),
+        0,
+        16,
+    );
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(
+            fallback
+                .get("dataBase64")
+                .and_then(Value::as_str)
+                .expect("missing dataBase64 in base64 fallback"),
+        )
+        .expect("valid base64");
+    assert_eq!(decoded, payload, "binary content must survive untouched");
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn read_result_text_format_errors_on_split_multibyte_boundary() {
+    // Acceptance C: a range ending mid-codepoint is not silently truncated;
+    // an aligned range over the same bytes is lossless in text mode, and the
+    // misaligned range keeps the legacy both-mode shape.
+    let store = mcp_result_store();
+    let payload = "abc😀xyz";
+    let workspace_root = format_test_workspace("text-boundary");
+    let stored = store
+        .put(
+            None,
+            &workspace_root,
+            payload.as_bytes(),
+            Some("text/plain"),
+        )
+        .expect("store result");
+
+    let misaligned = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        Some("text"),
+        0,
+        4,
+    );
+    assert_eq!(
+        misaligned.get("success").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        misaligned.get("errorCode").and_then(Value::as_str),
+        Some("text_range_not_utf8")
+    );
+
+    let aligned = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        Some("text"),
+        0,
+        7,
+    );
+    assert_eq!(aligned.get("success").and_then(Value::as_bool), Some(true));
+    assert_eq!(aligned.get("text").and_then(Value::as_str), Some("abc😀"));
+    assert!(aligned.get("dataBase64").is_none());
+
+    let legacy = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        None,
+        0,
+        4,
+    );
+    assert_eq!(legacy.get("success").and_then(Value::as_bool), Some(true));
+    assert!(legacy.get("dataBase64").is_some());
+    assert!(
+        legacy.get("text").is_none(),
+        "misaligned range never had a text mirror"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn read_result_rejects_unknown_format() {
+    let store = mcp_result_store();
+    let workspace_root = format_test_workspace("unknown-format");
+    let stored = store
+        .put(None, &workspace_root, b"payload", None)
+        .expect("store result");
+    let structured = read_result_structured_with_format(
+        &store,
+        &workspace_root,
+        &stored.metadata.result_id,
+        Some("raw"),
+        0,
+        16,
+    );
+    assert_eq!(
+        structured.get("success").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        structured.get("errorCode").and_then(Value::as_str),
+        Some("invalid_arguments")
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
 }
 
 #[tokio::test]
@@ -9190,5 +9589,89 @@ fn read_result_control_byte_range_serializes_bounded_escaped_text() {
     assert!(
         (800 * 1024..=1100 * 1024).contains(&serialized),
         "one maximal control-byte range must serialize to roughly 962 KiB, got {serialized} bytes"
+    );
+}
+
+/// Reads one maximal range straight from the handler with an explicit output
+/// mode and returns the serialized size for the format measurement tests.
+fn maximal_read_result_with_format(payload: &[u8], format: &str) -> usize {
+    let store = LargeResultStore::new_default().expect("create result store");
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-format-measure-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let range_bytes = crate::result_store::DEFAULT_MAX_RANGE_BYTES;
+    let stored = store
+        .put(None, &workspace_root, payload, None)
+        .expect("store measurement payload");
+    let req = tool_call_request(
+        "read_result",
+        json!({
+            "result_id": stored.metadata.result_id,
+            "offset": 0,
+            "max_bytes": range_bytes,
+            "format": format
+        }),
+    );
+    let response = handle_read_result(&req, &workspace_root.to_string_lossy(), &store, None);
+    let result = response.result.expect("read_result payload");
+    let len = serde_json::to_vec(&result).expect("serialize result").len();
+    let _ = std::fs::remove_dir_all(workspace_root);
+    len
+}
+
+#[test]
+fn read_result_text_format_cuts_max_range_serialized_size() {
+    // Acceptance D: on the maximal ASCII range the legacy both-mode ships
+    // base64 ≈ 171 KiB + text mirror ≈ 128 KiB ≈ 306 KiB; text-only mode
+    // drops the base64 mirror and lands near the raw payload size.
+    let payload = vec![b'a'; crate::result_store::DEFAULT_MAX_RANGE_BYTES];
+    let both = maximal_read_result_from_handler(&payload);
+    let text = maximal_read_result_with_format(&payload, "text");
+    let base64_only = maximal_read_result_with_format(&payload, "base64");
+    println!(
+        "read_result format measurement (maximal ASCII range, {} B payload): both={both} B, text={text} B, base64={base64_only} B",
+        payload.len()
+    );
+    assert!(
+        text < both / 2,
+        "text mode must at least halve the serialized range (both={both}, text={text})"
+    );
+    assert!(
+        text > 100 * 1024,
+        "text mode still carries the full payload ({text} bytes)"
+    );
+    assert!(
+        base64_only < both,
+        "base64 mode drops the text mirror (both={both}, base64={base64_only})"
+    );
+}
+
+#[test]
+fn read_result_text_format_shrinks_transcript_baseline_payload() {
+    // Acceptance D, measured baseline from the field report: a 100267-byte
+    // UTF-8 range serialized to ≈234749 B in legacy both mode because
+    // structuredContent duplicated text and dataBase64. Text mode must ship
+    // the same bytes without the base64 mirror.
+    let line = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor.\n";
+    let mut payload = String::with_capacity(100_267);
+    while payload.len() < 100_267 {
+        payload.push_str(line);
+    }
+    payload.truncate(100_267);
+    let payload = payload.as_bytes();
+    assert_eq!(payload.len(), 100_267);
+
+    let both = maximal_read_result_from_handler(payload);
+    let text = maximal_read_result_with_format(payload, "text");
+    println!(
+        "read_result format measurement (100267 B transcript baseline): both={both} B, text={text} B"
+    );
+    assert!(
+        (230_000..=245_000).contains(&both),
+        "legacy both-mode baseline must stay near the measured 234749 B, got {both}"
+    );
+    assert!(
+        text * 2 < both,
+        "text mode must at least halve the transcript baseline (both={both}, text={text})"
     );
 }

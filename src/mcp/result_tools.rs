@@ -14,6 +14,31 @@ use crate::result_store::{LargeResultStore, ResultKind, StoreError};
 // as a cap on the echoed copy.
 pub(crate) const MAX_SEARCH_RESULT_QUERY_CHARS: usize = 1024;
 
+/// Output modes for read_result. `both` is the backwards-compatible default:
+/// the lossless dataBase64 mirror always, plus `text` when the selected
+/// bytes are valid UTF-8. `text` and `base64` each ship only one mirror so
+/// transcript footprints drop by roughly half on UTF-8 ranges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadResultFormat {
+    Text,
+    Base64,
+    Both,
+}
+
+impl ReadResultFormat {
+    fn from_arguments(arguments: &Value) -> Result<Self, String> {
+        match arguments.get("format") {
+            None => Ok(Self::Both),
+            Some(value) => match value.as_str() {
+                Some("text") => Ok(Self::Text),
+                Some("base64") => Ok(Self::Base64),
+                Some("both") => Ok(Self::Both),
+                _ => Err("Parameter format must be one of: text, base64, both".to_string()),
+            },
+        }
+    }
+}
+
 pub(crate) fn handle_read_result(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -33,6 +58,10 @@ pub(crate) fn handle_read_result(
         Ok(value) => value,
         Err(error) => return invalid_arguments(req, error),
     };
+    let format = match ReadResultFormat::from_arguments(&arguments) {
+        Ok(value) => value,
+        Err(error) => return invalid_arguments(req, error),
+    };
 
     match store.read_range(
         session_namespace,
@@ -42,7 +71,12 @@ pub(crate) fn handle_read_result(
         max_bytes,
     ) {
         Ok(range) => {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&range.bytes);
+            // Text mode refuses ranges that are not complete valid UTF-8
+            // instead of silently masking bytes or truncating a codepoint;
+            // the client falls back to base64/both, which stay byte-exact.
+            if format == ReadResultFormat::Text && range.text.is_none() {
+                return text_range_not_utf8_response(req, range.offset, range.bytes.len());
+            }
             let mut structured = json!({
                 "toolName": "read_result",
                 "resultId": range.metadata.result_id,
@@ -53,7 +87,6 @@ pub(crate) fn handle_read_result(
                 "expiresAtMs": range.metadata.expires_at_ms,
                 "offset": range.offset,
                 "bytesReturned": range.bytes.len(),
-                "dataBase64": encoded,
                 "nextOffset": range.next_offset,
                 "eof": range.eof,
                 "message": format!(
@@ -63,16 +96,42 @@ pub(crate) fn handle_read_result(
                 ),
                 "success": true
             });
-            if let Some(text) = range.text {
-                structured
-                    .as_object_mut()
-                    .expect("structured result must be object")
-                    .insert("text".to_string(), Value::String(text));
+            let object = structured
+                .as_object_mut()
+                .expect("structured result must be object");
+            if format != ReadResultFormat::Text {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&range.bytes);
+                object.insert("dataBase64".to_string(), Value::String(encoded));
+            }
+            if format != ReadResultFormat::Base64 {
+                if let Some(text) = range.text {
+                    object.insert("text".to_string(), Value::String(text));
+                }
             }
             tool_success_response_with_structured(req, String::new(), structured)
         }
         Err(error) => store_error_response(req, error),
     }
+}
+
+fn text_range_not_utf8_response(
+    req: &JsonRpcRequest,
+    offset: u64,
+    bytes_returned: usize,
+) -> JsonRpcResponse {
+    let message = format!(
+        "Requested range at offset {offset} ({bytes_returned} bytes) is not valid UTF-8; re-read it with format=base64 (or format=both) for lossless bytes."
+    );
+    tool_error_response_with_structured(
+        req,
+        message.clone(),
+        json!({
+            "toolName": crate::mcp::jsonrpc::tool_name_from_request(req),
+            "errorCode": "text_range_not_utf8",
+            "message": message,
+            "success": false
+        }),
+    )
 }
 
 pub(crate) fn handle_search_result(

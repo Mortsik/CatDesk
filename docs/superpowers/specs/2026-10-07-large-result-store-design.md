@@ -13,7 +13,7 @@ Provide a bounded CatDesk-owned store for tool payloads that are too large to in
 - Public references are opaque IDs; no host path is exposed.
 - Every entry is bound to both the originating MCP session namespace and workspace root. A caller from another session or workspace cannot distinguish an existing foreign entry from an unknown reference.
 - Retrieval is byte-addressed and bounded. Every range response reports the returned byte count, `nextOffset`, and `eof` so repeated calls deterministically reconstruct the original payload.
-- Every range includes `dataBase64`; UTF-8 entries may additionally expose `text` when the selected byte range is valid UTF-8.
+- Every range includes `dataBase64`; UTF-8 entries may additionally expose `text` when the selected byte range is valid UTF-8. The optional `format` argument (`text`, `base64`, `both`; default `both`) drops one mirror per response: `text` ships only the lossless UTF-8 mirror and fails with `text_range_not_utf8` when the range is not valid UTF-8, `base64` ships only the byte-exact `dataBase64` mirror.
 - Search is available only for UTF-8 entries. It performs bounded literal search over the stored file without reading the entire artifact into memory, returns byte offsets and bounded snippets, and supports pagination.
 - Expired or capacity-evicted references owned by the caller remain explicit tombstones for a bounded period, so retrieval says `expired` or `evicted` instead of implying that omitted data is still available.
 - Session deletion removes that session's live entries and records them as evicted.
@@ -49,7 +49,7 @@ Metadata includes opaque result ID, total size, UTF-8/binary kind, optional cont
 
 Two local read-only tools are always advertised when local computer tools are available:
 
-- `read_result`: `result_id`, optional `offset`, optional `max_bytes`
+- `read_result`: `result_id`, optional `offset`, optional `max_bytes`, optional `format` (`text`/`base64`/`both`, default `both`)
 - `search_result`: `result_id`, `query`, optional `start_offset`, optional `max_matches`
 
 Both use the request's current session namespace and workspace root; neither accepts a path or session argument.
