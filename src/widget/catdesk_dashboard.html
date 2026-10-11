@@ -3272,7 +3272,7 @@
           var folder = readNonEmptyString(entry.folder);
           var seed = readNonEmptyString(entry.seed);
           // Imagery is optional on the payload (catdesk-2jk): the widget
-          // resource carries the seed → data-URI map, so a card without an
+          // resource carries the folder → data-URI map, so a card without an
           // inline `image` resolves through INITIAL_BINAGOTCHY_CARDS.
           var image = readOptionalStringField(entry, "image");
           var saveFolderUrl = readOptionalStringField(entry, "saveFolderUrl");

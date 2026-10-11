@@ -74,10 +74,15 @@ model nothing.
 
 ## Known edges
 
-- A metadata-only seed change inside an existing folder does not move
-  `cardsRev` (folder set + file size/mtime do); the summary feed itself is
-  computed fresh per instruction call, so only the resource-side image map
-  could lag until any file size/mtime change or a new archive folder appears.
+- `cardsRev` hashes folder names plus each folder's `metadata.toml` and
+  `character.png` size and mtime — never file contents. A content swap that
+  preserves both size and mtime (e.g. a copy with a preserved timestamp)
+  moves neither the URI cache-buster nor the resource-side image cache;
+  ordinary writes change mtime, so real CatDesk archives always bust. A
+  metadata-only seed edit moves the revision only when it changes
+  `metadata.toml`'s size or mtime (normal writes do). The summary feed itself
+  is computed fresh per instruction call, so card identity never lags either
+  way.
 - Hosts that never fetch MCP resources would show card placeholders instead
   of images; ChatGPT's widget template channel is the only supported host
   surface for the dashboard and it already fetches this resource.

@@ -9422,6 +9422,16 @@ fn remove_archive_fixture() {
     }
 }
 
+/// Removes leftover fixture cards when the guard drops — including the panic
+/// path, so a failing assertion cannot leak the lexically-dominating
+/// `9999fixture-*` folders into the remaining tests' archive reads.
+struct ArchiveFixtureCleanup;
+impl Drop for ArchiveFixtureCleanup {
+    fn drop(&mut self) {
+        remove_archive_fixture();
+    }
+}
+
 /// Representative uncompressible 48×48 archived PNG: eight encoded images
 /// exceed the 64 KiB inline tool-result budget, reproducing the P0 payload
 /// shape without depending on a developer's local archive.
@@ -9454,6 +9464,7 @@ fn representative_archive_png_bytes(seed: u64) -> Vec<u8> {
 #[tokio::test]
 async fn catdesk_instruction_with_realistic_archive_stays_fully_inline() {
     let _guard = ARCHIVE_FIXTURE_LOCK.lock().unwrap();
+    let _fixture_cleanup = ArchiveFixtureCleanup;
     remove_archive_fixture();
     for seed in 0..8_u64 {
         let png = representative_archive_png_bytes(seed);
@@ -9669,16 +9680,17 @@ async fn catdesk_instruction_with_realistic_archive_stays_fully_inline() {
         disabled_elapsed.as_millis(),
     );
 
-    remove_archive_fixture();
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
 /// Acceptance B transport (catdesk-2jk): the widget resource the host already
-/// fetches carries the archived card imagery as a seed → data-URI map, so the
-/// dashboard renders every card without the tool result shipping the bytes.
+/// fetches carries the archived card imagery as a folder → data-URI map (the
+/// folder is unique even where seeds collide), so the dashboard renders every
+/// card without the tool result shipping the bytes.
 #[test]
 fn widget_resource_inlines_archived_card_images_for_the_dashboard() {
     let _guard = ARCHIVE_FIXTURE_LOCK.lock().unwrap();
+    let _fixture_cleanup = ArchiveFixtureCleanup;
     remove_archive_fixture();
     for seed in 0..8_u64 {
         let png = representative_archive_png_bytes(seed);
@@ -9743,19 +9755,25 @@ fn widget_resource_inlines_archived_card_images_for_the_dashboard() {
         html_bytes,
         resource_elapsed.as_millis(),
     );
-
-    remove_archive_fixture();
 }
 
 /// The widget resource URI gains an archive revision (`cardsRev`) so a
 /// changed archive forces the host to re-fetch the template with fresh card
-/// imagery instead of serving a stale UI.
+/// imagery instead of serving a stale UI. Beyond carrying the revision,
+/// consecutive calls against an unchanged archive must produce byte-identical
+/// URIs — otherwise the host cache would churn (or cache under shifting keys)
+/// without any archive change.
 #[test]
 fn widget_resource_uri_carries_the_archive_revision() {
-    let uri = current_widget_resource_uri_for_tool("catdesk_instruction");
+    let first = current_widget_resource_uri_for_tool("catdesk_instruction");
+    let second = current_widget_resource_uri_for_tool("catdesk_instruction");
     assert!(
-        uri.contains("cardsRev="),
-        "the resource URI must carry the archive revision: {uri}"
+        first.contains("cardsRev="),
+        "the resource URI must carry the archive revision: {first}"
+    );
+    assert_eq!(
+        first, second,
+        "an unchanged archive must keep the resource URI stable"
     );
 }
 

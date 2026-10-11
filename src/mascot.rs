@@ -644,10 +644,12 @@ fn newest_archive_folders(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(newest)
 }
 
-/// Revision of the archive's folder set (catdesk-2jk): hashes the newest
-/// folder names, so archiving or removing a card moves the revision while an
-/// unchanged archive keeps it stable. Derived from directory names only —
-/// no file reads — because it is consulted for every widget resource URI.
+/// Revision of the archive's card set (catdesk-2jk): hashes the newest
+/// folder names plus each folder's `metadata.toml`/`character.png` size and
+/// mtime, so archiving or removing a card — or swapping imagery inside an
+/// existing folder — moves the revision while an unchanged archive keeps it
+/// stable. Metadata stat reads only, never file contents, because it is
+/// consulted for every widget resource URI.
 pub(crate) fn archived_cards_revision_from(root: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
 
@@ -2208,7 +2210,9 @@ mod tests {
 
     /// The archive revision keys both the widget resource URI cache-buster
     /// and the resource-side image cache: it must be stable while the folder
-    /// set is unchanged and must move when a new archive folder appears.
+    /// set is unchanged and must move when a new archive folder appears or
+    /// when imagery inside an existing folder is swapped (the stat layer —
+    /// size/mtime — does that work, not the folder names alone).
     #[test]
     fn archived_cards_revision_tracks_the_folder_set() {
         let unique = std::time::SystemTime::now()
@@ -2228,6 +2232,13 @@ mod tests {
         write_test_card(&archive_root, "card-02", 2, b"png");
         let grown = super::archived_cards_revision_from(&archive_root);
         assert_ne!(first, grown, "a new archive folder must move the revision");
+
+        write_test_card(&archive_root, "card-02", 2, b"png-two-with-more-bytes");
+        let swapped = super::archived_cards_revision_from(&archive_root);
+        assert_ne!(
+            grown, swapped,
+            "an in-place image change must move the revision"
+        );
 
         let _ = std::fs::remove_dir_all(&archive_root);
     }
