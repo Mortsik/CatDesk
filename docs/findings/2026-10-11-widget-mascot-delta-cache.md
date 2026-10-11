@@ -34,7 +34,7 @@ Same separation of transports catdesk-2jk established for the cards:
 | Seed publication | seed threaded per call, invisible to URI builders | process-global `current_widget_mascot_seed` (AtomicU64) republished at MCP request entry; the server owns one effective seed at a time |
 | Mascot generation | built fresh at every use | seed-keyed cache (`build_widget_mascot_cached`), invalidated by `WIDGET_MASCOT_GENERATOR_REVISION`, surfaced as `CacheKind::WidgetMascot` in perf metrics |
 | Partner set/reset HTTP responses | full mascot, built fresh | full mascot, served from the cache (live update channel unchanged) |
-| Dashboard mascot resolution | `widgetMascot` required in the instruction payload | optional: present → validated; absent → resource mascot when `INITIAL_WIDGET_MASCOT.seed === payload.widgetMascotSeed`, else the empty/loading outline — an explicit-but-corrupt mascot is still a payload error, and a seed mismatch degrades to the outline instead of animating a stale mascot |
+| Dashboard mascot resolution | `widgetMascot` required in the instruction payload | optional: present → validated; absent → resource mascot when `INITIAL_WIDGET_MASCOT.seed === payload.widgetMascotSeed`, else the mascot area renders empty (no frames to animate) — an explicit-but-corrupt mascot is still a payload error, and a seed mismatch degrades to the empty hero instead of animating a stale mascot |
 
 `ShowDetailMode::Disable` still attaches no widget payload and lists no
 resources. The dashboard HTML change ships in the same binary as the server
@@ -65,7 +65,7 @@ widget payload costs the model nothing — same property catdesk-2jk relied on.
 | --- | --- |
 | First render / cache miss carries every asset (A) | `widget_resource_inlines_widget_mascot_for_the_dashboard` (identity + dimensions + frames + sequence in the resource), `spirit_mascot_instruction_stays_fully_inline` (hero background in the resource) |
 | Unchanged updates avoid retransmitting media (A) | `instruction_widget_payload_carries_mascot_identity_without_frames` (identity-only payload, byte-delta pinned against the legacy reconstruction), `widget_mascot_frames_are_cached_per_seed` (miss→hit counter progression) |
-| Deterministic invalidation, no stale UI (B) | `widget_resource_uri_tracks_the_mascot_revision` (rev deterministic per seed, moves across seeds, URI busts on republished seed); dashboard seed mismatch → outline, never a stale mascot |
+| Deterministic invalidation, no stale UI (B) | `widget_resource_uri_tracks_the_mascot_revision` (rev deterministic per seed, moves across seeds; the URI embeds the revision of the published seed, so publish → bust holds by construction — the global is deliberately not flipped in tests to keep the suite parallel-safe); dashboard seed mismatch → empty hero, never a stale mascot |
 | Reconnect / expired cache / non-caching hosts (C) | full-resource fallback is the only render path — every render inlines mascot + cards; `resources_read_includes_widget_csp_connect_domains` pins the new placeholder replacement |
 | ShowDetailMode variants (C) | full suite runs the dispatcher gates in Disable/Expanded/Collapsed (699 passed); Disable path untouched |
 | Session/workspace isolation (C) | mascot is a pure function of the seed (no workspace data); the seed cache keys on seed only; the cards cache keys on archive root — nothing conflates sessions or workspaces |
@@ -81,7 +81,14 @@ widget payload costs the model nothing — same property catdesk-2jk relied on.
   change followed by a `resources/read` *before* any MCP request would render
   the new seed while the URI still addresses the old one; the first request
   after the change republishes and busts. The dashboard-side seed check keeps
-  even that window from showing a wrong mascot (outline instead).
-- Hosts that never fetch MCP resources see the loading outline instead of an
-  animated mascot — the same population that already sees card placeholders
+  even that window from showing a wrong mascot (empty hero instead).
+- Hosts that never fetch MCP resources see an empty mascot area instead of an
+  animated one — the same population that already sees card placeholders
   (catdesk-2jk known edge); ChatGPT's template channel fetches the resource.
+- Validation strictness is asymmetric by design: an explicit-but-corrupt
+  `widgetMascot` rejects the whole payload (it is server-authored content),
+  while a `widgetMascotSeed` of the wrong type or an identity with no matching
+  resource mascot degrades silently to the empty hero — the identity is a
+  lookup key, not a value the UI must render verbatim. Independent review
+  (post-merge) confirmed no correctness bugs; the doc wording above was
+  tightened from its first version accordingly.
