@@ -427,7 +427,10 @@ async fn workflow_files(harness: &GateHarness, footprints: &mut Vec<Footprint>) 
 
 /// Fake DevTools peer: echoes request arguments back as the tool text so the
 /// gate can assert the exact arguments that reached the peer, and serves a
-/// large deterministic body for get_network_request.
+/// large deterministic body for get_network_request. The body generator is
+/// shared byte-for-byte with the HTTP-transport mock peer in
+/// ops/measure-harness-payload.sh (DevTools profile, catdesk-ytk) — keep the
+/// two in lockstep so gate rows and HTTP rows stay like-for-like.
 fn spawn_fake_devtools_peer() -> Arc<Mutex<DevtoolsBridge>> {
     let child = tokio::process::Command::new("python3")
         .args([

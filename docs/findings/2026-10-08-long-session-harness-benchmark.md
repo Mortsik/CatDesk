@@ -46,9 +46,19 @@ host overhead separated from server payload?
   --output-format json` (2.1.270). One run per harness; artifacts
   (events/session transcripts, server connections.jsonl) land in the --out
   directory.
-- Workflow (c) needs a live DevTools bridge; its footprint comes from the
-  ojt.9 gate run on this same revision (fake peer, same handler the HTTP
-  path calls — only the transport differs), not from the HTTP script.
+- Workflow (c) is measured BOTH ways, with explicit provenance labels: the
+  ojt.9 gate run (fake peer, in-process) AND — added 2026-10-17 (catdesk-ytk)
+  — a `DevTools` profile of `ops/measure-harness-payload.sh` that routes the
+  same fixture through the REAL HTTP/MCP endpoint. A deterministic mock peer
+  stands in for chrome-devtools-mcp behind an `npx` PATH shim, and a stub
+  `chromium` executable (answers the `/json/version` probe only) satisfies
+  browser detection — no real browser, no CDP, no network, no live ChatGPT
+  account. The mock peer shares its byte-identical large-body generator with
+  the gate, so the two rows are like-for-like; a peer that fails to
+  provision fails the run loudly (missing tools in `tools/list`), never a
+  silent skip. Measured binary: `0.9.2+g6a4b2ef` (main minus the one
+  mascot-widget commit `57ea5bb`, which cannot touch the DevTools transport
+  path).
 - **Environment:** WSL2 (Linux 6.18.40.1-microsoft-standard-WSL2), release
   build, 2026-10-08. Wall-clock is single-run, shared-machine — treat as
   order-of-magnitude, not absolute.
@@ -121,19 +131,39 @@ no command tools in ReadOnly; (b)-write has no write tool, so the read/search
 subset ran over a file prepared directly in the workspace with byte-identical
 content.
 
-### Workflow (c): DevTools body (gate measurement, fake peer)
+### Workflow (c): DevTools body
 
-From `cargo test transcript_gate -- --nocapture` on this revision:
+Two source-qualified measurements, same byte-identical fixture (large
+network body = `GATE-NET-HEAD` + 8,192 × 16 filler chars + tail):
+
+**Gate (in-process, fake peer)** — `cargo test transcript_gate
+-- --nocapture` on this revision:
 
 | row | raw B | inline B | reduction |
 | --- | ---: | ---: | ---: |
 | snapshot + listing (input bounds) | 0 | 74 | — |
-| large network body | 131,141 | 4,744 | 96.4% |
+| large network body | 131,141 | 4,981 | 96.2% |
 
-(For reference the same gate run measured (a) 1,392,623 → 9,770 B and (b)
-read 493,378 → 5,166 B — consistent with the HTTP figures above; the small
-deltas are transport decorations server.rs adds after the gate's
-accounting point.)
+**Real HTTP/MCP transport (mock peer, DevTools profile)** — added
+2026-10-17 (catdesk-ytk); 2 runs, byte figures identical, walls quoted from
+the runs:
+
+| row | raw B | inline B | HTTP body B | budget B | outputRef | read_result calls | retrieved B | wall s | lossless |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| snapshot + listing (input bounds; defaults echoed: verbose=false, pageSize=100, pageIdx=2) | — | 1,119 | 1,159 | 65,536 | — | — | — | 0.002 | — |
+| large network body | 131,915 | 5,877 | 5,917 | 65,536 | yes | 2 | 131,915 (byte-for-byte) | 0.005–0.011 | yes |
+
+Mock-peer catalog contribution (visible only in this profile):
+`take_snapshot` 200 B, `list_console_messages` 240 B, `get_network_request`
+225 B schema objects; instruction text 3,447 B (vs 3,451 B in MultiTools —
+the mode line differs).
+
+The two measurements agree to within the transport decorations server.rs
+adds after the gate's accounting point (raw +774 B, inline +896 B here —
+same phenomenon as the (a)/(b) rows above); reconstruction is lossless on
+both paths. These figures qualify the CatDesk transport/budget path only —
+they are NOT chrome-devtools-mcp or real-browser measurements, and no
+client token or live-browser latency may be inferred from them.
 
 ## Harness-side: live runs
 
@@ -222,6 +252,7 @@ upper bound on what ChatGPT could place before the model.
 | Server schema payload (ReadOnly) | 12,581 B ≈ 3,145 tok | this benchmark, HTTP |
 | Server instruction (paid once) | 3,451 B (MultiTools) / 2,281 B (ReadOnly) | this benchmark, HTTP |
 | Server tool results, whole fixture | 21,380 B inline for 1,891,926 B raw (98.9% externalized) | this benchmark, HTTP |
+| DevTools tool results (mock peer over real HTTP) | 5,877 B inline for 131,915 B raw (95.5% externalized), 2 read_result calls, byte-for-byte | this benchmark, HTTP (catdesk-ytk) |
 | Codex schema presentation | 13,280 tokens (TS declarations) vs 6,337 tokens JSON ≈ 2.1× | Codex transcript |
 | Codex result transport | strips `responseBudget`/`_meta`; truncates outputs (41,520 B listing cap) | Codex transcript |
 | Codex session total | 195,732 input tok (166,912 cached), 686 out, 36 s | Codex usage |
@@ -238,8 +269,13 @@ upper bound on what ChatGPT could place before the model.
   TS-declaration inflation, host truncation caps) are single-run
   observations of stable host behavior — deterministic code paths, not
   sampling noise, but they were not re-run N times.
-- Workflow (c) numbers come from the gate's fake DevTools peer, not a real
-  chrome-devtools-mcp bridge; no browser was attached.
+- Workflow (c) numbers come from the gate's fake DevTools peer and (since
+  2026-10-17) the HTTP-transport DevTools profile's deterministic mock peer
+  — never a real chrome-devtools-mcp bridge; no browser was attached. The
+  mock peer's 3-tool catalog and schemas are the bench's own, so the
+  DevTools-profile schema row is not comparable to a real
+  chrome-devtools-mcp catalog footprint (that drift is documented in the
+  ojt.8 evaluation).
 - Codex ran with approvals bypassed (`--dangerously-bypass-approvals-and-sandbox`);
   the first attempt measured that default `exec` approval policy rejects
   every MCP tool call ("MCP tool call requires approval, but approval policy
@@ -282,6 +318,13 @@ upper bound on what ChatGPT could place before the model.
 - `cargo fmt` clean (run before commit).
 - Server-side benchmark: `ops/measure-harness-payload.sh` — byte-identical
   results across 3 MultiTools runs + 1 ReadOnly run.
+- DevTools transport profile (catdesk-ytk, 2026-10-17): 2 DevTools runs
+  byte-identical (walls drift by design); the provisioning failure path was
+  watched failing loudly before the mock peer existed (missing tools in
+  `tools/list` → `BENCH FAIL`), and MultiTools/ReadOnly were re-run green
+  after the pty-driver change (skip-key + mode-key sequencing) to prove the
+  existing profiles are unchanged. `cargo test transcript_gate` green on
+  the same tree; `cargo fmt --check` clean.
 - Harness runs: artifacts under /tmp/catdesk-ojt10-codex and
   /tmp/catdesk-ojt10-claude (session transcripts, events, server
   connections.jsonl); runners are committed and repeatable.
