@@ -200,78 +200,20 @@ pub(crate) fn agents_widget_state_payload(workspace_root: &str) -> std::io::Resu
     }))
 }
 
-/// One AGENTS.md layer rides the instruction text verbatim, so a workspace
-/// file must never be trusted at full size (audit finding F5). The cap uses
-/// the shared inline-budget scale and applies to the FINAL UTF-8 text: a
-/// lossy re-decode can expand one invalid byte into a 3-byte U+FFFD, so a
-/// sub-cap file must still be re-checked after decoding. An oversized layer
-/// keeps a bounded head plus a self-contained note — the file's tail is
-/// deliberately not read, so no budget head+tail preview (or stored
-/// remainder) applies here.
-const AGENTS_TEXT_PREVIEW_BYTES: usize = crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES;
-/// Reserved room for the truncation note so the preview stays within the cap
-/// for the largest possible file size. The note's skeleton is a fixed 80
-/// bytes; "at X" never exceeds 5 digits (X < the 64 KiB cap) and "of N"
-/// never exceeds 20 digits (u64::MAX), so the note tops out at 105 bytes and
-/// 112 leaves slack. A size-dependent note length must never be allowed to
-/// push the assembled preview past the cap.
-const AGENTS_TEXT_NOTE_ROOM: usize = 112;
-
+/// AGENTS.md is executable operating guidance for agents, not a sampled document.
+/// Never silently drop instructions from the middle or tail of the file.
+/// Tool transport also exempts catdesk_instruction from preview compaction.
 fn read_agents_text_result(path: &Path) -> std::io::Result<Option<String>> {
-    use std::io::Read;
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    // Read at most one byte past the cap. Oversize is decided from the bytes
-    // actually read — a metadata length can already be stale by the time the
-    // read happens, so it is never the sole classification input.
-    let metadata_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    let mut bytes = Vec::new();
-    let read_len = file
-        .take((AGENTS_TEXT_PREVIEW_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-
-    // Small files keep strict UTF-8 validation: a valid file is returned
-    // verbatim. An invalid one re-decodes lossily, which may expand the text
-    // past the cap — the re-check below catches that too.
-    let content = match String::from_utf8(bytes) {
-        Ok(content) => content,
-        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
-    };
-    // Oversize is settled first: the read window itself may be all whitespace
-    // padding with real content living past the cap, so an oversized file
-    // always gets the bounded preview. Only an inline-sized file may be
-    // classified as semantically empty.
-    if content.len() <= AGENTS_TEXT_PREVIEW_BYTES {
-        if content.trim().is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(content.trim().to_string()));
+    let content = String::from_utf8_lossy(&bytes);
+    if content.trim().is_empty() {
+        return Ok(None);
     }
-
-    // A lower bound on the file's real size for the note: the (possibly
-    // stale) metadata length or the bytes actually read, whichever is larger.
-    let size_bound = metadata_len.max(read_len as u64);
-    let head_room = AGENTS_TEXT_PREVIEW_BYTES - AGENTS_TEXT_NOTE_ROOM;
-    let mut head = content;
-    head.truncate(floor_char_boundary(&head, head_room));
-    head.push_str(&format!(
-        "\n… <agents text truncated at {} of at least {size_bound} bytes; full text not retained> …\n",
-        head.len()
-    ));
-    Ok(Some(head))
-}
-
-/// Largest index at or before `index` that lies on a char boundary.
-fn floor_char_boundary(text: &str, index: usize) -> usize {
-    let index = index.min(text.len());
-    let mut index = index;
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
+    Ok(Some(content.trim().to_string()))
 }
 
 pub(crate) fn cached_agents_text(path: &Path) -> Option<String> {

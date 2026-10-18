@@ -3254,45 +3254,139 @@ fn catdesk_instruction_keeps_richer_divergent_content() {
 }
 
 #[test]
-fn oversized_agents_text_layer_is_delivered_as_bounded_head_preview() {
-    let workspace_root =
-        std::env::temp_dir().join(format!("catdesk-mcp-agents-text-cap-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&workspace_root).expect("create workspace");
-    let agents_path = workspace_root.join("AGENTS.md");
-    let mut oversized = String::from("HEAD-SENTINEL\n");
-    while oversized.len() < 100_000 {
-        oversized.push_str("mid-padding-rule\n");
+fn agents_instructions_preserve_middle_and_tail_past_prior_limits() {
+    let root = std::env::temp_dir().join(format!("catdesk-agents-unbounded-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create test workspace");
+    let path = root.join("AGENTS.md");
+    let content = format!(
+        "HEAD-REQUIRED\\n{}MIDDLE-REQUIRED\\n{}TAIL-REQUIRED\\n",
+        "rule one\\n".repeat(11_000),
+        "rule two\\n".repeat(15_000)
+    )
+    .replace("\\n", "\n");
+    assert!(content.len() > 128 * 1024);
+    std::fs::write(&path, &content).expect("write instructions");
+
+    let read = super::agents_state::cached_agents_text(&path).expect("load instructions");
+    assert_eq!(
+        read.len(),
+        content.trim().len(),
+        "AGENTS.md must be complete"
+    );
+    assert!(read.contains("MIDDLE-REQUIRED"));
+    assert!(read.ends_with("TAIL-REQUIRED"));
+
+    let instructions =
+        catdesk_instruction_text(root.to_str().unwrap(), Mode::Both, ToolMode::MultiTools)
+            .expect("compose instructions");
+    assert!(instructions.contains("HEAD-REQUIRED"));
+    assert!(instructions.contains("MIDDLE-REQUIRED"));
+    assert!(instructions.contains("TAIL-REQUIRED"));
+    assert!(!instructions.contains("AGENTS.md truncated"));
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn guidance_files_bypass_read_file_and_batch_caps() {
+    let root = std::env::temp_dir().join(format!("catdesk-guidance-read-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let content = format!("HEAD\n{}TAIL", "guidance line\n".repeat(55_000));
+    assert!(content.len() > 512 * 1024);
+    let names = ["AGENTS.md", "CLAUDE.md", "GEMINI.md"];
+    for name in names {
+        std::fs::write(root.join(name), &content).unwrap();
     }
-    oversized.push_str("MIDDLE-SENTINEL\n");
-    while oversized.len() < 200_000 {
-        oversized.push_str("tail-padding-rule\n");
+    let requests: Vec<crate::workspace_tools::ReadRequest> = names
+        .iter()
+        .map(|name| crate::workspace_tools::ReadRequest {
+            path: (*name).to_string(),
+            start_line: None,
+            end_line: None,
+        })
+        .collect();
+    let result = crate::workspace_tools::read_files(root.to_str().unwrap(), &requests).unwrap();
+    assert!(
+        !result.batch_truncated,
+        "guidance content is never batch-capped"
+    );
+    assert_eq!(result.files.len(), 3);
+    for file in &result.files {
+        assert!(!file.truncated, "{} was truncated", file.path);
+        assert_eq!(file.bytes, content.len());
+        assert!(file.text.ends_with("TAIL"));
     }
-    oversized.push_str("\nTAIL-SENTINEL");
-    std::fs::write(&agents_path, &oversized).expect("write agents");
+    std::fs::write(root.join("ordinary.rs"), &content).unwrap();
+    let ordinary = crate::workspace_tools::read_files(
+        root.to_str().unwrap(),
+        &[crate::workspace_tools::ReadRequest {
+            path: "ordinary.rs".to_string(),
+            start_line: None,
+            end_line: None,
+        }],
+    )
+    .unwrap();
+    assert!(
+        ordinary.files[0].truncated,
+        "normal source files retain existing cap"
+    );
+    #[cfg(unix)]
+    {
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::os::unix::fs::symlink("../ordinary.rs", root.join("nested/AGENTS.md")).unwrap();
+        let linked = crate::workspace_tools::read_files(
+            root.to_str().unwrap(),
+            &[crate::workspace_tools::ReadRequest {
+                path: "nested/AGENTS.md".into(),
+                start_line: None,
+                end_line: None,
+            }],
+        )
+        .unwrap();
+        assert!(
+            !linked.files[0].truncated,
+            "AGENTS.md symlink must bypass cap"
+        );
+        assert!(linked.files[0].text.ends_with("TAIL"));
+        let mixed = crate::workspace_tools::read_files(
+            root.to_str().unwrap(),
+            &["ordinary.rs", "nested/AGENTS.md"]
+                .iter()
+                .map(|path| crate::workspace_tools::ReadRequest {
+                    path: (*path).into(),
+                    start_line: None,
+                    end_line: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            mixed
+                .files
+                .iter()
+                .any(|file| !file.truncated && file.text.ends_with("TAIL")),
+            "batch dedup must not discard the complete AGENTS.md alias"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
 
-    let preview = super::agents_state::cached_agents_text(&agents_path)
-        .expect("a non-empty oversized layer must still deliver a preview");
-
-    assert!(preview.contains("HEAD-SENTINEL"));
-    assert!(
-        !preview.contains("MIDDLE-SENTINEL"),
-        "bytes past the reader cap must never ride the instruction payload"
+#[test]
+fn oversized_agents_text_layer_is_delivered_whole() {
+    let root = std::env::temp_dir().join(format!("catdesk-agents-big-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let text = format!(
+        "HEAD-SENTINEL\n{}MIDDLE-SENTINEL\n{}TAIL-SENTINEL",
+        "middle-rule\n".repeat(10_000),
+        "tail-rule\n".repeat(12_000)
     );
-    assert!(
-        !preview.contains("TAIL-SENTINEL"),
-        "the file tail is deliberately unread: no synthetic tail may appear"
-    );
-    assert!(
-        preview.contains("full text not retained"),
-        "the omission note must be self-contained: this surface has no outputRef: {preview:.200}"
-    );
-    assert!(
-        preview.len() <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
-        "preview must stay on the shared inline-budget scale, got {} bytes",
-        preview.len()
-    );
-
-    let _ = std::fs::remove_dir_all(workspace_root);
+    let path = root.join("AGENTS.md");
+    std::fs::write(&path, &text).unwrap();
+    let read = super::agents_state::cached_agents_text(&path).expect("read full AGENTS.md");
+    assert_eq!(read.len(), text.len());
+    assert!(read.contains("MIDDLE-SENTINEL"));
+    assert!(read.ends_with("TAIL-SENTINEL"));
+    assert!(!read.contains("full text not retained"));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -3316,31 +3410,20 @@ fn small_agents_text_layer_is_kept_verbatim_without_a_truncation_note() {
 }
 
 #[test]
-fn invalid_utf8_agents_layer_cannot_expand_past_the_cap() {
-    let workspace_root =
-        std::env::temp_dir().join(format!("catdesk-mcp-agents-text-utf8-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&workspace_root).expect("create workspace");
-    let agents_path = workspace_root.join("AGENTS.md");
-    // One lone continuation byte per line: every byte decodes into a 3-byte
-    // U+FFFD, so the lossy result is ~3x the raw file size.
+fn invalid_utf8_agents_layer_keeps_every_replacement_character() {
+    let root = std::env::temp_dir().join(format!("catdesk-agents-invalid-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("AGENTS.md");
     let invalid = vec![0x80_u8; super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES];
-    std::fs::write(&agents_path, &invalid).expect("write invalid utf8 agents");
-
-    let preview = super::agents_state::cached_agents_text(&agents_path)
-        .expect("a non-empty invalid-utf8 layer must still deliver a preview");
-
-    assert!(
-        preview.len() <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
-        "the cap must hold on the FINAL UTF-8 text, got {} bytes from a {}-byte file",
-        preview.len(),
-        invalid.len()
+    std::fs::write(&path, &invalid).unwrap();
+    let read = super::agents_state::cached_agents_text(&path).unwrap();
+    assert_eq!(
+        read.len(),
+        invalid.len() * 3,
+        "lossy UTF-8 may expand, not truncate"
     );
-    assert!(
-        preview.contains("full text not retained"),
-        "a file whose decoded text exceeds the cap must carry the truncation note"
-    );
-
-    let _ = std::fs::remove_dir_all(workspace_root);
+    assert!(!read.contains("full text not retained"));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -3371,126 +3454,48 @@ fn invalid_utf8_within_the_cap_stays_lossy_without_a_note() {
 }
 
 #[test]
-fn oversized_agents_preview_stays_within_the_cap_for_huge_file_sizes() {
-    let workspace_root = std::env::temp_dir().join(format!(
-        "catdesk-mcp-agents-text-huge-size-{}",
-        Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&workspace_root).expect("create workspace");
-    let agents_path = workspace_root.join("AGENTS.md");
-    let mut content = String::from("HEAD-SENTINEL\n");
-    while content.len() < 70 * 1024 {
-        content.push_str("rule\n");
-    }
-    std::fs::write(&agents_path, &content).expect("write oversized agents");
-    // A sparse extension reports a ~100 GB metadata length: the note's size
-    // digits grow with the reported size, so the reserved note room must
-    // already account for the largest possible note.
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&agents_path)
-        .expect("open agents for sparse extension");
-    file.set_len(100_000_000_000)
-        .expect("extend file to 100 GB");
-    drop(file);
-
-    let preview = super::agents_state::cached_agents_text(&agents_path)
-        .expect("a non-empty oversized layer must still deliver a preview");
-
-    assert!(
-        preview.len() <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
-        "the cap must hold even with a 12-digit size in the note, got {} bytes",
-        preview.len()
-    );
-    assert!(preview.contains("HEAD-SENTINEL"));
-    assert!(preview.contains("full text not retained"));
-    assert!(
-        preview.contains("100000000000"),
-        "the note must name the real size bound it saw: {preview:.200}"
-    );
-
-    let _ = std::fs::remove_dir_all(workspace_root);
+fn large_agents_text_does_not_need_size_preview() {
+    let root = std::env::temp_dir().join(format!("catdesk-agents-large-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("AGENTS.md");
+    let content = format!("HEAD-SENTINEL\n{}TAIL-SENTINEL", "rule\n".repeat(20_000));
+    std::fs::write(&path, &content).unwrap();
+    let read = super::agents_state::cached_agents_text(&path).unwrap();
+    assert_eq!(read.len(), content.len());
+    assert!(read.ends_with("TAIL-SENTINEL"));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn whitespace_padded_oversized_agents_layer_keeps_a_bounded_preview() {
-    let workspace_root = std::env::temp_dir().join(format!(
-        "catdesk-mcp-agents-text-whitespace-{}",
-        Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&workspace_root).expect("create workspace");
-
-    // The read window (cap + 1 bytes) is ALL spaces with real content living
-    // past it: emptiness must be classified only for inline-sized files,
-    // otherwise this layer would silently vanish.
-    let agents_path = workspace_root.join("AGENTS.md");
-    let mut padded = String::new();
-    while padded.len() < 70 * 1024 {
-        padded.push(' ');
-    }
-    padded.push_str("HIDDEN-GUARANTEE");
-    std::fs::write(&agents_path, &padded).expect("write whitespace-padded agents");
-
-    let preview = super::agents_state::cached_agents_text(&agents_path)
-        .expect("an oversized layer must not vanish behind whitespace padding");
-
-    assert!(
-        preview.len() <= super::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
-        "the whitespace head plus note must stay within the cap, got {} bytes",
-        preview.len()
-    );
-    assert!(
-        preview.contains("full text not retained"),
-        "the bounded preview must say the full text was not kept"
-    );
-
-    // Inline-sized whitespace stays semantically empty, as before.
-    let spaces_path = workspace_root.join("spaces-only.md");
-    std::fs::write(&spaces_path, " \n\t".repeat(256)).expect("write spaces-only layer");
-    assert!(
-        super::agents_state::cached_agents_text(&spaces_path).is_none(),
-        "an inline-sized whitespace-only layer is still no layer at all"
-    );
-
-    let _ = std::fs::remove_dir_all(workspace_root);
+fn whitespace_padded_agents_text_does_not_hide_its_tail() {
+    let root = std::env::temp_dir().join(format!("catdesk-agents-spaces-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("AGENTS.md");
+    std::fs::write(&path, format!("{}HIDDEN-GUARANTEE", " ".repeat(70 * 1024))).unwrap();
+    let read = super::agents_state::cached_agents_text(&path).unwrap();
+    assert!(read.ends_with("HIDDEN-GUARANTEE"));
+    assert!(!read.contains("full text not retained"));
+    let empty = root.join("empty.md");
+    std::fs::write(&empty, " \n\t".repeat(256)).unwrap();
+    assert!(super::agents_state::cached_agents_text(&empty).is_none());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn oversized_agents_layer_never_rides_catdesk_instruction_inline() {
-    let workspace_root = std::env::temp_dir().join(format!(
-        "catdesk-mcp-agents-instruction-cap-{}",
-        Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&workspace_root).expect("create workspace");
-    let mut oversized = String::from("HEAD-SENTINEL\n");
-    while oversized.len() < 300_000 {
-        oversized.push_str("padding-rule\n");
-    }
-    oversized.push_str("\nTAIL-SENTINEL");
-    std::fs::write(workspace_root.join("AGENTS.md"), &oversized)
-        .expect("write oversized agents layer");
-    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
-
+fn oversized_agents_layer_rides_catdesk_instruction_whole() {
+    let root = std::env::temp_dir().join(format!("catdesk-agents-inline-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let content = format!(
+        "HEAD-SENTINEL\n{}TAIL-SENTINEL",
+        "padding-rule\n".repeat(30_000)
+    );
+    std::fs::write(root.join("AGENTS.md"), &content).unwrap();
     let instruction =
-        catdesk_instruction_text(&workspace_root_str, Mode::Both, ToolMode::MultiTools)
-            .expect("build instruction");
-
+        catdesk_instruction_text(root.to_str().unwrap(), Mode::Both, ToolMode::MultiTools).unwrap();
     assert!(instruction.contains("HEAD-SENTINEL"));
-    assert!(
-        !instruction.contains("TAIL-SENTINEL"),
-        "an arbitrarily large AGENTS.md must not be inlined into the instruction"
-    );
-    assert!(
-        instruction.contains("AGENTS.md truncated"),
-        "the layer cap must disclose the cut in the instruction text"
-    );
-    assert!(
-        instruction.len() < 32 * 1024,
-        "instruction must stay near the template plus one bounded layer, got {} bytes",
-        instruction.len()
-    );
-
-    let _ = std::fs::remove_dir_all(workspace_root);
+    assert!(instruction.ends_with("TAIL-SENTINEL"));
+    assert!(!instruction.contains("AGENTS.md truncated"));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -7314,21 +7319,30 @@ async fn retrieval_hint_fields_are_declared_in_budgetable_output_schemas() {
         "start_command",
         "poll_command",
         "cancel_command",
-        "catdesk_instruction",
     ] {
         let schema = tools
             .iter()
             .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
             .and_then(|tool| tool.get("outputSchema"))
             .unwrap_or_else(|| panic!("missing outputSchema for {name}"));
-        for field in ["outputRef", "outputBytes", "outputTruncated"] {
+        for field in [
+            "outputRef",
+            "outputBytes",
+            "outputTruncated",
+            "retrievalAdvice",
+        ] {
             assert!(
                 schema["properties"].get(field).is_some(),
                 "{name} must declare {field} so the hint survives outputSchema projection"
             );
         }
     }
-    for name in ["read_result", "search_result", "read_image"] {
+    for name in [
+        "read_result",
+        "search_result",
+        "read_image",
+        "catdesk_instruction",
+    ] {
         let schema = tools
             .iter()
             .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
@@ -7399,6 +7413,13 @@ async fn externalized_results_surface_retrieval_inside_structured_content() {
             .pointer("/responseBudget/originalBytes")
             .and_then(Value::as_u64),
         "outputBytes must quote the manifest's original size"
+    );
+    assert!(
+        inline
+            .pointer("/structuredContent/retrievalAdvice")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("read_result")),
+        "tool must explain how to recover omitted data"
     );
 
     std::fs::remove_dir_all(workspace_root).ok();
@@ -8912,7 +8933,7 @@ const TOOL_PAYLOAD_AUDIT: &[(&str, &str)] = &[
     // Not inherent-static: the template is fixed, but the response embeds
     // uncapped host-controlled AGENTS.md text and Binagotchy card images
     // (finding F5). Only the shared-budget gate bounds it today.
-    ("catdesk_instruction", "shared-budget"),
+    ("catdesk_instruction", "guidance-exempt"),
     ("read", "shared-budget+pre-cap"),
     ("read_image", "multimodal-exempt"),
     ("search", "shared-budget+pre-cap"),
@@ -8930,6 +8951,7 @@ const AUDITED_BOUNDING_CLASSES: &[&str] = &[
     "shared-budget",
     "shared-budget+pre-cap",
     "store-range",
+    "guidance-exempt",
     "inherent-static",
     "multimodal-exempt",
     "devtools-passthrough",
@@ -9260,20 +9282,17 @@ async fn devtools_passthrough_big_result_goes_through_shared_budget() {
 /// model could not see (user report 2026-10-08, "pełna instrukcja częściowo
 /// ucięta"). The answer stays inline, bounded, and honest about the cut.
 #[tokio::test]
-async fn oversized_agents_layers_are_capped_inline_and_disclosed() {
-    let workspace_root =
-        std::env::temp_dir().join(format!("catdesk-audit-instruction-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&workspace_root).expect("create workspace");
-    // ~1 MiB of AGENTS.md: far past the per-layer cap, far past the inline
-    // budget that used to externalize the whole instruction.
-    let agents_bytes = "INSTRUCTIONS-".repeat(80_000);
-    std::fs::write(workspace_root.join("AGENTS.md"), &agents_bytes)
-        .expect("write oversized AGENTS.md");
-    let req = tool_call_request("catdesk_instruction", json!({}));
-
+async fn oversized_agents_layers_are_delivered_whole_without_budgeting() {
+    let root = std::env::temp_dir().join(format!("catdesk-agents-transport-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let content = format!(
+        "HEAD-REQUIRED\n{}TAIL-REQUIRED",
+        "INSTRUCTIONS-".repeat(80_000)
+    );
+    std::fs::write(root.join("AGENTS.md"), &content).unwrap();
     let response = handle_tools_call(
-        &req,
-        &workspace_root.to_string_lossy(),
+        &tool_call_request("catdesk_instruction", json!({})),
+        root.to_str().unwrap(),
         1,
         Mode::Both,
         ToolMode::MultiTools,
@@ -9282,44 +9301,33 @@ async fn oversized_agents_layers_are_capped_inline_and_disclosed() {
         &None,
     )
     .await;
-
     let result = response.result.expect("instruction result");
-    let serialized = serde_json::to_vec(&result).expect("serialize result");
-    assert!(
-        serialized.len() <= crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES,
-        "a capped instruction stays fully inline; got {} bytes",
-        serialized.len()
-    );
-    assert!(
-        result.get("responseBudget").is_none(),
-        "the instruction must not be externalized: the layer cap bounds it input-side"
-    );
-    let instruction_text = result
+    let instruction = result
         .pointer("/structuredContent/instructionText")
         .and_then(Value::as_str)
-        .expect("instruction text");
+        .expect("complete instruction");
+    assert!(instruction.contains("HEAD-REQUIRED"));
+    assert!(instruction.ends_with("TAIL-REQUIRED"));
+    assert!(!instruction.contains("AGENTS.md truncated"));
+    assert!(instruction.len() >= content.len());
     assert!(
-        instruction_text.contains("AGENTS.md truncated"),
-        "the cut layer must be disclosed in the text: …{}",
-        &instruction_text[instruction_text.len().saturating_sub(200)..]
+        result.get("responseBudget").is_none(),
+        "instructions must never become a preview"
     );
-    let _ = std::fs::remove_dir_all(workspace_root);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// For a layer between the instruction cap and the agents-text preview cap
 /// the file arrives verbatim, so the disclosure can name the true size.
 #[tokio::test]
-async fn agents_layer_over_the_cap_discloses_the_true_size() {
-    let workspace_root =
-        std::env::temp_dir().join(format!("catdesk-audit-instruction-mid-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&workspace_root).expect("create workspace");
-    let agents_text = "rule-line\n".repeat(2048); // 20 480 bytes
-    std::fs::write(workspace_root.join("AGENTS.md"), &agents_text).expect("write AGENTS.md");
-    let req = tool_call_request("catdesk_instruction", json!({}));
-
+async fn agents_layer_over_previous_cap_is_unmodified() {
+    let root = std::env::temp_dir().join(format!("catdesk-agents-mid-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let content = "rule-line\n".repeat(2048);
+    std::fs::write(root.join("AGENTS.md"), &content).unwrap();
     let response = handle_tools_call(
-        &req,
-        &workspace_root.to_string_lossy(),
+        &tool_call_request("catdesk_instruction", json!({})),
+        root.to_str().unwrap(),
         1,
         Mode::Both,
         ToolMode::MultiTools,
@@ -9328,22 +9336,16 @@ async fn agents_layer_over_the_cap_discloses_the_true_size() {
         &None,
     )
     .await;
-
-    let instruction_text = response
+    let instruction = response
         .result
         .as_ref()
-        .and_then(|result| result.pointer("/structuredContent/instructionText"))
+        .unwrap()
+        .pointer("/structuredContent/instructionText")
         .and_then(Value::as_str)
-        .expect("instruction text");
-    assert!(
-        instruction_text.contains(&format!(
-            "AGENTS.md truncated at 8192 of {} bytes",
-            agents_text.trim().len()
-        )),
-        "the disclosure must name the true original size: …{}",
-        &instruction_text[instruction_text.len().saturating_sub(200)..]
-    );
-    let _ = std::fs::remove_dir_all(workspace_root);
+        .unwrap();
+    assert!(instruction.contains(content.trim()));
+    assert!(!instruction.contains("AGENTS.md truncated"));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]

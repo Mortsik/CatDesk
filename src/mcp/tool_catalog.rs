@@ -399,8 +399,10 @@ fn ensure_local_tool_output_schema(tool: &mut Value) {
     // ChatGPT projects results through this schema — fields it does not
     // declare here must not be relied on to reach the model. The two
     // store-range tools are exempt from the budget and never externalize.
-    if !matches!(name.as_str(), "read_result" | "search_result")
-        && let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut)
+    if !matches!(
+        name.as_str(),
+        "read_result" | "search_result" | "catdesk_instruction"
+    ) && let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut)
     {
         properties.insert(
             "outputRef".to_string(),
@@ -422,6 +424,13 @@ fn ensure_local_tool_output_schema(tool: &mut Value) {
             json!({
                 "type": "boolean",
                 "description": "true means the content you saw is a bounded preview, not the whole output"
+            }),
+        );
+        properties.insert(
+            "retrievalAdvice".to_string(),
+            json!({
+                "type": "string",
+                "description": "Instructions for recovering omitted material when this reply is only a preview"
             }),
         );
     }

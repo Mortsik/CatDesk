@@ -151,6 +151,9 @@ impl BudgetCandidate {
             structured
                 .entry("outputBytes".to_string())
                 .or_insert_with(|| json!(self.original.len()));
+            structured.entry("retrievalAdvice".to_string()).or_insert_with(|| json!(
+                "This is only a preview. Before relying on omitted data, retrieve the necessary portion with read_result(result_id=outputRef, offset=...) or search_result; do not assume the preview is complete."
+            ));
             return;
         }
         if let Some(content) = self
@@ -572,6 +575,7 @@ fn is_essential_key(key: &str) -> bool {
             | "exitCode"
             | "timedOut"
             | "jobId"
+            | "retrievalAdvice"
             | "id"
             | "path"
             | "cwd"

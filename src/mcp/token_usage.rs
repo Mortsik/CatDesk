@@ -11,14 +11,17 @@ use crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES;
 /// [`exempt_from_response_budget`] for the shape that must never be encoded).
 const EXACT_TOKENIZATION_LIMIT_BYTES: usize = 2 * DEFAULT_INLINE_RESPONSE_BYTES;
 
-/// Results these tools return are exempt from the response budget gate
-/// (src/mcp.rs keeps them uncut), so whatever size the caller asked for
-/// reaches the estimator in full. Their ranges are newline-free base64, and
-/// an unbroken homogeneous run (e.g. zero padding encoding to `AAAA…`) makes
+/// Retrieval ranges and mandatory agent instructions are exempt from preview
+/// compaction. Large AGENTS.md instruction layers must reach the model whole.
+/// The token estimator must therefore bound its work even for very large results.
+/// Retrieval ranges may contain newline-free base64: an unbroken homogeneous run (e.g. zero padding encoding to `AAAA…`) makes
 /// the BPE encode quadratic AT ANY SIZE: measured at 36 s for a legal 109 KiB
 /// serialized range that sits well under the size cap, and 93 s at 180 KiB.
 pub(crate) fn exempt_from_response_budget(tool_name: &str) -> bool {
-    matches!(tool_name, "read_result" | "search_result")
+    matches!(
+        tool_name,
+        "read_result" | "search_result" | "catdesk_instruction"
+    )
 }
 
 #[derive(Clone, Default)]

@@ -14,6 +14,7 @@ matrix), and each handler was traced to its bounding mechanism.
 | --- | --- |
 | `shared-budget` | Response flows through the canonical dispatcher gate `apply_response_budget` (`src/mcp.rs:493-506`): results over 64 KiB serialized (`src/mcp/response_budget.rs:6`) are losslessly stored in the large-result store and replaced by a bounded preview with a `responseBudget` manifest pointing at `read_result`/`search_result`. |
 | `shared-budget+pre-cap` | Same dispatcher gate, plus a tool-level cap on the data before serialization (command buffers, search limits, read batch budget). Pre-caps bound what enters the store; the shared budget bounds the inline response. |
+| `guidance-exempt` | Mandatory operating instructions bypass preview compaction and preserve the complete instruction text. Caller/model transport limitations still apply; no truncation is performed by CatDesk. |
 | `store-range` | The tool *is* the retrieval instrument, so it is excluded from the dispatcher gate (`src/mcp.rs:493`) and bounded inherently by store-side request validation (`src/result_store.rs`). |
 | `inherent-static` | Response is generated from static templates or small scalars; no host-controlled payload surface. Still covered by the shared-budget gate as a backstop. |
 | `multimodal-exempt` | Response carries native non-text MCP content, which the shared budget deliberately leaves intact (`response_budget.rs:168`, `has_native_non_text_content`) to preserve multimodal capability. Image bytes are capped by `MAX_IMAGE_BYTES`. |
@@ -32,7 +33,7 @@ compares it against the enumerated catalog exposure per (Mode, ToolMode).
 | `start_command` | C+M | `events[]` (early output), job scalars | `shared-budget+pre-cap` | retained-output cap 4 MiB/job `src/command_jobs.rs:31`, `src/mcp/commands.rs:163` | First snapshot may carry early output up to the retained cap; shared budget externalizes anything over 64 KiB. |
 | `poll_command` | C+M | `events[]` (incremental output), text content | `shared-budget+pre-cap` | per-poll clip 128 KiB `src/command_jobs.rs:33,352-381`, retained 4 MiB `src/command_jobs.rs:31` | A single event larger than 128 KiB still passes whole (see discoveries); the shared budget bounds the final inline response. |
 | `cancel_command` | C+M | `events[]` (terminal output) | `shared-budget+pre-cap` | terminal retained output 32 MiB `src/command_jobs.rs:32`, `src/mcp/commands.rs:330` | Bounded by retention cap + shared budget. |
-| `catdesk_instruction` | C+M, C+R, B | `instructionText`, text content, widget `_meta` (`binagotchyCards[]` with base64 images) | `shared-budget` | template lines `src/mcp/instruction.rs:142-236`; AGENTS.md layers read unbounded `src/mcp/agents_state.rs:203-211` via `src/mcp/instruction.rs:82-123,232-236`; widget cards read unbounded `src/mascot.rs:520-553` via `src/mcp/instruction.rs:323-336` | Not inherent-static: the template is fixed, but the response embeds host-controlled AGENTS.md text and archived Binagotchy card images, neither length-capped — finding F5. Only the shared-budget gate bounds the response (and its >64 MiB fail-open, F2, applies). Regression test `oversized_catdesk_instruction_is_externalized_not_inlined` pins the externalization contract. |
+| `catdesk_instruction` | C+M, C+R, B | Complete `instructionText`, text content, widget `_meta` | `guidance-exempt` | `src/mcp/agents_state.rs` full read, `src/mcp/instruction.rs` uncapped layers, `src/mcp/token_usage.rs` dispatcher exemption | Mandatory agent instructions are never truncated or externalized into previews. This is a deliberate exception for complete operating guidance. |
 | `read` | C+M, C+R | `files[].text`, text content | `shared-budget+pre-cap` | batch budget 512 KiB `src/workspace_tools.rs:23`, per-file cap 512 KiB `src/workspace_tools.rs:21`, batch size 32 `src/workspace_tools.rs:22`, per-file budget accounting `src/workspace_tools.rs:449-473`, flags `budgetTruncated`/`batchTruncated` `src/mcp/file_tools.rs:56-61` | Files past the batch budget return metadata only. |
 | `read_image` | C+M, C+R | image content (base64), `structuredContent` (with `analyze`) | `multimodal-exempt` | input cap 20 MiB / 40 Mpx `src/workspace_tools.rs:27-28`, resize default 1600 max 4096 `src/workspace_tools.rs:24-26`, post-encode cap `src/workspace_tools.rs:425`, exemption `src/mcp/response_budget.rs:168` with test `src/mcp/response_budget.rs:879`, size-cap test `src/mcp/tests.rs:4014-4031` | Deliberate multimodal exception: native image content bypasses the budget so clients keep vision capability. With `analyze`, `analysis.description` has no cap — finding F1. |
 | `search` | C+M, C+R | `searchResults[]` (path/line/text), text content | `shared-budget+pre-cap` | match cap default 100 hard 500 `src/workspace_tools.rs:32-33`, per-file cap `src/mcp/tool_catalog.rs:642`, deadline truncation `src/workspace_tools.rs:39-50`, fallback scan caps `src/workspace_tools.rs:62-64`, `searchTruncated` flag `src/mcp/file_tools.rs:506` | A single matched line can still be arbitrarily long (minified files); the shared budget externalizes such responses over 64 KiB. |
@@ -100,6 +101,16 @@ upstream by the DevTools transport cap.
   - `src/mcp/instruction.rs:323-336,313` — the cards are attached to the widget `_meta` of the instruction response (`binagotchyCards`).
 - Problem: a large AGENTS.md (or many/oversized archived cards) inflates the response arbitrarily; today only the shared-budget gate bounds it, so the response is externalized above 64 KiB — but above the store's 64 MiB entry cap the F2 fail-open returns the whole thing inline. The base64 card images also permanently inflate the widget `_meta` that travels with the (usually tiny) instruction response.
 - Suggested direction: cap `read_agents_text_result` (e.g. head preview at 64 KiB with an explicit truncation marker) and cap the card feed (max card count and max PNG bytes; skip oversized entries) so the tool's own sources are bounded instead of relying solely on the dispatcher gate.
+
+**2026-10-18 follow-up:** The F5 diagnosis above is historical. Per user
+requirement, AGENTS.md now bypasses both the input-side 64 KiB preview and
+the 8 KiB instruction-layer limit. catdesk_instruction is exempt from the
+shared output preview budget, preserving the complete operating guidance.
+The read tool likewise exempts AGENTS.md, CLAUDE.md, GEMINI.md and
+copilot-instructions.md from its 512 KiB per-file and batch caps. All other
+files keep their limits. This deliberately trades potential large instruction
+payloads for complete policy visibility; host/model context constraints
+remain separate from CatDesk's own byte limits.
 
 ### F6 — retrieval-tool responses pay full o200k tokenization inline — severity: medium (performance)
 

@@ -17,10 +17,27 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Per-file cap; MAX_READ_BATCH_BYTES caps the whole batch.
+/// Per-file cap for ordinary files; agent guidance files bypass both read caps.
 const MAX_READ_BYTES: usize = 512 * 1024;
 pub const MAX_READ_BATCH_FILES: usize = 32;
 pub const MAX_READ_BATCH_BYTES: usize = 512 * 1024;
+
+/// Agent guidance documents bypass file and batch limits so rules stay complete.
+/// The transport externalizes large read replies losslessly for retrieval.
+fn is_agent_guidance_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|file| file.to_str())
+        .is_some_and(|file| {
+            [
+                "AGENTS.md",
+                "CLAUDE.md",
+                "GEMINI.md",
+                "copilot-instructions.md",
+            ]
+            .iter()
+            .any(|name| file.eq_ignore_ascii_case(name))
+        })
+}
 pub const DEFAULT_IMAGE_MAX_WIDTH: u32 = 1600;
 pub const DEFAULT_IMAGE_MAX_HEIGHT: u32 = 1600;
 pub const MAX_IMAGE_OUTPUT_DIMENSION: u32 = 4096;
@@ -465,6 +482,8 @@ fn read_file_in_range(
     let root = workspace_root_path(workspace_root)?;
     let target = resolve_target_path(workspace_root, &request.path)?;
     let size_bytes = readable_size(&target)?;
+    let guidance =
+        is_agent_guidance_file(Path::new(&request.path)) || is_agent_guidance_file(&target);
 
     let (mut text, truncated, line_count, start_line, end_line) =
         match (request.start_line, request.end_line) {
@@ -477,7 +496,13 @@ fn read_file_in_range(
                 // away, so the read stops at the budget. The open still happens,
                 // which is what lets a file that cannot be read report its own
                 // error instead of a budget cut.
-                let cap = budget.min(MAX_READ_BYTES);
+                let cap = if guidance {
+                    usize::try_from(size_bytes)
+                        .unwrap_or(usize::MAX - 1)
+                        .min(usize::MAX - 1)
+                } else {
+                    budget.min(MAX_READ_BYTES)
+                };
                 let mut buf = Vec::with_capacity(cap + 1);
                 let read_n = file
                     .by_ref()
@@ -491,7 +516,7 @@ fn read_file_in_range(
                 // can exceed the cap even when the file did not. Cutting it here
                 // keeps that a per-file limit rather than something the batch
                 // blames on its budget.
-                if text.len() > MAX_READ_BYTES {
+                if !guidance && text.len() > MAX_READ_BYTES {
                     let keep = floor_char_boundary(&text, MAX_READ_BYTES);
                     text.truncate(keep);
                     truncated = true;
@@ -503,7 +528,11 @@ fn read_file_in_range(
             }
             (start_line, end_line) => {
                 let start_line = start_line.unwrap_or(1);
-                let cap = budget.min(MAX_READ_BYTES);
+                let cap = if guidance {
+                    usize::MAX - 1
+                } else {
+                    budget.min(MAX_READ_BYTES)
+                };
                 if cap == 0 {
                     // The batch cannot keep a single byte of the range: skip
                     // the offset scan (locating a range can walk the whole
@@ -540,7 +569,7 @@ fn read_file_in_range(
                 let mut text = String::from_utf8_lossy(data).into_owned();
                 // The same lossy-expansion cut the head read applies: decoded
                 // text can cross the per-file cap the disk read never did.
-                if text.len() > MAX_READ_BYTES {
+                if !guidance && text.len() > MAX_READ_BYTES {
                     let keep = floor_char_boundary(&text, MAX_READ_BYTES);
                     text.truncate(keep);
                     truncated = true;
@@ -768,24 +797,41 @@ pub fn read_files(
 
     // A symlink and its target canonicalize to the same place, as does the
     // same request twice. Reading it twice would charge the budget twice; the
-    // same file under two different ranges is two distinct reads.
-    let mut already_read: HashSet<(PathBuf, Option<usize>, Option<usize>)> = HashSet::new();
+    // same file under two different ranges or with distinct guidance status
+    // is two distinct reads: a capped normal read must not hide AGENTS.md.
+    let mut already_read: HashSet<(PathBuf, Option<usize>, Option<usize>, bool)> = HashSet::new();
 
     for index in read_order(&planned) {
         let request = &requests[index];
+        let guidance = is_agent_guidance_file(Path::new(&request.path))
+            || planned[index]
+                .target
+                .as_deref()
+                .is_some_and(is_agent_guidance_file);
         if let Some(target) = &planned[index].target
-            && already_read.contains(&(target.clone(), request.start_line, request.end_line))
+            && already_read.contains(&(
+                target.clone(),
+                request.start_line,
+                request.end_line,
+                guidance,
+            ))
         {
             continue;
         }
-        match read_file_in_range(workspace_root, request, remaining) {
+        let read_budget = if guidance { usize::MAX - 1 } else { remaining };
+        match read_file_in_range(workspace_root, request, read_budget) {
             Ok(output) => {
-                let keep = floor_char_boundary(&output.text, remaining);
+                let keep = if guidance {
+                    output.text.len()
+                } else {
+                    floor_char_boundary(&output.text, remaining)
+                };
                 let text_cut = keep < output.text.len();
                 // Now that the read stops at the budget, how much came back no
                 // longer says which limit stopped it. The budget is the binding
                 // one whenever it is tighter than the per-file cap.
-                let budget_cut = text_cut || (output.truncated && remaining < MAX_READ_BYTES);
+                let budget_cut =
+                    !guidance && (text_cut || (output.truncated && remaining < MAX_READ_BYTES));
                 let truncated = output.truncated || text_cut;
                 batch_truncated |= budget_cut;
                 let mut text = output.text;
@@ -795,11 +841,18 @@ pub fn read_files(
                 } else {
                     output.line_count
                 };
-                remaining -= keep;
+                if !guidance {
+                    remaining -= keep;
+                }
                 total_bytes += keep;
                 total_line_count += line_count;
                 if let Some(target) = &planned[index].target {
-                    already_read.insert((target.clone(), request.start_line, request.end_line));
+                    already_read.insert((
+                        target.clone(),
+                        request.start_line,
+                        request.end_line,
+                        guidance,
+                    ));
                 }
                 // Reported bounds describe what came back: a whole range keeps
                 // its resolved end, a cut range counts the lines actually
