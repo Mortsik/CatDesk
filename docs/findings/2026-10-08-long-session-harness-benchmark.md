@@ -165,6 +165,21 @@ both paths. These figures qualify the CatDesk transport/budget path only —
 they are NOT chrome-devtools-mcp or real-browser measurements, and no
 client token or live-browser latency may be inferred from them.
 
+Re-verified at HEAD `807eb73` (2026-10-19, catdesk-ytk closure): the release
+binary was rebuilt from this tree and the DevTools profile ran twice —
+bytes identical across runs, provisioning and reconstruction green. Absolute
+figures shift uniformly vs the pinned `g6a4b2ef` binary quoted above: every
+DevTools row +122 B (raw 132,037 B → inline 5,999 B, 95.5%; input bounds
+1,241 B; instruction text 3,447 B unchanged). The shift comes from
+`7f7233a`/`00a92a1`/`9138ae1` sitting between the pinned binary and this
+branch's base `443743a` — result-envelope and schema bytes grew (MultiTools
+at HEAD: `tools/list` +7,248 B; instruction full result −6,367 B as the
+widget `_meta` moved to the widget resource; step rows +122…+233 B), while
+structure is unchanged: the same 2 read_result calls, byte-for-byte
+reconstruction, and identical retrieval counts (11/4 in MultiTools, 98.8%
+reduction). Gate-vs-HTTP like-for-like holds per binary version — always
+quote absolute bytes together with the binary that produced them.
+
 ## Harness-side: live runs
 
 ### Codex CLI 0.161.0 — connected, measured live
@@ -325,6 +340,11 @@ upper bound on what ChatGPT could place before the model.
   after the pty-driver change (skip-key + mode-key sequencing) to prove the
   existing profiles are unchanged. `cargo test transcript_gate` green on
   the same tree; `cargo fmt --check` clean.
+- catdesk-ytk closure re-verify (2026-10-19): `cargo build --release` from
+  HEAD `807eb73`; DevTools profile ×2 byte-identical (132,037 B raw →
+  5,999 B inline, 2 read_result calls, byte-for-byte), MultiTools green,
+  `cargo fmt --check` clean. Byte deltas vs the pinned `g6a4b2ef` binary
+  (+122 B per DevTools row) are recorded in the DevTools section above.
 - Harness runs: artifacts under /tmp/catdesk-ojt10-codex and
   /tmp/catdesk-ojt10-claude (session transcripts, events, server
   connections.jsonl); runners are committed and repeatable.
