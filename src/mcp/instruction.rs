@@ -156,7 +156,7 @@ Always specify the branch explicitly in `git push`."#
 
     if mode.computer_enabled() {
         lines.push(
-            "Use read for files and search for text; name every file you need in one call."
+            "read defaults to whole files; for parts set paths {path,start_line,end_line}. search finds text."
                 .to_string(),
         );
         lines.push(

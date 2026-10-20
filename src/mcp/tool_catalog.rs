@@ -73,7 +73,7 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 "batchTruncated".to_string(),
                 json!({
                     "type": "boolean",
-                    "description": "The shared budget cut something short, so asking for fewer files returns more."
+                    "description": "Compatibility field; full-file reads never silently truncate. Oversized reads return per-file errors with range guidance."
                 }),
             );
             properties.insert(
@@ -104,7 +104,7 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                             "truncated": { "type": "boolean" },
                             "budgetTruncated": {
                                 "type": "boolean",
-                                "description": "Cut by the shared budget, so asking for fewer files returns more of this one. A file truncated without this is over the per-file cap and no retry returns the rest."
+                                "description": "Compatibility field; always false for full reads. Oversized requests return an error instead of truncated text."
                             },
                             "startLine": {
                                 "type": "integer",
@@ -614,7 +614,7 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
         tools.push(json!({
             "name": "read",
             "title": "Read files",
-            "description": "Read text files from the workspace. Name every file you need in one call.",
+            "description": "Read complete text files by default. To read just a fragment, pass an object with start_line and/or end_line. Name every file you need in one call. Oversized reads fail explicitly rather than returning partial text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -645,7 +645,7 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
                         "minItems": 1,
                         "maxItems": workspace_tools::MAX_READ_BATCH_FILES,
                         "description": format!(
-                            "File paths relative to workspace root, or absolute paths within it. A string reads the whole file; an object with start_line/end_line reads that 1-based inclusive line range only, so a small range inside a huge file comes back whole. Paths that resolve to the same file and range are read once. Combined text is capped at {} bytes; entries past that return metadata only.",
+                            "File paths relative to workspace root, or absolute paths within it. A plain path reads the entire file by default; specify start_line/end_line (1-based, inclusive) only when you want a portion. Identical file/range requests are deduplicated. The {}-byte response safety ceiling rejects oversized reads with explicit per-file errors rather than silently clipping content. Successful large responses are stored losslessly for read_result/search_result.",
                             workspace_tools::MAX_READ_BATCH_BYTES
                         )
                     }

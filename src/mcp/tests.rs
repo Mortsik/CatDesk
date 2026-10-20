@@ -3287,6 +3287,18 @@ fn agents_instructions_preserve_middle_and_tail_past_prior_limits() {
 }
 
 #[test]
+fn instruction_explains_full_read_default_and_opt_in_line_range() {
+    let root = read_workspace("instruction-whole-files");
+    let instructions =
+        catdesk_instruction_text(root.to_str().unwrap(), Mode::Both, ToolMode::MultiTools)
+            .expect("instructions");
+    assert!(instructions.contains("defaults to whole files"));
+    assert!(instructions.contains("start_line,end_line"));
+    assert!(instructions.contains("search finds text"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn guidance_files_bypass_read_file_and_batch_caps() {
     let root = std::env::temp_dir().join(format!("catdesk-guidance-read-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
@@ -3326,9 +3338,10 @@ fn guidance_files_bypass_read_file_and_batch_caps() {
     )
     .unwrap();
     assert!(
-        ordinary.files[0].truncated,
-        "normal source files retain existing cap"
+        !ordinary.files[0].truncated,
+        "normal source files are complete by default"
     );
+    assert_eq!(ordinary.files[0].text, content);
     #[cfg(unix)]
     {
         std::fs::create_dir_all(root.join("nested")).unwrap();
@@ -4411,11 +4424,10 @@ async fn read_tool_plain_string_paths_keep_working_alongside_ranges() {
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
-/// Invalid UTF-8 expands under lossy decoding (1 byte in, 3 out), so the
-/// decoded text can cross the per-file cap even though the disk read did
-/// not. That shortening is a truncation and must be reported as one.
+/// Invalid UTF-8 expands under lossy decoding, but full-file reads must
+/// still return the entire decoded result without silent truncation.
 #[tokio::test]
-async fn read_tool_range_reports_truncation_when_lossy_decoding_expands_past_the_cap() {
+async fn read_tool_range_returns_full_text_when_lossy_decoding_expands() {
     let workspace_root = read_workspace("line-range-lossy");
     let mut bytes = Vec::with_capacity(300 * 1024);
     for index in 0..300 * 1024 {
@@ -4430,20 +4442,16 @@ async fn read_tool_range_reports_truncation_when_lossy_decoding_expands_past_the
     .await;
 
     let entry = &structured["files"][0];
-    assert_eq!(
-        entry["truncated"].as_bool(),
-        Some(true),
-        "lossy expansion past the per-file cap is a truncation: {}",
-        entry["bytes"]
-    );
+    assert_eq!(entry["truncated"], json!(false));
+    assert_eq!(entry["endLine"], json!(1));
+    assert!(entry["bytes"].as_u64().unwrap() > 512 * 1024);
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
-/// endLine describes what came back, not what was asked for: a range cut by
-/// the per-file cap reports the last line actually returned.
+/// A requested range is complete even when it exceeds the old per-file cap.
 #[tokio::test]
-async fn read_tool_range_cut_by_the_per_file_cap_reports_the_last_returned_line() {
+async fn read_tool_range_larger_than_old_cap_reports_full_end_line() {
     let workspace_root = read_workspace("line-range-report-end");
     // Six 100-KiB lines: the 512-KiB per-file cap cuts the range mid-way.
     let big_line = format!("{}\n", "z".repeat(100 * 1024));
@@ -4456,40 +4464,27 @@ async fn read_tool_range_cut_by_the_per_file_cap_reports_the_last_returned_line(
     .await;
 
     let entry = &structured["files"][0];
-    assert_eq!(entry["truncated"].as_bool(), Some(true));
-    let reported_end = entry["endLine"].as_u64().expect("reported end line");
-    assert!(
-        reported_end < 8,
-        "endLine must reflect the returned content, got {reported_end}"
-    );
-    // The 512-KiB entry itself exceeds the 64-KiB inline budget, so the
-    // visible text is a head+tail preview; the reported bounds must instead
-    // agree with the lineCount the entry reports for what came back.
-    let line_count = entry["lineCount"].as_u64().expect("lineCount");
-    let start = entry["startLine"].as_u64().unwrap_or(1);
-    assert_eq!(
-        reported_end,
-        start + line_count - 1,
-        "endLine counts the lines the entry actually returned"
-    );
-    assert!(line_count < 8);
+    assert_eq!(entry["truncated"], json!(false));
+    assert_eq!(entry["startLine"], json!(1));
+    assert_eq!(entry["endLine"], json!(8));
+    assert_eq!(entry["lineCount"], json!(8));
+    assert!(entry["bytes"].as_u64().unwrap() > 512 * 1024);
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
-/// An exhausted batch budget must not send the ranged read scanning: the
-/// entry comes back budget-truncated and empty instead of walking the file
-/// for a range that can never be returned.
+/// An oversized file must be rejected before a huge filesystem scan,
+/// never silently returned as an incomplete file.
 #[cfg(unix)]
 #[tokio::test]
-async fn read_tool_range_with_exhausted_batch_budget_skips_the_scan() {
+async fn read_tool_rejects_oversized_whole_file_without_scanning() {
     let workspace_root = read_workspace("line-range-exhausted");
-    // Two full reads exhaust the 512-KiB batch budget...
+    // Small files remain complete even if an oversized file is requested.
     let filler = "f".repeat(400 * 1024);
     std::fs::write(workspace_root.join("first.bin"), &filler).expect("write file");
     std::fs::write(workspace_root.join("second.bin"), &filler).expect("write file");
-    // ...and the sparse 1-GiB file sorts last, so its range is requested
-    // with nothing left. A scan here would walk up to a gigabyte.
+    // A sparse 1-GiB file sorts last; a full-file read must reject it
+    // immediately from metadata instead of scanning or allocating a GiB.
     let sparse = workspace_root.join("huge.bin");
     let sparse_file = std::fs::File::create(&sparse).expect("create sparse");
     sparse_file
@@ -4499,21 +4494,23 @@ async fn read_tool_range_with_exhausted_batch_budget_skips_the_scan() {
 
     let structured = read_batch(
         &workspace_root,
-        json!([
-            "first.bin",
-            "second.bin",
-            { "path": "huge.bin", "start_line": 500_000_000 }
-        ]),
+        json!(["first.bin", "second.bin", "huge.bin"]),
     )
     .await;
 
     let entry = &structured["files"][2];
     assert!(
-        entry["error"].is_null(),
-        "an exhausted budget is not an error: {entry}"
+        entry["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("safety ceiling"),
+        "oversized reads must explain how to request a range: {entry}"
     );
-    assert_eq!(entry["text"].as_str(), Some(""));
-    assert_eq!(entry["budgetTruncated"].as_bool(), Some(true));
+    assert_eq!(entry["text"], json!(""));
+    assert_eq!(entry["truncated"], json!(false));
+    assert_eq!(entry["budgetTruncated"], json!(false));
+    assert_eq!(structured["files"][0]["truncated"], json!(false));
+    assert_eq!(structured["files"][1]["truncated"], json!(false));
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -4896,52 +4893,29 @@ async fn read_tool_returns_every_named_file_in_one_call() {
 }
 
 #[tokio::test]
-async fn read_tool_stops_reading_once_the_batch_budget_is_spent() {
+async fn read_tool_returns_entire_batch_beyond_previous_budget() {
     let workspace_root = read_workspace("batch-budget");
-    // The first file alone spends the whole budget, so the rest must come
-    // back with metadata and no text.
+    // Three files exceeding the old combined 512-KiB cap all come back whole.
     let names = ["a.txt", "b.txt", "c.txt"];
     for name in names {
-        std::fs::write(
-            workspace_root.join(name),
-            filler(workspace_tools::MAX_READ_BATCH_BYTES),
-        )
-        .expect("write file");
+        std::fs::write(workspace_root.join(name), filler(600 * 1024)).expect("write file");
     }
 
     let structured = read_batch(&workspace_root, json!(names)).await;
     let files = structured["files"].as_array().expect("missing files");
-    let total: usize = files
+    // Transport previews can shorten the visible text; bytes records how much
+    // was read and the complete result is available through read_result.
+    let total: u64 = files
         .iter()
-        .map(|file| file["text"].as_str().unwrap_or_default().len())
+        .map(|file| file["bytes"].as_u64().unwrap_or(0))
         .sum();
 
-    assert!(
-        total <= workspace_tools::MAX_READ_BATCH_BYTES,
-        "combined text {total} exceeded the batch cap"
-    );
-    assert_eq!(structured["batchTruncated"], json!(true));
-    for skipped in &files[1..] {
-        assert_eq!(
-            skipped["bytes"],
-            json!(0),
-            "over-budget file was still read"
-        );
-        assert_eq!(
-            skipped["lineCount"],
-            json!(0),
-            "over-budget file was scanned"
-        );
-        assert_eq!(skipped["truncated"], json!(true));
-        assert_eq!(
-            skipped["budgetTruncated"],
-            json!(true),
-            "a file the budget never reached must still say a smaller retry helps"
-        );
-        assert!(
-            skipped["sizeBytes"].as_u64().unwrap_or(0) > 0,
-            "missing metadata"
-        );
+    assert!(total > 512 * 1024, "batch must exceed the old ceiling");
+    assert_eq!(structured["batchTruncated"], json!(false));
+    for file in files {
+        assert_eq!(file["bytes"], json!(600 * 1024));
+        assert_eq!(file["truncated"], json!(false));
+        assert_eq!(file["budgetTruncated"], json!(false));
     }
 
     let _ = std::fs::remove_dir_all(workspace_root);
@@ -5010,7 +4984,7 @@ async fn read_tool_rejects_a_directory_the_same_way_wherever_it_lands() {
 #[tokio::test]
 async fn read_tool_does_not_let_an_unreadable_file_shrink_the_others() {
     let workspace_root = read_workspace("unreadable");
-    let big = workspace_tools::MAX_READ_BATCH_BYTES - 8192;
+    let big = 600 * 1024;
     std::fs::write(workspace_root.join("app.js"), filler(big)).expect("write file");
     std::fs::write(workspace_root.join("locked.txt"), filler(100 * 1024)).expect("write file");
     use std::os::unix::fs::PermissionsExt;
@@ -5041,7 +5015,7 @@ async fn read_tool_does_not_let_an_unreadable_file_shrink_the_others() {
 #[tokio::test]
 async fn read_tool_does_not_blame_the_budget_for_lossy_expansion() {
     let workspace_root = read_workspace("lossy-big");
-    // Lossy conversion triples these past the cap.
+    // Lossy conversion expands content beyond the old 512-KiB cap.
     let mut bytes = Vec::new();
     while bytes.len() < 200 * 1024 {
         bytes.extend(std::iter::repeat_n(0xE9_u8, 40));
@@ -5051,16 +5025,17 @@ async fn read_tool_does_not_blame_the_budget_for_lossy_expansion() {
 
     let structured = read_batch(&workspace_root, json!(["bin.dat"])).await;
 
-    assert_eq!(structured["files"][0]["truncated"], json!(true));
+    assert_eq!(structured["files"][0]["truncated"], json!(false));
     assert_eq!(structured["batchTruncated"], json!(false));
+    assert!(structured["files"][0]["bytes"].as_u64().unwrap() > 512 * 1024);
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
 #[tokio::test]
-async fn read_tool_counts_lines_over_what_it_returned() {
+async fn read_tool_counts_lines_over_complete_files() {
     let workspace_root = read_workspace("lines");
-    let cap = workspace_tools::MAX_READ_BATCH_BYTES;
+    let cap = 600 * 1024;
     std::fs::write(workspace_root.join("a.txt"), filler(cap - 1)).expect("write file");
     std::fs::write(workspace_root.join("b.txt"), "line\n".repeat(cap / 5 + 200))
         .expect("write file");
@@ -5073,12 +5048,9 @@ async fn read_tool_counts_lines_over_what_it_returned() {
         .find(|file| file["path"] == json!("b.txt"))
         .expect("missing b.txt");
 
-    assert_eq!(b["bytes"], json!(1));
-    assert_eq!(
-        b["lineCount"],
-        json!(1),
-        "lines of text that was thrown away"
-    );
+    assert_eq!(b["bytes"], json!((cap / 5 + 200) * 5));
+    assert_eq!(b["lineCount"], json!(cap / 5 + 200));
+    assert_eq!(b["truncated"], json!(false));
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -5100,7 +5072,7 @@ async fn read_tool_charges_one_file_once_however_many_times_it_is_named() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn read_tool_still_reports_an_unreadable_file_past_the_budget() {
+async fn read_tool_still_reports_an_unreadable_file_in_batch() {
     let workspace_root = read_workspace("locked-past-budget");
     std::fs::write(
         workspace_root.join("big.txt"),
@@ -5118,8 +5090,7 @@ async fn read_tool_still_reports_an_unreadable_file_past_the_budget() {
     let structured = read_batch(&workspace_root, json!(["big.txt", "locked.txt"])).await;
     let locked = &structured["files"][1];
 
-    // Skipping the open would have called this a budget cut, which tells
-    // the model a smaller retry returns the file. It never will.
+    // Permission errors must be reported independently of the safety ceiling.
     assert!(
         locked["error"]
             .as_str()
@@ -5137,13 +5108,9 @@ async fn read_tool_still_reports_an_unreadable_file_past_the_budget() {
 }
 
 #[tokio::test]
-async fn read_tool_budget_goes_to_the_smallest_files_first() {
+async fn read_tool_keeps_requested_order_and_reads_all_files() {
     let workspace_root = read_workspace("batch-order");
-    std::fs::write(
-        workspace_root.join("big.log"),
-        filler(workspace_tools::MAX_READ_BATCH_BYTES),
-    )
-    .expect("write file");
+    std::fs::write(workspace_root.join("big.log"), filler(600 * 1024)).expect("write file");
     std::fs::write(workspace_root.join("a.txt"), "alpha\n").expect("write file");
     std::fs::write(workspace_root.join("b.txt"), "beta\n").expect("write file");
 
@@ -5153,10 +5120,8 @@ async fn read_tool_budget_goes_to_the_smallest_files_first() {
     assert_eq!(files[0]["path"], json!("big.log"));
     assert_eq!(files[1]["text"], json!("alpha\n"));
     assert_eq!(files[2]["text"], json!("beta\n"));
-    assert!(
-        files[0]["bytes"].as_u64().unwrap() < workspace_tools::MAX_READ_BATCH_BYTES as u64,
-        "the big file should have left room for the small ones"
-    );
+    assert_eq!(files[0]["bytes"], json!(600 * 1024));
+    assert_eq!(files[0]["truncated"], json!(false));
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -5228,9 +5193,9 @@ async fn poll_command_waits_for_progress_unless_told_not_to() {
 }
 
 #[tokio::test]
-async fn read_tool_says_which_truncations_a_retry_would_fix() {
+async fn read_tool_no_longer_silently_truncates_large_files() {
     let workspace_root = read_workspace("retryable");
-    let cap = workspace_tools::MAX_READ_BATCH_BYTES;
+    let cap = 600 * 1024;
     std::fs::write(workspace_root.join("a.txt"), filler(cap - 1)).expect("write file");
     std::fs::write(workspace_root.join("b.txt"), filler(cap + 4096)).expect("write file");
 
@@ -5241,17 +5206,12 @@ async fn read_tool_says_which_truncations_a_retry_would_fix() {
         .find(|file| file["path"] == json!("b.txt"))
         .expect("missing b.txt");
 
-    assert_eq!(b["truncated"], json!(true));
-    assert_eq!(b["budgetTruncated"], json!(true), "a smaller retry helps");
-
-    // The same file alone is cut by the per-file cap instead.
+    assert_eq!(b["truncated"], json!(false));
+    assert_eq!(b["budgetTruncated"], json!(false));
+    assert_eq!(b["bytes"], json!(cap + 4096));
     let alone = read_batch(&workspace_root, json!(["b.txt"])).await;
-    assert_eq!(alone["files"][0]["truncated"], json!(true));
-    assert_eq!(
-        alone["files"][0]["budgetTruncated"],
-        json!(false),
-        "no retry returns the rest"
-    );
+    assert_eq!(alone["files"][0]["truncated"], json!(false));
+    assert_eq!(alone["files"][0]["bytes"], json!(cap + 4096));
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -5293,8 +5253,8 @@ async fn read_tool_does_not_head_the_result_with_an_empty_file() {
 #[tokio::test]
 async fn read_tool_heads_the_result_with_a_whole_file() {
     let workspace_root = read_workspace("head-whole");
-    let cap = workspace_tools::MAX_READ_BATCH_BYTES;
-    // Sorted smallest first, pad.txt is read whole and huge.txt gets a sliver.
+    let cap = 600 * 1024;
+    // Both inputs fit; the result is headed by the first requested whole file.
     std::fs::write(workspace_root.join("pad.txt"), filler(cap - 4)).expect("write file");
     std::fs::write(workspace_root.join("huge.txt"), filler(cap + 4096)).expect("write file");
 
@@ -5302,8 +5262,8 @@ async fn read_tool_heads_the_result_with_a_whole_file() {
 
     assert_eq!(
         structured["path"],
-        json!("pad.txt"),
-        "the batch's bytes belong to pad.txt"
+        json!("huge.txt"),
+        "the batch's bytes are attributed to the first whole file"
     );
 
     let _ = std::fs::remove_dir_all(workspace_root);

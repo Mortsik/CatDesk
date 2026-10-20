@@ -17,12 +17,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Per-file cap for ordinary files; agent guidance files bypass both read caps.
-const MAX_READ_BYTES: usize = 512 * 1024;
+/// Whole-file reads are the default. This is a transport safety ceiling, not a
+/// truncation limit: oversized reads fail explicitly and suggest a line range.
+/// The result store externalizes successful large replies losslessly.
 pub const MAX_READ_BATCH_FILES: usize = 32;
-pub const MAX_READ_BATCH_BYTES: usize = 512 * 1024;
+pub const MAX_READ_BATCH_BYTES: usize = 32 * 1024 * 1024;
 
-/// Agent guidance documents bypass file and batch limits so rules stay complete.
+/// Agent guidance documents bypass the safety ceiling so rules stay complete.
 /// The transport externalizes large read replies losslessly for retrieval.
 fn is_agent_guidance_file(path: &Path) -> bool {
     path.file_name()
@@ -474,6 +475,13 @@ pub fn read_image(
     })
 }
 
+fn read_safety_limit_error(remaining: usize) -> String {
+    format!(
+        "Read exceeds the response safety ceiling ({} bytes remaining in this batch). Use start_line/end_line to request a smaller section, or read fewer files.",
+        remaining
+    )
+}
+
 fn read_file_in_range(
     workspace_root: &str,
     request: &ReadRequest,
@@ -490,62 +498,43 @@ fn read_file_in_range(
             (None, None) => {
                 let mut file = fs::File::open(&target)
                     .map_err(|error| format!("{error}: {}", target.display()))?;
-                // A single read() may come back short on a network filesystem, and
-                // line_count is derived from what was read.
-                // Whatever the batch cannot keep would be read and then thrown
-                // away, so the read stops at the budget. The open still happens,
-                // which is what lets a file that cannot be read report its own
-                // error instead of a budget cut.
+                // Default: return the entire file, never a clipped prefix.
+                // Reject oversized requests rather than silently omitting lines.
                 let cap = if guidance {
                     usize::try_from(size_bytes)
                         .unwrap_or(usize::MAX - 1)
                         .min(usize::MAX - 1)
                 } else {
-                    budget.min(MAX_READ_BYTES)
+                    budget
                 };
-                let mut buf = Vec::with_capacity(cap + 1);
+                if !guidance && size_bytes > cap as u64 {
+                    return Err(read_safety_limit_error(budget));
+                }
+                let capacity = usize::try_from(size_bytes)
+                    .unwrap_or(cap)
+                    .min(cap)
+                    .saturating_add(1);
+                let mut buf = Vec::with_capacity(capacity);
                 let read_n = file
                     .by_ref()
                     .take((cap + 1) as u64)
                     .read_to_end(&mut buf)
                     .map_err(|e| e.to_string())?;
-                let mut truncated = read_n > cap;
-                let data = &buf[..read_n.min(cap)];
-                let mut text = String::from_utf8_lossy(data).into_owned();
-                // from_utf8_lossy expands one invalid byte into three, so the text
-                // can exceed the cap even when the file did not. Cutting it here
-                // keeps that a per-file limit rather than something the batch
-                // blames on its budget.
-                if !guidance && text.len() > MAX_READ_BYTES {
-                    let keep = floor_char_boundary(&text, MAX_READ_BYTES);
-                    text.truncate(keep);
-                    truncated = true;
+                if !guidance && read_n > cap {
+                    return Err(read_safety_limit_error(budget));
                 }
-                // Over what was read, not the whole file: a full scan costs the
-                // entire file in disk reads to return at most MAX_READ_BYTES.
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                if !guidance && text.len() > budget {
+                    return Err(read_safety_limit_error(budget));
+                }
                 let line_count = count_lines(&text);
-                (text, truncated, line_count, None, None)
+                (text, false, line_count, None, None)
             }
             (start_line, end_line) => {
                 let start_line = start_line.unwrap_or(1);
-                let cap = if guidance {
-                    usize::MAX - 1
-                } else {
-                    budget.min(MAX_READ_BYTES)
-                };
+                let cap = if guidance { usize::MAX - 1 } else { budget };
                 if cap == 0 {
-                    // The batch cannot keep a single byte of the range: skip
-                    // the offset scan (locating a range can walk the whole
-                    // file) and report the same budget cut a head read gets.
-                    return Ok(ReadFileOutput {
-                        path: to_workspace_relative(&root, &target),
-                        size_bytes,
-                        line_count: 0,
-                        text: String::new(),
-                        truncated: true,
-                        start_line: None,
-                        end_line: None,
-                    });
+                    return Err(read_safety_limit_error(budget));
                 }
                 let (start_offset, end_offset, resolved_end) =
                     line_range_byte_offsets(&target, start_line, end_line)?;
@@ -564,20 +553,17 @@ fn read_file_in_range(
                     .take(want + lookahead)
                     .read_to_end(&mut buf)
                     .map_err(|e| e.to_string())?;
-                let mut truncated = (read_n as u64) > want;
-                let data = &buf[..read_n.min(want as usize)];
-                let mut text = String::from_utf8_lossy(data).into_owned();
-                // The same lossy-expansion cut the head read applies: decoded
-                // text can cross the per-file cap the disk read never did.
-                if !guidance && text.len() > MAX_READ_BYTES {
-                    let keep = floor_char_boundary(&text, MAX_READ_BYTES);
-                    text.truncate(keep);
-                    truncated = true;
+                if !guidance && (read_n as u64) > want {
+                    return Err(read_safety_limit_error(budget));
+                }
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                if !guidance && text.len() > budget {
+                    return Err(read_safety_limit_error(budget));
                 }
                 let line_count = count_lines(&text);
                 (
                     text,
-                    truncated,
+                    false,
                     line_count,
                     Some(start_line),
                     Some(resolved_end),
@@ -679,9 +665,8 @@ pub struct ReadBatchEntry {
     pub line_count: usize,
     pub text: String,
     pub truncated: bool,
-    /// This entry was cut by the shared budget, so asking for fewer files
-    /// returns more of it. A file over the per-file cap sets `truncated`
-    /// without this: no retry returns the rest.
+    /// Retained for API compatibility. Whole-file reads never silently trim
+    /// text to fit the transport ceiling; oversized requests return errors.
     pub budget_truncated: bool,
     /// The resolved 1-based inclusive line range, present for ranged reads.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -694,20 +679,8 @@ pub struct ReadBatchOutput {
     pub files: Vec<ReadBatchEntry>,
     pub total_bytes: usize,
     pub total_line_count: usize,
-    /// The shared budget cut something short, so a smaller retry returns more.
-    /// A file over the per-file cap does not set this: no retry helps.
+    /// Compatibility field: whole reads either succeed or fail explicitly.
     pub batch_truncated: bool,
-}
-
-fn floor_char_boundary(text: &str, max: usize) -> usize {
-    if max >= text.len() {
-        return text.len();
-    }
-    let mut index = max;
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 /// One path form for every entry, readable or not.
@@ -791,7 +764,7 @@ pub fn read_files(
 
     let mut entries: Vec<Option<ReadBatchEntry>> = (0..requests.len()).map(|_| None).collect();
     let mut remaining = MAX_READ_BATCH_BYTES;
-    let mut batch_truncated = false;
+    let batch_truncated = false;
     let mut total_bytes = 0_usize;
     let mut total_line_count = 0_usize;
 
@@ -821,26 +794,10 @@ pub fn read_files(
         let read_budget = if guidance { usize::MAX - 1 } else { remaining };
         match read_file_in_range(workspace_root, request, read_budget) {
             Ok(output) => {
-                let keep = if guidance {
-                    output.text.len()
-                } else {
-                    floor_char_boundary(&output.text, remaining)
-                };
-                let text_cut = keep < output.text.len();
-                // Now that the read stops at the budget, how much came back no
-                // longer says which limit stopped it. The budget is the binding
-                // one whenever it is tighter than the per-file cap.
-                let budget_cut =
-                    !guidance && (text_cut || (output.truncated && remaining < MAX_READ_BYTES));
-                let truncated = output.truncated || text_cut;
-                batch_truncated |= budget_cut;
-                let mut text = output.text;
-                text.truncate(keep);
-                let line_count = if text_cut {
-                    count_lines(&text)
-                } else {
-                    output.line_count
-                };
+                let text = output.text;
+                let keep = text.len();
+                let truncated = output.truncated;
+                let line_count = output.line_count;
                 if !guidance {
                     remaining -= keep;
                 }
@@ -873,7 +830,7 @@ pub fn read_files(
                     line_count,
                     text,
                     truncated,
-                    budget_truncated: budget_cut,
+                    budget_truncated: false,
                     start_line,
                     end_line,
                 });
@@ -2287,6 +2244,61 @@ mod tests {
     /// covers both levels.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_serialization::lock_env()
+    }
+
+    #[test]
+    fn default_read_returns_complete_files_beyond_previous_per_file_and_batch_caps() {
+        let workspace_root = test_workspace("whole-read-default");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let first = format!("HEAD\n{}\nTAIL\n", "a".repeat(600 * 1024));
+        let second = format!("START\n{}\nEND\n", "b".repeat(600 * 1024));
+        fs::write(workspace_root.join("first.txt"), &first).expect("write first");
+        fs::write(workspace_root.join("second.txt"), &second).expect("write second");
+        let root = workspace_root.to_string_lossy();
+        let result = read_files(
+            &root,
+            &[
+                ReadRequest {
+                    path: "first.txt".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+                ReadRequest {
+                    path: "second.txt".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            ],
+        )
+        .expect("read files");
+        assert_eq!(result.files[0].text, first);
+        assert_eq!(result.files[1].text, second);
+        assert!(!result.files[0].truncated);
+        assert!(!result.files[1].truncated);
+        assert!(!result.batch_truncated);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn explicit_line_range_only_returns_selected_fragment_of_large_file() {
+        let workspace_root = test_workspace("whole-read-range");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let data = format!("one\ntwo\n{}\nfour\n", "x".repeat(600 * 1024));
+        fs::write(workspace_root.join("notes.txt"), &data).expect("write file");
+        let result = read_files(
+            &workspace_root.to_string_lossy(),
+            &[ReadRequest {
+                path: "notes.txt".into(),
+                start_line: Some(2),
+                end_line: Some(2),
+            }],
+        )
+        .expect("range read");
+        assert_eq!(result.files[0].text, "two\n");
+        assert_eq!(result.files[0].start_line, Some(2));
+        assert_eq!(result.files[0].end_line, Some(2));
+        assert!(!result.files[0].truncated);
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[test]
