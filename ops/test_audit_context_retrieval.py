@@ -28,6 +28,26 @@ class AuditContextRetrievalTests(unittest.TestCase):
         self.assertEqual(total["externalized_raw_bytes"], 300_000)
         self.assertEqual(total["externalized_inline_bytes"], 4_096)
 
+    def test_read_usage_counts_full_ranged_and_failed_without_inventing_historical_data(self):
+        rows = [
+            {"event": "tool_result_bytes", "rpc_tool": "read", "class": "small", "raw_bytes": 500, "inline_bytes": 500},
+            {"event": "read_usage", "full_requests": 3, "ranged_requests": 2,
+             "full_files": 2, "ranged_files": 1, "failed_files": 1,
+             "returned_bytes": 9000},
+            {"event": "read_usage", "full_requests": 1, "ranged_requests": 0,
+             "full_files": 1, "ranged_files": 0, "failed_files": 0,
+             "returned_bytes": 120},
+        ]
+        result = summarize(rows)
+        self.assertEqual(result["read_calls"], 1)
+        self.assertEqual(result["read_usage_calls"], 2)
+        self.assertEqual(result["full_requests"], 4)
+        self.assertEqual(result["ranged_requests"], 2)
+        self.assertEqual(result["full_files"], 3)
+        self.assertEqual(result["ranged_files"], 1)
+        self.assertEqual(result["failed_files"], 1)
+        self.assertEqual(result["returned_bytes"], 9120)
+
 
 if __name__ == "__main__":
     unittest.main()

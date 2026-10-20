@@ -156,6 +156,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_usage_records_only_numeric_mode_counters() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let log = Diagnostics {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
+            write_dropped: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicU64::new(0)),
+            active_requests: Arc::new(StdMutex::new(HashMap::new())),
+            stopping_since: Arc::new(StdMutex::new(None)),
+        };
+        let trace = RequestLog {
+            log,
+            id: "read-test".to_string(),
+            started: Instant::now(),
+            complete: AtomicBool::new(false),
+            tool: AtomicU8::new(0),
+            rpc_recorded: AtomicBool::new(false),
+        };
+        REQUEST
+            .scope(trace, async {
+                read_usage(ReadUsageMetrics {
+                    full_requests: 3,
+                    ranged_requests: 2,
+                    full_files: 2,
+                    ranged_files: 1,
+                    failed_files: 1,
+                    returned_bytes: 9120,
+                });
+            })
+            .await;
+        let record = receiver.recv().unwrap().unwrap();
+        assert_eq!(record["event"], "read_usage");
+        assert_eq!(record["request_id"], "read-test");
+        assert_eq!(record["full_requests"], 3);
+        assert_eq!(record["ranged_requests"], 2);
+        assert_eq!(record["full_files"], 2);
+        assert_eq!(record["ranged_files"], 1);
+        assert_eq!(record["failed_files"], 1);
+        assert_eq!(record["returned_bytes"], 9120);
+        assert!(record.get("path").is_none());
+        assert!(record.get("text").is_none());
+    }
+
+    #[tokio::test]
     async fn tool_result_bytes_records_numbers_only_aggregates() {
         let (sender, receiver) = mpsc::sync_channel(8);
         let log = Diagnostics {
@@ -2011,6 +2056,33 @@ pub(crate) fn rpc_request(body: &Value) {
             let index = crate::perf_metrics::tool_index(tool);
             request.tool.store(index as u8 + 1, Ordering::Relaxed);
         }
+    });
+}
+
+/// One read call's numeric-only accounting. Input counts include duplicates;
+/// output counts exclude deduplicated paths. No paths or file contents persist.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReadUsageMetrics {
+    pub(crate) full_requests: usize,
+    pub(crate) ranged_requests: usize,
+    pub(crate) full_files: usize,
+    pub(crate) ranged_files: usize,
+    pub(crate) failed_files: usize,
+    pub(crate) returned_bytes: usize,
+}
+
+pub(crate) fn read_usage(metrics: ReadUsageMetrics) {
+    let _ = REQUEST.try_with(|request| {
+        request.log.record(json!({
+            "event": "read_usage",
+            "request_id": request.id,
+            "full_requests": metrics.full_requests,
+            "ranged_requests": metrics.ranged_requests,
+            "full_files": metrics.full_files,
+            "ranged_files": metrics.ranged_files,
+            "failed_files": metrics.failed_files,
+            "returned_bytes": metrics.returned_bytes,
+        }));
     });
 }
 

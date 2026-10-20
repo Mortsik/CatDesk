@@ -21,6 +21,20 @@ Records contain Unix milliseconds (`timestamp_ms`), process ID (`pid`), and:
   `requested_timeout_ms`. Unknown methods/tool names become `other`. Client IDs,
   all other arguments, custom/browser tool names, resource names, commands,
   output, credentials and connector URLs are never saved.
+- `read_usage`: one numeric-only record per valid `read` batch, with
+  `full_requests` and `ranged_requests` (input path entries; duplicates counted),
+  `full_files`, `ranged_files`, and `failed_files` (actual output entries,
+  after deduplication), plus `returned_bytes` (full decoded file text before
+  MCP response-budget processing). A range is any `start_line` or `end_line`
+  argument; successful zero-byte files count as files. An entire batch rejected
+  before reading counts each requested path as failed. Malformed arguments
+  rejected by the request parser are not included. The record carries the
+  generated `request_id`, but never input paths, file names, ranges, contents
+  or error messages. Join to `tool_result_bytes` by `request_id` to inspect
+  externalized-versus-inline transport; large results retain their complete
+  data in the result store. Older logs cannot distinguish full/ranged reads.
+  Run `python3 ops/audit_context_retrieval.py` from the repo to summarize
+  these counters over the retained log window (or pass a specific JSONL log).
 - `http_finished`: HTTP `status`, numeric `rpc_error_code` when provided by the
   MCP handler, `tool_error` and `content_items` for tool responses, and `elapsed_ms`.
   Scheduled MCP calls additionally record `scheduler_class`,

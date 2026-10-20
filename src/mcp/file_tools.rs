@@ -2,6 +2,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use std::path::Path;
 
+use crate::diagnostics::{self, ReadUsageMetrics};
 use crate::handoff;
 use crate::vision;
 use crate::workspace_tools;
@@ -89,6 +90,7 @@ pub(crate) fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> J
     };
     match workspace_tools::read_files(workspace_root, &requests) {
         Ok(output) => {
+            diagnostics::read_usage(read_usage_metrics(&requests, &output));
             let structured = json!({
                 "toolName": "read",
                 // The batch's byte and line counts are billed to this path, so
@@ -120,7 +122,108 @@ pub(crate) fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> J
                 tool_success_response_with_structured(req, String::new(), structured)
             }
         }
-        Err(e) => tool_error_response(req, e),
+        Err(e) => {
+            let mut metrics = count_requested_read_modes(&requests);
+            metrics.failed_files = requests.len();
+            diagnostics::read_usage(metrics);
+            tool_error_response(req, e)
+        }
+    }
+}
+
+/// Request counts represent the caller's intent (including duplicates).
+/// Result counts represent files actually delivered after deduplication.
+fn count_requested_read_modes(requests: &[workspace_tools::ReadRequest]) -> ReadUsageMetrics {
+    let mut metrics = ReadUsageMetrics::default();
+    for request in requests {
+        if request.start_line.is_some() || request.end_line.is_some() {
+            metrics.ranged_requests += 1;
+        } else {
+            metrics.full_requests += 1;
+        }
+    }
+    metrics
+}
+
+fn read_usage_metrics(
+    requests: &[workspace_tools::ReadRequest],
+    output: &workspace_tools::ReadBatchOutput,
+) -> ReadUsageMetrics {
+    let mut metrics = count_requested_read_modes(requests);
+    metrics.returned_bytes = output.total_bytes;
+    for file in &output.files {
+        if file.error.is_some() {
+            metrics.failed_files += 1;
+        } else if file.start_line.is_some() || file.end_line.is_some() {
+            metrics.ranged_files += 1;
+        } else {
+            metrics.full_files += 1;
+        }
+    }
+    metrics
+}
+
+#[cfg(test)]
+mod read_usage_tests {
+    use super::*;
+
+    #[test]
+    fn read_usage_distinguishes_full_ranged_and_failed_files_after_deduplication() {
+        let requests = vec![
+            workspace_tools::ReadRequest {
+                path: "secret-one".into(),
+                start_line: None,
+                end_line: None,
+            },
+            workspace_tools::ReadRequest {
+                path: "secret-two".into(),
+                start_line: None,
+                end_line: Some(3),
+            },
+            workspace_tools::ReadRequest {
+                path: "missing".into(),
+                start_line: None,
+                end_line: None,
+            },
+            workspace_tools::ReadRequest {
+                path: "secret-one".into(),
+                start_line: None,
+                end_line: None,
+            },
+        ];
+        let entry = |path: &str,
+                     bytes: usize,
+                     start_line: Option<usize>,
+                     end_line: Option<usize>,
+                     failed: bool| workspace_tools::ReadBatchEntry {
+            path: path.into(),
+            error: failed.then(|| "missing".into()),
+            bytes,
+            size_bytes: bytes as u64,
+            line_count: 1,
+            text: "private".into(),
+            truncated: false,
+            budget_truncated: false,
+            start_line,
+            end_line,
+        };
+        let output = workspace_tools::ReadBatchOutput {
+            files: vec![
+                entry("secret-one", 5, None, None, false),
+                entry("secret-two", 3, Some(1), Some(3), false),
+                entry("missing", 0, None, None, true),
+            ],
+            total_bytes: 8,
+            total_line_count: 2,
+            batch_truncated: false,
+        };
+        let stats = read_usage_metrics(&requests, &output);
+        assert_eq!(stats.full_requests, 3);
+        assert_eq!(stats.ranged_requests, 1);
+        assert_eq!(stats.full_files, 1);
+        assert_eq!(stats.ranged_files, 1);
+        assert_eq!(stats.failed_files, 1);
+        assert_eq!(stats.returned_bytes, 8);
     }
 }
 

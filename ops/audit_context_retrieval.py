@@ -21,8 +21,21 @@ def summarize(records):
         "retrieval_calls": 0,
         "retrieval_response_bytes": 0,
         "search_result_calls": 0,
+        "read_usage_calls": 0,
+        "full_requests": 0,
+        "ranged_requests": 0,
+        "full_files": 0,
+        "ranged_files": 0,
+        "failed_files": 0,
+        "returned_bytes": 0,
     }
     for row in records:
+        if row.get("event") == "read_usage":
+            report["read_usage_calls"] += 1
+            for field in ("full_requests", "ranged_requests", "full_files",
+                          "ranged_files", "failed_files", "returned_bytes"):
+                report[field] += row.get(field, 0)
+            continue
         if row.get("event") != "tool_result_bytes":
             continue
         tool = row.get("rpc_tool")
@@ -63,6 +76,9 @@ def main():
     ], help="Diagnostics JSONL paths or glob patterns")
     args = parser.parse_args()
     print(json.dumps(summarize(read_logs(args.logs)), indent=2))
+    print("Full/ranged input counters include duplicate requested paths; output "
+          "counters exclude deduplicated entries. Logs before the read_usage "
+          "event was introduced cannot classify historical read calls.")
     print("Retrieval calls count chunks, not recovered files/results. "
           "Correlating individual outputRef values requires additional tracking.")
 
