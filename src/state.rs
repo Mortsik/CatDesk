@@ -83,7 +83,10 @@ pub use crate::usage_pricing::GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 /// 9: read paths gained the line-range object form and budgetable tools'
 /// outputSchemas declare the outputRef/outputBytes/outputTruncated retrieval
 /// hint (catdesk-t05) — both are model-visible schema changes.
-pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 9;
+/// 10: read cuts files at a line boundary to an inline budget; the cached
+/// read descriptions said budgetTruncated was always false and oversized
+/// reads errored, which a model would take as "this text is complete".
+pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 10;
 
 /// Token totals for one usage bucket.
 ///

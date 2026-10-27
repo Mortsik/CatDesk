@@ -513,6 +513,7 @@ async fn handle_tools_call_with_result_store(
     // Serialized size before the lossy entry-cap reduction, if one happened:
     // telemetry must keep reporting the full result as raw.
     let mut entry_cap_raw_bytes: Option<u64> = None;
+    let inline_limit = response_budget::inline_response_limit(&tool_name);
     if !exempt_from_response_budget(&tool_name)
         && let Some(result) = response.result.as_mut()
     {
@@ -522,13 +523,14 @@ async fn handle_tools_call_with_result_store(
         // entry-cap rejection, which would otherwise send the oversized
         // payload inline (finding F2): the response is reduced until it fits
         // the cap and externalized like any other.
-        budget_outcome = match response_budget::apply_response_budget(
+        budget_outcome = match response_budget::apply_response_budget_with_limit(
             result,
             is_error,
             result_store,
             session_namespace,
             Path::new(workspace_root),
             None,
+            inline_limit,
         ) {
             Ok(outcome) => outcome,
             Err(StoreError::EntryTooLarge { .. }) => {
@@ -541,13 +543,14 @@ async fn handle_tools_call_with_result_store(
                 };
                 entry_cap_raw_bytes = Some(reduction.original_bytes);
                 reduce_result_to_entry_cap(result, result_store.max_entry_bytes());
-                match response_budget::apply_response_budget(
+                match response_budget::apply_response_budget_with_limit(
                     result,
                     is_error,
                     result_store,
                     session_namespace,
                     Path::new(workspace_root),
                     Some(reduction),
+                    inline_limit,
                 ) {
                     Ok(Some(outcome)) => Some(outcome),
                     Ok(None) => {
@@ -560,16 +563,16 @@ async fn handle_tools_call_with_result_store(
                         // path, whose rebuilt manifest re-attaches the
                         // disclosure at every compaction level.
                         attach_entry_cap_disclosure(result, reduction);
-                        if serde_json::to_vec(result).map_or(0, |bytes| bytes.len())
-                            > response_budget::DEFAULT_INLINE_RESPONSE_BYTES
+                        if serde_json::to_vec(result).map_or(0, |bytes| bytes.len()) > inline_limit
                         {
-                            response_budget::apply_response_budget(
+                            response_budget::apply_response_budget_with_limit(
                                 result,
                                 is_error,
                                 result_store,
                                 session_namespace,
                                 Path::new(workspace_root),
                                 Some(reduction),
+                                inline_limit,
                             )
                             .ok()
                             .flatten()

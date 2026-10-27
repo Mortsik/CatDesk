@@ -73,7 +73,7 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 "batchTruncated".to_string(),
                 json!({
                     "type": "boolean",
-                    "description": "Compatibility field; full-file reads never silently truncate. Oversized reads return per-file errors with range guidance."
+                    "description": "true when some file was cut to fit the inline read budget; see files[].budgetTruncated and retrievalAdvice."
                 }),
             );
             properties.insert(
@@ -104,17 +104,17 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                             "truncated": { "type": "boolean" },
                             "budgetTruncated": {
                                 "type": "boolean",
-                                "description": "Compatibility field; always false for full reads. Oversized requests return an error instead of truncated text."
+                                "description": "true when the inline read budget cut this file at a line boundary: startLine/endLine give the lines returned; continue with start_line = endLine + 1. No startLine means no text was returned."
                             },
                             "startLine": {
                                 "type": "integer",
                                 "minimum": 1,
-                                "description": "Present for ranged reads: the 1-based first line returned."
+                                "description": "Present for ranged or budget-cut reads: the 1-based first line returned."
                             },
                             "endLine": {
                                 "type": "integer",
                                 "minimum": 1,
-                                "description": "Present for ranged reads: the 1-based last line returned, clamped to the file's end."
+                                "description": "Present for ranged or budget-cut reads: the 1-based last line returned, clamped to the file's end."
                             }
                         },
                         "required": ["path", "bytes", "sizeBytes", "lineCount", "text", "truncated", "budgetTruncated"]
@@ -614,7 +614,7 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
         tools.push(json!({
             "name": "read",
             "title": "Read files",
-            "description": "Read complete text files by default. To read just a fragment, pass an object with start_line and/or end_line. Name every file you need in one call. Oversized reads fail explicitly rather than returning partial text.",
+            "description": "Read complete text files by default. To read just a fragment, pass an object with start_line and/or end_line. Name every file you need in one call. A reply carries a bounded amount of text: files that do not fit are cut at a line boundary and marked budgetTruncated, with endLine telling where to continue. Reads past the per-call safety ceiling fail with a per-file error; use start_line/end_line for those.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -645,7 +645,8 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
                         "minItems": 1,
                         "maxItems": workspace_tools::MAX_READ_BATCH_FILES,
                         "description": format!(
-                            "File paths relative to workspace root, or absolute paths within it. A plain path reads the entire file by default; specify start_line/end_line (1-based, inclusive) only when you want a portion. Identical file/range requests are deduplicated. The {}-byte response safety ceiling rejects oversized reads with explicit per-file errors rather than silently clipping content. Successful large responses are stored losslessly for read_result/search_result.",
+                            "File paths relative to workspace root, or absolute paths within it. A plain path reads the entire file by default; specify start_line/end_line (1-based, inclusive) only when you want a portion. Identical file/range requests are deduplicated. About {} bytes of text come back per call: smaller files whole first, the rest cut at a line boundary (budgetTruncated, endLine) for a follow-up ranged read. Files totalling more than the {}-byte safety ceiling in one call fail with explicit per-file errors instead.",
+                            workspace_tools::read_inline_budget(),
                             workspace_tools::MAX_READ_BATCH_BYTES
                         )
                     }

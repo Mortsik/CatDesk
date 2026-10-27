@@ -27,13 +27,15 @@ def summarize(records):
         "full_files": 0,
         "ranged_files": 0,
         "failed_files": 0,
+        "budget_cut_files": 0,
         "returned_bytes": 0,
     }
     for row in records:
         if row.get("event") == "read_usage":
             report["read_usage_calls"] += 1
             for field in ("full_requests", "ranged_requests", "full_files",
-                          "ranged_files", "failed_files", "returned_bytes"):
+                          "ranged_files", "failed_files", "budget_cut_files",
+                          "returned_bytes"):
                 report[field] += row.get(field, 0)
             continue
         if row.get("event") != "tool_result_bytes":

@@ -3337,11 +3337,15 @@ fn guidance_files_bypass_read_file_and_batch_caps() {
         }],
     )
     .unwrap();
+    // Ordinary files are cut at a line to the inline budget, never AGENTS.md.
+    let cut = &ordinary.files[0];
     assert!(
-        !ordinary.files[0].truncated,
-        "normal source files are complete by default"
+        cut.truncated && cut.budget_truncated,
+        "an ordinary file past the inline budget is cut at a line"
     );
-    assert_eq!(ordinary.files[0].text, content);
+    assert!(content.starts_with(&cut.text) && cut.text.ends_with('\n'));
+    assert_eq!(cut.start_line, Some(1));
+    assert_eq!(cut.end_line, Some(cut.line_count));
     #[cfg(unix)]
     {
         std::fs::create_dir_all(root.join("nested")).unwrap();
@@ -4451,24 +4455,94 @@ async fn read_tool_range_returns_full_text_when_lossy_decoding_expands() {
 
 /// A requested range is complete even when it exceeds the old per-file cap.
 #[tokio::test]
-async fn read_tool_range_larger_than_old_cap_reports_full_end_line() {
+async fn read_tool_budget_cut_range_reports_returned_lines_and_continuation() {
     let workspace_root = read_workspace("line-range-report-end");
-    // Six 100-KiB lines: the 512-KiB per-file cap cuts the range mid-way.
+    // Eight 100-KiB lines: the default inline budget fits one per reply.
     let big_line = format!("{}\n", "z".repeat(100 * 1024));
     std::fs::write(workspace_root.join("lines.txt"), big_line.repeat(8)).expect("write file");
 
     let structured = read_batch(
         &workspace_root,
-        json!([{ "path": "lines.txt", "start_line": 1, "end_line": 8 }]),
+        json!([{ "path": "lines.txt", "start_line": 3, "end_line": 6 }]),
     )
     .await;
 
     let entry = &structured["files"][0];
-    assert_eq!(entry["truncated"], json!(false));
-    assert_eq!(entry["startLine"], json!(1));
-    assert_eq!(entry["endLine"], json!(8));
-    assert_eq!(entry["lineCount"], json!(8));
-    assert!(entry["bytes"].as_u64().unwrap() > 512 * 1024);
+    assert_eq!(entry["truncated"], json!(true));
+    assert_eq!(entry["budgetTruncated"], json!(true));
+    assert_eq!(structured["batchTruncated"], json!(true));
+    assert_eq!(entry["startLine"], json!(3));
+    assert_eq!(entry["endLine"], json!(3));
+    assert_eq!(entry["lineCount"], json!(1));
+    assert_eq!(entry["text"], json!(big_line));
+    let advice = structured["retrievalAdvice"]
+        .as_str()
+        .expect("a cut read names its continuation");
+    assert!(
+        advice.contains("lines.txt returned lines 3-3")
+            && advice.contains(r#"{"path": "lines.txt", "start_line": 4, "end_line": 6}"#),
+        "{advice}"
+    );
+    assert!(
+        structured.get("outputRef").is_none(),
+        "nothing was externalized"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+/// A batch the store must take anyway (an unbreakable line) is not cut, and
+/// the preview keeps the read_result warning in front of any read advice.
+#[tokio::test]
+async fn read_tool_externalized_batch_is_complete_and_says_it_is_a_preview() {
+    let workspace_root = read_workspace("mixed-externalized");
+    std::fs::write(workspace_root.join("big.log"), filler(300 * 1024)).expect("write log");
+    std::fs::write(workspace_root.join("app.min.js"), "x".repeat(200 * 1024)).expect("write js");
+
+    let structured = read_batch(&workspace_root, json!(["big.log", "app.min.js"])).await;
+
+    assert!(
+        structured["outputRef"].is_string(),
+        "the batch must externalize"
+    );
+    assert_eq!(structured["batchTruncated"], json!(false));
+    assert_eq!(structured["files"][0]["budgetTruncated"], json!(false));
+    let advice = structured["retrievalAdvice"]
+        .as_str()
+        .expect("missing advice");
+    assert!(
+        advice.starts_with("This is only a preview") && advice.contains("read_result"),
+        "{advice}"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+/// Thirty-two long paths with a cut batch still fit the read gate: the
+/// metadata overhead stays inside the reserve on top of the text budget.
+#[tokio::test]
+async fn read_tool_full_batch_of_long_paths_stays_inline() {
+    let workspace_root = read_workspace("long-paths");
+    let dir = (0..8)
+        .map(|level| format!("{level}{}", "d".repeat(40)))
+        .collect::<Vec<_>>()
+        .join("/");
+    std::fs::create_dir_all(workspace_root.join(&dir)).expect("create dirs");
+    let paths: Vec<String> = (0..workspace_tools::MAX_READ_BATCH_FILES)
+        .map(|index| format!("{dir}/{index:02}-{}.rs", "f".repeat(150)))
+        .collect();
+    for path in &paths {
+        std::fs::write(workspace_root.join(path), filler(8 * 1024)).expect("write file");
+    }
+
+    let structured = read_batch(&workspace_root, json!(paths)).await;
+
+    assert!(structured.get("outputRef").is_none(), "must stay inline");
+    assert_eq!(structured["batchTruncated"], json!(true));
+    assert_eq!(
+        structured["fileCount"],
+        json!(workspace_tools::MAX_READ_BATCH_FILES)
+    );
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -4893,9 +4967,9 @@ async fn read_tool_returns_every_named_file_in_one_call() {
 }
 
 #[tokio::test]
-async fn read_tool_returns_entire_batch_beyond_previous_budget() {
+async fn read_tool_cuts_an_oversized_batch_at_lines_and_names_every_continuation() {
     let workspace_root = read_workspace("batch-budget");
-    // Three files exceeding the old combined 512-KiB cap all come back whole.
+    // Three files, each past the inline budget on its own.
     let names = ["a.txt", "b.txt", "c.txt"];
     for name in names {
         std::fs::write(workspace_root.join(name), filler(600 * 1024)).expect("write file");
@@ -4903,20 +4977,41 @@ async fn read_tool_returns_entire_batch_beyond_previous_budget() {
 
     let structured = read_batch(&workspace_root, json!(names)).await;
     let files = structured["files"].as_array().expect("missing files");
-    // Transport previews can shorten the visible text; bytes records how much
-    // was read and the complete result is available through read_result.
     let total: u64 = files
         .iter()
         .map(|file| file["bytes"].as_u64().unwrap_or(0))
         .sum();
 
-    assert!(total > 512 * 1024, "batch must exceed the old ceiling");
-    assert_eq!(structured["batchTruncated"], json!(false));
-    for file in files {
-        assert_eq!(file["bytes"], json!(600 * 1024));
-        assert_eq!(file["truncated"], json!(false));
-        assert_eq!(file["budgetTruncated"], json!(false));
+    assert_eq!(structured["batchTruncated"], json!(true));
+    assert!(
+        structured.get("outputRef").is_none(),
+        "nothing was externalized"
+    );
+    assert!(total <= workspace_tools::read_inline_budget() as u64);
+    // The first requested file takes the budget, cut at a line; the others
+    // say they returned nothing rather than pretending to be empty files.
+    assert_eq!(files[0]["budgetTruncated"], json!(true));
+    assert_eq!(files[0]["startLine"], json!(1));
+    let end = files[0]["endLine"]
+        .as_u64()
+        .expect("cut file reports endLine");
+    assert_eq!(files[0]["lineCount"], json!(end));
+    for file in &files[1..] {
+        assert_eq!(file["budgetTruncated"], json!(true));
+        assert_eq!(file["text"], json!(""));
+        assert!(file.get("startLine").is_none() && file.get("endLine").is_none());
     }
+    let advice = structured["retrievalAdvice"]
+        .as_str()
+        .expect("missing advice");
+    assert!(
+        advice.contains(&format!("\"start_line\": {}", end + 1)),
+        "{advice}"
+    );
+    assert!(
+        advice.contains("no text returned for b.txt, c.txt"),
+        "{advice}"
+    );
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -4984,7 +5079,8 @@ async fn read_tool_rejects_a_directory_the_same_way_wherever_it_lands() {
 #[tokio::test]
 async fn read_tool_does_not_let_an_unreadable_file_shrink_the_others() {
     let workspace_root = read_workspace("unreadable");
-    let big = 600 * 1024;
+    // Together they would overflow the inline budget; alone app.js fits.
+    let big = 100 * 1024;
     std::fs::write(workspace_root.join("app.js"), filler(big)).expect("write file");
     std::fs::write(workspace_root.join("locked.txt"), filler(100 * 1024)).expect("write file");
     use std::os::unix::fs::PermissionsExt;
@@ -5015,19 +5111,20 @@ async fn read_tool_does_not_let_an_unreadable_file_shrink_the_others() {
 #[tokio::test]
 async fn read_tool_does_not_blame_the_budget_for_lossy_expansion() {
     let workspace_root = read_workspace("lossy-big");
-    // Lossy conversion expands content beyond the old 512-KiB cap.
+    // Lossy conversion triples the size on disk, still inside the budget.
     let mut bytes = Vec::new();
-    while bytes.len() < 200 * 1024 {
+    while bytes.len() < 30 * 1024 {
         bytes.extend(std::iter::repeat_n(0xE9_u8, 40));
         bytes.push(b'\n');
     }
+    let size_on_disk = bytes.len() as u64;
     std::fs::write(workspace_root.join("bin.dat"), bytes).expect("write file");
 
     let structured = read_batch(&workspace_root, json!(["bin.dat"])).await;
 
     assert_eq!(structured["files"][0]["truncated"], json!(false));
     assert_eq!(structured["batchTruncated"], json!(false));
-    assert!(structured["files"][0]["bytes"].as_u64().unwrap() > 512 * 1024);
+    assert!(structured["files"][0]["bytes"].as_u64().unwrap() > 2 * size_on_disk);
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -5035,10 +5132,9 @@ async fn read_tool_does_not_blame_the_budget_for_lossy_expansion() {
 #[tokio::test]
 async fn read_tool_counts_lines_over_complete_files() {
     let workspace_root = read_workspace("lines");
-    let cap = 600 * 1024;
-    std::fs::write(workspace_root.join("a.txt"), filler(cap - 1)).expect("write file");
-    std::fs::write(workspace_root.join("b.txt"), "line\n".repeat(cap / 5 + 200))
-        .expect("write file");
+    let lines = 10_000;
+    std::fs::write(workspace_root.join("a.txt"), filler(40 * 1024)).expect("write file");
+    std::fs::write(workspace_root.join("b.txt"), "line\n".repeat(lines)).expect("write file");
 
     let structured = read_batch(&workspace_root, json!(["a.txt", "b.txt"])).await;
     let b = structured["files"]
@@ -5048,8 +5144,8 @@ async fn read_tool_counts_lines_over_complete_files() {
         .find(|file| file["path"] == json!("b.txt"))
         .expect("missing b.txt");
 
-    assert_eq!(b["bytes"], json!((cap / 5 + 200) * 5));
-    assert_eq!(b["lineCount"], json!(cap / 5 + 200));
+    assert_eq!(b["bytes"], json!(lines * 5));
+    assert_eq!(b["lineCount"], json!(lines));
     assert_eq!(b["truncated"], json!(false));
 
     let _ = std::fs::remove_dir_all(workspace_root);
@@ -5058,7 +5154,8 @@ async fn read_tool_counts_lines_over_complete_files() {
 #[tokio::test]
 async fn read_tool_charges_one_file_once_however_many_times_it_is_named() {
     let workspace_root = read_workspace("dup");
-    std::fs::write(workspace_root.join("a.txt"), filler(300 * 1024)).expect("write file");
+    // Charged twice, this file would overflow the inline budget and be cut.
+    std::fs::write(workspace_root.join("a.txt"), filler(100 * 1024)).expect("write file");
 
     let structured = read_batch(&workspace_root, json!(["a.txt", "a.txt"])).await;
     let files = structured["files"].as_array().expect("missing files");
@@ -5117,11 +5214,13 @@ async fn read_tool_keeps_requested_order_and_reads_all_files() {
     let structured = read_batch(&workspace_root, json!(["big.log", "a.txt", "b.txt"])).await;
     let files = structured["files"].as_array().expect("missing files");
 
+    // Small files come back whole even though the big one, requested first,
+    // had to be cut to fit the inline budget.
     assert_eq!(files[0]["path"], json!("big.log"));
     assert_eq!(files[1]["text"], json!("alpha\n"));
     assert_eq!(files[2]["text"], json!("beta\n"));
-    assert_eq!(files[0]["bytes"], json!(600 * 1024));
-    assert_eq!(files[0]["truncated"], json!(false));
+    assert_eq!(files[0]["budgetTruncated"], json!(true));
+    assert!(files[0]["bytes"].as_u64().unwrap() > 0);
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -5193,25 +5292,24 @@ async fn poll_command_waits_for_progress_unless_told_not_to() {
 }
 
 #[tokio::test]
-async fn read_tool_no_longer_silently_truncates_large_files() {
+async fn read_tool_never_cuts_large_files_silently() {
     let workspace_root = read_workspace("retryable");
     let cap = 600 * 1024;
-    std::fs::write(workspace_root.join("a.txt"), filler(cap - 1)).expect("write file");
     std::fs::write(workspace_root.join("b.txt"), filler(cap + 4096)).expect("write file");
 
-    let structured = read_batch(&workspace_root, json!(["a.txt", "b.txt"])).await;
-    let files = structured["files"].as_array().expect("missing files");
-    let b = files
-        .iter()
-        .find(|file| file["path"] == json!("b.txt"))
-        .expect("missing b.txt");
-
-    assert_eq!(b["truncated"], json!(false));
-    assert_eq!(b["budgetTruncated"], json!(false));
-    assert_eq!(b["bytes"], json!(cap + 4096));
     let alone = read_batch(&workspace_root, json!(["b.txt"])).await;
-    assert_eq!(alone["files"][0]["truncated"], json!(false));
-    assert_eq!(alone["files"][0]["bytes"], json!(cap + 4096));
+    let b = &alone["files"][0];
+
+    assert_eq!(b["truncated"], json!(true));
+    assert_eq!(b["budgetTruncated"], json!(true));
+    assert_eq!(alone["batchTruncated"], json!(true));
+    assert_eq!(b["sizeBytes"], json!(cap + 4096));
+    let end = b["endLine"].as_u64().expect("cut read reports endLine");
+    let advice = alone["retrievalAdvice"].as_str().expect("missing advice");
+    assert!(
+        advice.contains("incomplete") && advice.contains(&format!("\"start_line\": {}", end + 1)),
+        "{advice}"
+    );
 
     let _ = std::fs::remove_dir_all(workspace_root);
 }
@@ -7185,7 +7283,9 @@ async fn shared_tools_call_boundary_externalizes_oversized_result_losslessly() {
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-mcp-budget-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
-    let full_text = format!("HEAD\n{}\nTAIL", "ż中🙂".repeat(30_000));
+    // One line no ranged read can fit: read leaves it whole, so the reply
+    // overflows the read ceiling and takes the externalization path.
+    let full_text = format!("HEAD{}TAIL", "ż中🙂".repeat(30_000));
     std::fs::write(workspace_root.join("big.txt"), &full_text).expect("write file");
     let workspace_root_str = workspace_root.to_string_lossy().into_owned();
     let store = LargeResultStore::new_default().expect("create result store");
@@ -7324,7 +7424,9 @@ async fn retrieval_hint_fields_are_declared_in_budgetable_output_schemas() {
 async fn externalized_results_surface_retrieval_inside_structured_content() {
     let workspace_root = std::env::temp_dir().join(format!("catdesk-mcp-hint-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
-    let full_text = format!("HEAD\n{}\nTAIL", "ż中🙂".repeat(30_000));
+    // One line no ranged read can fit: read leaves it whole, so the reply
+    // overflows the read ceiling and takes the externalization path.
+    let full_text = format!("HEAD{}TAIL", "ż中🙂".repeat(30_000));
     std::fs::write(workspace_root.join("big.txt"), &full_text).expect("write file");
     let workspace_root_str = workspace_root.to_string_lossy().into_owned();
     let store = LargeResultStore::new_default().expect("create result store");
@@ -8144,9 +8246,10 @@ async fn byte_accounting_reports_externalized_results_from_the_budget_policy() {
     let workspace_root =
         std::env::temp_dir().join(format!("catdesk-accounting-external-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    // A single unbreakable line: read keeps it whole and the reply externalizes.
     std::fs::write(
         workspace_root.join("big.txt"),
-        format!("HEAD\n{}\nTAIL", "ż中🙂".repeat(30_000)),
+        format!("HEAD{}TAIL", "ż中🙂".repeat(30_000)),
     )
     .expect("write file");
     let workspace_root_str = workspace_root.to_string_lossy().into_owned();

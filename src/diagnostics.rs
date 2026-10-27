@@ -183,6 +183,7 @@ mod tests {
                     full_files: 2,
                     ranged_files: 1,
                     failed_files: 1,
+                    budget_cut_files: 1,
                     returned_bytes: 9120,
                 });
             })
@@ -195,6 +196,7 @@ mod tests {
         assert_eq!(record["full_files"], 2);
         assert_eq!(record["ranged_files"], 1);
         assert_eq!(record["failed_files"], 1);
+        assert_eq!(record["budget_cut_files"], 1);
         assert_eq!(record["returned_bytes"], 9120);
         assert!(record.get("path").is_none());
         assert!(record.get("text").is_none());
@@ -2068,6 +2070,8 @@ pub(crate) struct ReadUsageMetrics {
     pub(crate) full_files: usize,
     pub(crate) ranged_files: usize,
     pub(crate) failed_files: usize,
+    /// Successful entries the inline read budget cut at a line boundary.
+    pub(crate) budget_cut_files: usize,
     pub(crate) returned_bytes: usize,
 }
 
@@ -2081,6 +2085,7 @@ pub(crate) fn read_usage(metrics: ReadUsageMetrics) {
             "full_files": metrics.full_files,
             "ranged_files": metrics.ranged_files,
             "failed_files": metrics.failed_files,
+            "budget_cut_files": metrics.budget_cut_files,
             "returned_bytes": metrics.returned_bytes,
         }));
     });

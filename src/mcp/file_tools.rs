@@ -91,7 +91,7 @@ pub(crate) fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> J
     match workspace_tools::read_files(workspace_root, &requests) {
         Ok(output) => {
             diagnostics::read_usage(read_usage_metrics(&requests, &output));
-            let structured = json!({
+            let mut structured = json!({
                 "toolName": "read",
                 // The batch's byte and line counts are billed to this path, so
                 // it has to be a file that contributed them -- not a failed
@@ -112,6 +112,9 @@ pub(crate) fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> J
                 "batchTruncated": output.batch_truncated,
                 "files": output.files,
             });
+            if let Some(advice) = read_continuation_advice(&output.files) {
+                structured["retrievalAdvice"] = json!(advice);
+            }
             // Successful reads stay structured-only; failed reads also
             // expose model-readable error content.
             if output.files.iter().all(|file| file.error.is_some()) {
@@ -129,6 +132,55 @@ pub(crate) fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> J
             tool_error_response(req, e)
         }
     }
+}
+
+/// Names what a budget-cut batch left out and where each file continues, in
+/// `retrievalAdvice`: the field every budgetable tool's outputSchema declares,
+/// so hosts that project results through the schema still show it.
+fn read_continuation_advice(files: &[workspace_tools::ReadBatchEntry]) -> Option<String> {
+    // The follow-up keeps the caller's own end: a cut 1-1000 range continues
+    // up to line 1000, not to the end of the file.
+    let follow_up = |path: &str, start_line: Option<usize>, end_line: Option<usize>| {
+        let mut request = format!("{{\"path\": {}", json!(path));
+        if let Some(start_line) = start_line {
+            request.push_str(&format!(", \"start_line\": {start_line}"));
+        }
+        if let Some(end_line) = end_line {
+            request.push_str(&format!(", \"end_line\": {end_line}"));
+        }
+        request.push('}');
+        request
+    };
+    let mut steps: Vec<String> = Vec::new();
+    let mut not_returned: Vec<String> = Vec::new();
+    for file in files.iter().filter(|file| file.budget_truncated) {
+        match file.end_line {
+            Some(end) => steps.push(format!(
+                "{} returned lines {}-{end}; continue with {}",
+                file.path,
+                file.start_line.unwrap_or(1),
+                follow_up(&file.path, Some(end + 1), file.requested_end_line)
+            )),
+            None if file.ranged_request() => not_returned.push(follow_up(
+                &file.path,
+                file.requested_start_line,
+                file.requested_end_line,
+            )),
+            None => not_returned.push(file.path.clone()),
+        }
+    }
+    if !not_returned.is_empty() {
+        steps.push(format!(
+            "no text returned for {}; read them in a separate call",
+            not_returned.join(", ")
+        ));
+    }
+    (!steps.is_empty()).then(|| {
+        format!(
+            "Inline read budget reached; the files listed here are incomplete. {}.",
+            steps.join("; ")
+        )
+    })
 }
 
 /// Request counts represent the caller's intent (including duplicates).
@@ -154,10 +206,15 @@ fn read_usage_metrics(
     for file in &output.files {
         if file.error.is_some() {
             metrics.failed_files += 1;
-        } else if file.start_line.is_some() || file.end_line.is_some() {
+            continue;
+        }
+        if file.ranged_request() {
             metrics.ranged_files += 1;
         } else {
             metrics.full_files += 1;
+        }
+        if file.budget_truncated {
+            metrics.budget_cut_files += 1;
         }
     }
     metrics
@@ -206,24 +263,34 @@ mod read_usage_tests {
             budget_truncated: false,
             start_line,
             end_line,
+            requested_start_line: start_line,
+            requested_end_line: end_line,
         };
+        // A whole-file read cut by the inline budget reports line bounds but
+        // still counts as a full read, plus a budget cut.
+        let mut cut = entry("secret-three", 4, Some(1), Some(40), false);
+        (cut.requested_start_line, cut.requested_end_line) = (None, None);
+        cut.truncated = true;
+        cut.budget_truncated = true;
         let output = workspace_tools::ReadBatchOutput {
             files: vec![
                 entry("secret-one", 5, None, None, false),
                 entry("secret-two", 3, Some(1), Some(3), false),
                 entry("missing", 0, None, None, true),
+                cut,
             ],
-            total_bytes: 8,
-            total_line_count: 2,
-            batch_truncated: false,
+            total_bytes: 12,
+            total_line_count: 3,
+            batch_truncated: true,
         };
         let stats = read_usage_metrics(&requests, &output);
         assert_eq!(stats.full_requests, 3);
         assert_eq!(stats.ranged_requests, 1);
-        assert_eq!(stats.full_files, 1);
+        assert_eq!(stats.full_files, 2);
         assert_eq!(stats.ranged_files, 1);
         assert_eq!(stats.failed_files, 1);
-        assert_eq!(stats.returned_bytes, 8);
+        assert_eq!(stats.budget_cut_files, 1);
+        assert_eq!(stats.returned_bytes, 12);
     }
 }
 

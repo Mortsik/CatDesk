@@ -23,6 +23,31 @@ use std::time::{Duration, Instant};
 pub const MAX_READ_BATCH_FILES: usize = 32;
 pub const MAX_READ_BATCH_BYTES: usize = 32 * 1024 * 1024;
 
+/// Text one read reply carries inline, measured as JSON-escaped bytes. Files
+/// that fit come back whole (smallest first); the next ones are cut at a line
+/// boundary with startLine/endLine set so a ranged read continues exactly
+/// where the reply stopped. Hosts truncate oversized tool results on their
+/// own, silently, so the reply stays well under what they accept.
+pub const DEFAULT_READ_INLINE_BYTES: usize = 128 * 1024;
+const MIN_READ_INLINE_BYTES: usize = 4 * 1024;
+/// Overrides the inline budget, e.g. to measure where a host starts cutting.
+pub const READ_INLINE_BYTES_ENV: &str = "CATDESK_READ_INLINE_BYTES";
+
+pub fn read_inline_budget() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        parse_read_inline_budget(std::env::var(READ_INLINE_BYTES_ENV).ok().as_deref())
+    })
+}
+
+fn parse_read_inline_budget(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map_or(DEFAULT_READ_INLINE_BYTES, |value| {
+            value.clamp(MIN_READ_INLINE_BYTES, MAX_READ_BATCH_BYTES)
+        })
+}
+
 /// Agent guidance documents bypass the safety ceiling so rules stay complete.
 /// The transport externalizes large read replies losslessly for retrieval.
 fn is_agent_guidance_file(path: &Path) -> bool {
@@ -665,21 +690,34 @@ pub struct ReadBatchEntry {
     pub line_count: usize,
     pub text: String,
     pub truncated: bool,
-    /// Retained for API compatibility. Whole-file reads never silently trim
-    /// text to fit the transport ceiling; oversized requests return errors.
+    /// The inline budget cut this entry at a line boundary; startLine/endLine
+    /// say what came back, so a ranged read continues from endLine + 1.
     pub budget_truncated: bool,
     /// The resolved 1-based inclusive line range, present for ranged reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_line: Option<usize>,
+    /// The range as requested, kept off the wire: a budget cut rewrites the
+    /// reported bounds, while usage metrics and the continuation advice need
+    /// what the caller asked for.
+    #[serde(skip)]
+    pub requested_start_line: Option<usize>,
+    #[serde(skip)]
+    pub requested_end_line: Option<usize>,
+}
+
+impl ReadBatchEntry {
+    pub fn ranged_request(&self) -> bool {
+        self.requested_start_line.is_some() || self.requested_end_line.is_some()
+    }
 }
 
 pub struct ReadBatchOutput {
     pub files: Vec<ReadBatchEntry>,
     pub total_bytes: usize,
     pub total_line_count: usize,
-    /// Compatibility field: whole reads either succeed or fail explicitly.
+    /// Some entry was cut to fit the inline budget.
     pub batch_truncated: bool,
 }
 
@@ -704,6 +742,8 @@ fn failed_entry(path: &str, error: String) -> ReadBatchEntry {
         budget_truncated: false,
         start_line: None,
         end_line: None,
+        requested_start_line: None,
+        requested_end_line: None,
     }
 }
 
@@ -746,6 +786,14 @@ pub fn read_files(
     workspace_root: &str,
     requests: &[ReadRequest],
 ) -> Result<ReadBatchOutput, String> {
+    read_files_with_inline_budget(workspace_root, requests, read_inline_budget())
+}
+
+pub fn read_files_with_inline_budget(
+    workspace_root: &str,
+    requests: &[ReadRequest],
+    inline_budget: usize,
+) -> Result<ReadBatchOutput, String> {
     if requests.is_empty() {
         return Err("paths must contain at least one path".into());
     }
@@ -763,10 +811,8 @@ pub fn read_files(
         .collect();
 
     let mut entries: Vec<Option<ReadBatchEntry>> = (0..requests.len()).map(|_| None).collect();
+    let mut guidance_entries = vec![false; requests.len()];
     let mut remaining = MAX_READ_BATCH_BYTES;
-    let batch_truncated = false;
-    let mut total_bytes = 0_usize;
-    let mut total_line_count = 0_usize;
 
     // A symlink and its target canonicalize to the same place, as does the
     // same request twice. Reading it twice would charge the budget twice; the
@@ -801,8 +847,7 @@ pub fn read_files(
                 if !guidance {
                     remaining -= keep;
                 }
-                total_bytes += keep;
-                total_line_count += line_count;
+                guidance_entries[index] = guidance;
                 if let Some(target) = &planned[index].target {
                     already_read.insert((
                         target.clone(),
@@ -833,6 +878,8 @@ pub fn read_files(
                     budget_truncated: false,
                     start_line,
                     end_line,
+                    requested_start_line: request.start_line,
+                    requested_end_line: request.end_line,
                 });
             }
             Err(error) => {
@@ -843,6 +890,8 @@ pub fn read_files(
             }
         }
     }
+
+    let batch_truncated = pack_inline(&mut entries, &guidance_entries, inline_budget);
 
     let files: Vec<ReadBatchEntry> = entries
         .into_iter()
@@ -857,6 +906,8 @@ pub fn read_files(
             (None, None) => None,
         })
         .collect();
+    let total_bytes = files.iter().map(|file| file.bytes).sum();
+    let total_line_count = files.iter().map(|file| file.line_count).sum();
 
     Ok(ReadBatchOutput {
         files,
@@ -864,6 +915,112 @@ pub fn read_files(
         total_line_count,
         batch_truncated,
     })
+}
+
+/// Fits the batch into the inline budget. Agent guidance is never cut, so it
+/// is charged first; the other files come back whole smallest first, and the
+/// rest are cut at a line boundary in request order. A file whose first line
+/// alone exceeds the whole budget cannot be continued by line ranges, so such
+/// a batch (like guidance past the budget) is left whole for the response
+/// budget to externalize losslessly. Returns whether any entry was cut.
+fn pack_inline(
+    entries: &mut [Option<ReadBatchEntry>],
+    guidance: &[bool],
+    inline_budget: usize,
+) -> bool {
+    let mut guidance_cost = 0_usize;
+    let mut ordinary: Vec<(usize, usize)> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry.as_ref().filter(|entry| entry.error.is_none()) else {
+            continue;
+        };
+        let cost = json_escaped_len(&entry.text);
+        if guidance[index] {
+            guidance_cost = guidance_cost.saturating_add(cost);
+        } else {
+            ordinary.push((index, cost));
+        }
+    }
+    ordinary.sort_by_key(|&(index, cost)| (cost, index));
+
+    let mut remaining = inline_budget.saturating_sub(guidance_cost);
+    let mut deferred: Vec<usize> = Vec::new();
+    for (index, cost) in ordinary {
+        if cost <= remaining {
+            remaining -= cost;
+        } else {
+            deferred.push(index);
+        }
+    }
+    deferred.sort_unstable();
+
+    // Something that must stay whole already overflows the budget, so the
+    // reply goes to the result store anyway. Cutting the other files would
+    // only make the stored copy incomplete and point the model at ranged
+    // reads instead of read_result; leave the whole batch to the store.
+    let unbreakable = |index: &usize| {
+        entries[*index].as_ref().is_some_and(|entry| {
+            entry
+                .text
+                .split_inclusive('\n')
+                .next()
+                .map_or(0, json_escaped_len)
+                > inline_budget
+        })
+    };
+    if guidance_cost > inline_budget || deferred.iter().any(unbreakable) {
+        return false;
+    }
+
+    for &index in &deferred {
+        if let Some(entry) = entries[index].as_mut() {
+            remaining -= cut_to_line_budget(entry, remaining);
+        }
+    }
+    !deferred.is_empty()
+}
+
+/// Keeps the longest whole-line prefix that fits `budget` and returns its
+/// escaped cost. The kept lines are reported as startLine/endLine, so the next
+/// ranged read starts at endLine + 1; nothing kept reports no bounds.
+fn cut_to_line_budget(entry: &mut ReadBatchEntry, budget: usize) -> usize {
+    let first_line = entry.start_line.unwrap_or(1);
+    let mut kept_bytes = 0_usize;
+    let mut kept_cost = 0_usize;
+    let mut kept_lines = 0_usize;
+    for line in entry.text.split_inclusive('\n') {
+        let cost = json_escaped_len(line);
+        if kept_cost + cost > budget {
+            break;
+        }
+        kept_bytes += line.len();
+        kept_cost += cost;
+        kept_lines += 1;
+    }
+    entry.text.truncate(kept_bytes);
+    entry.text.shrink_to_fit();
+    entry.bytes = kept_bytes;
+    entry.line_count = kept_lines;
+    entry.truncated = true;
+    entry.budget_truncated = true;
+    (entry.start_line, entry.end_line) = if kept_lines > 0 {
+        (Some(first_line), Some(first_line + kept_lines - 1))
+    } else {
+        (None, None)
+    };
+    kept_cost
+}
+
+/// Length of `text` once serialized as a JSON string body, which is what the
+/// reply actually spends: quotes, backslashes and control characters expand.
+fn json_escaped_len(text: &str) -> usize {
+    text.chars()
+        .map(|ch| match ch {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            ch if (ch as u32) < 0x20 => 6,
+            ch => ch.len_utf8(),
+        })
+        .sum()
 }
 
 fn count_lines(text: &str) -> usize {
@@ -2255,7 +2412,9 @@ mod tests {
         fs::write(workspace_root.join("first.txt"), &first).expect("write first");
         fs::write(workspace_root.join("second.txt"), &second).expect("write second");
         let root = workspace_root.to_string_lossy();
-        let result = read_files(
+        // Whole reads are bounded only by the safety ceiling once the inline
+        // budget allows it; the default budget is covered by the packing tests.
+        let result = read_files_with_inline_budget(
             &root,
             &[
                 ReadRequest {
@@ -2269,6 +2428,7 @@ mod tests {
                     end_line: None,
                 },
             ],
+            MAX_READ_BATCH_BYTES,
         )
         .expect("read files");
         assert_eq!(result.files[0].text, first);
@@ -2277,6 +2437,233 @@ mod tests {
         assert!(!result.files[1].truncated);
         assert!(!result.batch_truncated);
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    fn whole(path: &str) -> ReadRequest {
+        ReadRequest {
+            path: path.into(),
+            start_line: None,
+            end_line: None,
+        }
+    }
+
+    fn numbered_lines(prefix: &str, count: usize) -> String {
+        (1..=count)
+            .map(|line| format!("{prefix} line {line:05} \"quoted\"\tpadding padding\n"))
+            .collect()
+    }
+
+    #[test]
+    fn inline_budget_returns_small_files_whole_and_cuts_the_rest_at_a_line() {
+        let workspace_root = test_workspace("inline-pack");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let small_a = numbered_lines("a", 20);
+        let small_b = numbered_lines("b", 20);
+        let big = numbered_lines("big", 2_000);
+        fs::write(workspace_root.join("big.txt"), &big).expect("write big");
+        fs::write(workspace_root.join("a.txt"), &small_a).expect("write a");
+        fs::write(workspace_root.join("b.txt"), &small_b).expect("write b");
+        let root = workspace_root.to_string_lossy();
+        let budget = 16 * 1024;
+
+        let result = read_files_with_inline_budget(
+            &root,
+            &[whole("big.txt"), whole("a.txt"), whole("b.txt")],
+            budget,
+        )
+        .expect("read files");
+
+        // Request order survives packing; the small files came back whole.
+        assert_eq!(result.files[1].text, small_a);
+        assert_eq!(result.files[2].text, small_b);
+        assert!(!result.files[1].truncated && !result.files[2].truncated);
+        let cut = &result.files[0];
+        assert!(cut.truncated && cut.budget_truncated && result.batch_truncated);
+        assert_eq!(cut.start_line, Some(1));
+        let end = cut.end_line.expect("cut entry reports its last line");
+        assert_eq!(cut.line_count, end);
+        assert!(big.starts_with(&cut.text) && cut.text.ends_with('\n'));
+        let spent: usize = result
+            .files
+            .iter()
+            .map(|file| json_escaped_len(&file.text))
+            .sum();
+        assert!(spent <= budget, "spent {spent} of {budget}");
+        assert!(budget - spent < 128, "the cut file takes what is left");
+        assert_eq!(
+            result.total_bytes,
+            result.files.iter().map(|f| f.bytes).sum::<usize>()
+        );
+
+        // Continuing from endLine + 1 reassembles the file exactly.
+        let mut reassembled = cut.text.clone();
+        let mut next = end + 1;
+        loop {
+            let more = read_files_with_inline_budget(
+                &root,
+                &[ReadRequest {
+                    path: "big.txt".into(),
+                    start_line: Some(next),
+                    end_line: None,
+                }],
+                budget,
+            )
+            .expect("continue read");
+            let entry = &more.files[0];
+            reassembled.push_str(&entry.text);
+            if !entry.truncated {
+                break;
+            }
+            assert_eq!(entry.start_line, Some(next));
+            next = entry.end_line.expect("continuation bounds") + 1;
+        }
+        assert_eq!(reassembled, big);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn inline_budget_never_cuts_agent_guidance() {
+        let workspace_root = test_workspace("inline-guidance");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        // Guidance under the budget is charged first; the ordinary file gets
+        // what is left, cut at a line.
+        let rules = numbered_lines("rule", 50);
+        let notes = numbered_lines("note", 50);
+        fs::write(workspace_root.join("AGENTS.md"), &rules).expect("write rules");
+        fs::write(workspace_root.join("notes.txt"), &notes).expect("write notes");
+        let root = workspace_root.to_string_lossy();
+        let budget = json_escaped_len(&rules) + 1024;
+
+        let result =
+            read_files_with_inline_budget(&root, &[whole("notes.txt"), whole("AGENTS.md")], budget)
+                .expect("read files");
+
+        assert_eq!(result.files[1].text, rules);
+        assert!(!result.files[1].truncated);
+        let cut = &result.files[0];
+        assert!(cut.truncated && cut.budget_truncated && result.batch_truncated);
+        assert!(notes.starts_with(&cut.text) && !cut.text.is_empty());
+
+        // Guidance alone past the budget sends the reply to the result store:
+        // nothing else is cut, so the stored copy stays complete.
+        let small = read_files_with_inline_budget(
+            &root,
+            &[whole("notes.txt"), whole("AGENTS.md")],
+            json_escaped_len(&rules) / 2,
+        )
+        .expect("read files");
+        assert_eq!(small.files[0].text, notes);
+        assert_eq!(small.files[1].text, rules);
+        assert!(!small.batch_truncated && !small.files[0].budget_truncated);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn inline_budget_cuts_nothing_when_an_unbreakable_line_forces_the_store() {
+        let workspace_root = test_workspace("inline-giant-batch");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let log = numbered_lines("log", 1_000);
+        let minified = "x".repeat(32 * 1024);
+        fs::write(workspace_root.join("big.log"), &log).expect("write log");
+        fs::write(workspace_root.join("app.min.js"), &minified).expect("write js");
+
+        let result = read_files_with_inline_budget(
+            &workspace_root.to_string_lossy(),
+            &[whole("big.log"), whole("app.min.js")],
+            16 * 1024,
+        )
+        .expect("read files");
+
+        assert_eq!(result.files[0].text, log);
+        assert_eq!(result.files[1].text, minified);
+        assert!(!result.batch_truncated);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn inline_budget_continuation_reassembles_crlf_and_unterminated_files() {
+        let workspace_root = test_workspace("inline-crlf");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let crlf: String = (1..=400)
+            .map(|line| format!("crlf line {line:04} padding\r\n"))
+            .collect();
+        let unterminated = format!("{}last line without newline", numbered_lines("open", 300));
+        fs::write(workspace_root.join("crlf.txt"), &crlf).expect("write crlf");
+        fs::write(workspace_root.join("open.txt"), &unterminated).expect("write open");
+        let root = workspace_root.to_string_lossy();
+
+        for (path, expected) in [("crlf.txt", &crlf), ("open.txt", &unterminated)] {
+            let mut reassembled = String::new();
+            let mut start_line = None;
+            for _ in 0..64 {
+                let result = read_files_with_inline_budget(
+                    &root,
+                    &[ReadRequest {
+                        path: path.into(),
+                        start_line,
+                        end_line: None,
+                    }],
+                    4 * 1024,
+                )
+                .expect("read file");
+                let entry = &result.files[0];
+                reassembled.push_str(&entry.text);
+                if !entry.truncated {
+                    break;
+                }
+                start_line = Some(entry.end_line.expect("cut bounds") + 1);
+            }
+            assert_eq!(&reassembled, expected, "{path}");
+        }
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn inline_budget_leaves_a_line_no_range_can_fit_for_the_result_store() {
+        let workspace_root = test_workspace("inline-giant-line");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let minified = "x".repeat(32 * 1024);
+        fs::write(workspace_root.join("app.min.js"), &minified).expect("write file");
+
+        let result = read_files_with_inline_budget(
+            &workspace_root.to_string_lossy(),
+            &[whole("app.min.js")],
+            16 * 1024,
+        )
+        .expect("read file");
+
+        assert_eq!(result.files[0].text, minified);
+        assert!(!result.files[0].truncated && !result.batch_truncated);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn json_escaped_len_matches_serde_serialization() {
+        for text in [
+            "plain",
+            "quote\" back\\slash",
+            "tab\tnl\ncr\r",
+            "\u{1}\u{8}\u{c}\u{1f}",
+            "zażółć 🐈",
+        ] {
+            let serialized = serde_json::to_string(text).expect("serialize");
+            assert_eq!(json_escaped_len(text), serialized.len() - 2, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn read_inline_budget_override_parses_and_clamps() {
+        assert_eq!(parse_read_inline_budget(None), DEFAULT_READ_INLINE_BYTES);
+        assert_eq!(
+            parse_read_inline_budget(Some("lots")),
+            DEFAULT_READ_INLINE_BYTES
+        );
+        assert_eq!(parse_read_inline_budget(Some(" 262144 ")), 262_144);
+        assert_eq!(parse_read_inline_budget(Some("1")), MIN_READ_INLINE_BYTES);
+        assert_eq!(
+            parse_read_inline_budget(Some("999999999999")),
+            MAX_READ_BATCH_BYTES
+        );
     }
 
     #[test]

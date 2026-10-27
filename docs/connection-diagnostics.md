@@ -24,8 +24,10 @@ Records contain Unix milliseconds (`timestamp_ms`), process ID (`pid`), and:
 - `read_usage`: one numeric-only record per valid `read` batch, with
   `full_requests` and `ranged_requests` (input path entries; duplicates counted),
   `full_files`, `ranged_files`, and `failed_files` (actual output entries,
-  after deduplication), plus `returned_bytes` (full decoded file text before
-  MCP response-budget processing). A range is any `start_line` or `end_line`
+  after deduplication, classified by what was requested), `budget_cut_files`
+  (successful entries the inline read budget cut at a line boundary; absent in
+  logs before 2026-10-27), plus `returned_bytes` (decoded text actually
+  returned, after inline read packing). A range is any `start_line` or `end_line`
   argument; successful zero-byte files count as files. An entire batch rejected
   before reading counts each requested path as failed. Malformed arguments
   rejected by the request parser are not included. The record carries the

@@ -9,7 +9,8 @@
 //! (a) a large run_command whose stdout+stderr are externalized and later
 //!     reconstructed byte-for-byte through read_result,
 //! (b) a file workflow (write a large file, search for a needle, read the
-//!     file back) with full-content reconstruction,
+//!     file back) whose bounded, line-cut read reassembles the full content
+//!     through ranged continuation reads,
 //! (c) a browser/DevTools workflow through a fake peer: bounded input
 //!     defaults (take_snapshot non-verbose, bounded listing pages) and a
 //!     large network body externalized and reconstructed,
@@ -40,7 +41,7 @@ use std::sync::Arc;
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::jsonrpc::JsonRpcRequest;
-use crate::mcp::response_budget::DEFAULT_INLINE_RESPONSE_BYTES;
+use crate::mcp::response_budget::{DEFAULT_INLINE_RESPONSE_BYTES, inline_response_limit};
 use crate::mcp::{JsonRpcResponse, handle_tools_call_with_result_store};
 use crate::result_store::{DEFAULT_MAX_RANGE_BYTES, LargeResultStore};
 use crate::state::{Mode, ShowDetailMode, ToolMode};
@@ -53,6 +54,8 @@ struct Footprint {
     raw_bytes: u64,
     inline_bytes: u64,
     externalized: bool,
+    /// The tool's inline ceiling: `read` packs to its own, larger budget.
+    inline_limit: u64,
 }
 
 fn print_footprint_report(footprints: &[Footprint]) {
@@ -76,12 +79,12 @@ fn print_footprint_report(footprints: &[Footprint]) {
 /// Assert the shared footprint invariants for one tool-result row.
 fn assert_footprint(row: &Footprint) {
     assert!(
-        row.inline_bytes <= DEFAULT_INLINE_RESPONSE_BYTES as u64,
+        row.inline_bytes <= row.inline_limit,
         "[{}] inline result {} B exceeds the {} B budget — an oversized \
          payload bypassed the response budget",
         row.workflow,
         row.inline_bytes,
-        DEFAULT_INLINE_RESPONSE_BYTES
+        row.inline_limit
     );
     if row.externalized {
         assert!(
@@ -273,18 +276,29 @@ impl GateHarness {
             raw_bytes: Self::raw_bytes(response),
             inline_bytes: Self::inline_bytes(response),
             externalized: true,
+            inline_limit: DEFAULT_INLINE_RESPONSE_BYTES as u64,
         };
         assert_footprint(&row);
         row
     }
 
     fn bounded_row(workflow: &'static str, detail: &str, response: &JsonRpcResponse) -> Footprint {
+        Self::bounded_row_within(workflow, detail, response, DEFAULT_INLINE_RESPONSE_BYTES)
+    }
+
+    fn bounded_row_within(
+        workflow: &'static str,
+        detail: &str,
+        response: &JsonRpcResponse,
+        inline_limit: usize,
+    ) -> Footprint {
         let row = Footprint {
             workflow,
             detail: detail.to_string(),
             raw_bytes: 0,
             inline_bytes: Self::inline_bytes(response),
             externalized: false,
+            inline_limit: inline_limit as u64,
         };
         assert_footprint(&row);
         row
@@ -408,19 +422,54 @@ async fn workflow_files(harness: &GateHarness, footprints: &mut Vec<Footprint>) 
         &search,
     ));
 
-    // Big read must externalize and reconstruct byte-for-byte.
-    let read = harness
-        .call("read", json!({ "paths": ["gate/big.txt"] }))
-        .await;
-    let row = harness.require_externalized("files", "read big.txt", &read);
-    let rebuilt = harness.reconstruct(&GateHarness::output_ref(&read)).await;
-    let full: Value = serde_json::from_slice(&rebuilt).expect("parse reconstructed read");
-    let got = full
-        .pointer("/structuredContent/files/0/text")
-        .and_then(Value::as_str)
-        .expect("read content text");
-    assert_eq!(got, content, "file content must reconstruct byte-for-byte");
-    footprints.push(row);
+    // Big read comes back bounded and inline, cut at a line boundary; ranged
+    // reads continuing from endLine + 1 reassemble it byte-for-byte.
+    const MAX_CONTINUATION_READS: usize = 64;
+    let read_limit = inline_response_limit("read");
+    let mut rebuilt = String::new();
+    let mut next_line: Option<u64> = None;
+    let mut reads = 0;
+    loop {
+        assert!(
+            reads < MAX_CONTINUATION_READS,
+            "continuation reads never reached the end of the file"
+        );
+        let arguments = match next_line {
+            None => json!({ "paths": ["gate/big.txt"] }),
+            Some(line) => json!({ "paths": [{ "path": "gate/big.txt", "start_line": line }] }),
+        };
+        let read = harness.call("read", arguments).await;
+        reads += 1;
+        assert!(
+            !GateHarness::externalized(&read),
+            "a line-addressable read must come back inline, not externalized"
+        );
+        let row =
+            GateHarness::bounded_row_within("files", "read big.txt (bounded)", &read, read_limit);
+        let file = read
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer("/structuredContent/files/0"))
+            .expect("read file entry");
+        rebuilt.push_str(file["text"].as_str().expect("read content text"));
+        if reads == 1 {
+            assert_eq!(
+                file["budgetTruncated"],
+                json!(true),
+                "the big file must be cut"
+            );
+            footprints.push(row);
+        }
+        if file["budgetTruncated"] != json!(true) {
+            break;
+        }
+        next_line = Some(file["endLine"].as_u64().expect("cut read reports endLine") + 1);
+    }
+    assert!(reads >= 2, "the gate must exercise a continuation read");
+    assert_eq!(
+        rebuilt, content,
+        "file content must reassemble byte-for-byte"
+    );
 }
 
 // ── (c) browser/DevTools: bounded input defaults + big body retrieval ─────
@@ -630,6 +679,7 @@ async fn workflow_repeated_polling(harness: &GateHarness, footprints: &mut Vec<F
         raw_bytes: 0,
         inline_bytes: max_poll_inline,
         externalized: false,
+        inline_limit: DEFAULT_INLINE_RESPONSE_BYTES as u64,
     });
 }
 
@@ -665,9 +715,11 @@ async fn transcript_gate_bounds_footprint_and_keeps_capability() {
     // rounding accident.
     let externalized_rows: Vec<&Footprint> =
         footprints.iter().filter(|row| row.externalized).collect();
+    // File reads no longer externalize: they come back bounded and inline,
+    // continued by ranged reads (asserted in the files workflow).
     assert!(
-        externalized_rows.len() >= 3,
-        "expected the command, file-read, and DevTools workflows to externalize"
+        externalized_rows.len() >= 2,
+        "expected the command and DevTools workflows to externalize"
     );
     for row in &externalized_rows {
         assert!(

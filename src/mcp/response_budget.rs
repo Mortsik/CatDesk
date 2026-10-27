@@ -10,6 +10,7 @@ const ERROR_TEXT_PREVIEW_BYTES: usize = 8 * 1024;
 const ARRAY_PREVIEW_ITEMS: usize = 12;
 const MAX_OMISSION_DETAILS: usize = 16;
 const FALLBACK_TEXT_PREVIEW_BYTES: usize = 2 * 1024;
+const PREVIEW_RETRIEVAL_ADVICE: &str = "This is only a preview. Before relying on omitted data, retrieve the necessary portion with read_result(result_id=outputRef, offset=...) or search_result; do not assume the preview is complete.";
 
 #[derive(Clone, Debug, Default)]
 struct OmissionTracker {
@@ -90,6 +91,8 @@ pub(crate) struct BudgetCandidate {
     omissions: OmissionTracker,
     is_error: bool,
     entry_cap: Option<EntryCapReduction>,
+    /// The ceiling this result crossed, reported in the manifest.
+    inline_limit: usize,
 }
 
 /// Byte accounting for one externalized result, straight from the policy's
@@ -151,9 +154,16 @@ impl BudgetCandidate {
             structured
                 .entry("outputBytes".to_string())
                 .or_insert_with(|| json!(self.original.len()));
-            structured.entry("retrievalAdvice".to_string()).or_insert_with(|| json!(
-                "This is only a preview. Before relying on omitted data, retrieve the necessary portion with read_result(result_id=outputRef, offset=...) or search_result; do not assume the preview is complete."
-            ));
+            // A tool may already advise on its own data (read names ranged
+            // continuations); the preview warning goes first, never dropped.
+            let advice = match structured.get("retrievalAdvice").and_then(Value::as_str) {
+                Some(existing) if existing.starts_with(PREVIEW_RETRIEVAL_ADVICE) => None,
+                Some(existing) => Some(format!("{PREVIEW_RETRIEVAL_ADVICE} {existing}")),
+                None => Some(PREVIEW_RETRIEVAL_ADVICE.to_string()),
+            };
+            if let Some(advice) = advice {
+                structured.insert("retrievalAdvice".to_string(), json!(advice));
+            }
             return;
         }
         if let Some(content) = self
@@ -183,7 +193,7 @@ impl BudgetCandidate {
         if let Some(object) = self.preview.as_object_mut() {
             let mut manifest = json!({
                 "policy": POLICY_NAME,
-                "limitBytes": DEFAULT_INLINE_RESPONSE_BYTES,
+                "limitBytes": self.inline_limit,
                 "originalBytes": self.original.len(),
                 "previewBytes": preview_bytes,
                 "omittedBytes": self.original.len().saturating_sub(preview_bytes),
@@ -228,6 +238,23 @@ impl BudgetCandidate {
     }
 }
 
+/// Room for a read reply's per-file metadata and widget meta on top of the
+/// text the read packer admits; past it the reply externalizes as a backstop
+/// (agent guidance is never cut, and a single unbreakable line stays whole).
+const READ_RESPONSE_OVERHEAD_BYTES: usize = 32 * 1024;
+
+/// Inline ceiling for one tool's reply. `read` packs its own text budget, so
+/// the shared ceiling would only cut files it already chose to return whole.
+pub(crate) fn inline_response_limit(tool_name: &str) -> usize {
+    match tool_name {
+        "read" => crate::workspace_tools::read_inline_budget()
+            .saturating_add(READ_RESPONSE_OVERHEAD_BYTES)
+            .max(DEFAULT_INLINE_RESPONSE_BYTES),
+        _ => DEFAULT_INLINE_RESPONSE_BYTES,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn apply_response_budget(
     result: &mut Value,
     is_error: bool,
@@ -236,7 +263,28 @@ pub(crate) fn apply_response_budget(
     workspace_root: &Path,
     entry_cap_reduction: Option<EntryCapReduction>,
 ) -> Result<Option<BudgetOutcome>, StoreError> {
-    let Some(mut candidate) = prepare_response_budget(result, is_error) else {
+    apply_response_budget_with_limit(
+        result,
+        is_error,
+        store,
+        owner_session,
+        workspace_root,
+        entry_cap_reduction,
+        DEFAULT_INLINE_RESPONSE_BYTES,
+    )
+}
+
+pub(crate) fn apply_response_budget_with_limit(
+    result: &mut Value,
+    is_error: bool,
+    store: &LargeResultStore,
+    owner_session: Option<&str>,
+    workspace_root: &Path,
+    entry_cap_reduction: Option<EntryCapReduction>,
+    inline_limit: usize,
+) -> Result<Option<BudgetOutcome>, StoreError> {
+    let Some(mut candidate) = prepare_response_budget_with_limit(result, is_error, inline_limit)
+    else {
         return Ok(None);
     };
     candidate.entry_cap = entry_cap_reduction;
@@ -257,9 +305,18 @@ pub(crate) fn apply_response_budget(
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_response_budget(result: &Value, is_error: bool) -> Option<BudgetCandidate> {
+    prepare_response_budget_with_limit(result, is_error, DEFAULT_INLINE_RESPONSE_BYTES)
+}
+
+fn prepare_response_budget_with_limit(
+    result: &Value,
+    is_error: bool,
+    inline_limit: usize,
+) -> Option<BudgetCandidate> {
     let original = serde_json::to_vec(result).ok()?;
-    if original.len() <= DEFAULT_INLINE_RESPONSE_BYTES || has_native_non_text_content(result) {
+    if original.len() <= inline_limit || has_native_non_text_content(result) {
         return None;
     }
 
@@ -280,6 +337,7 @@ pub(crate) fn prepare_response_budget(result: &Value, is_error: bool) -> Option<
         omissions,
         is_error,
         entry_cap: None,
+        inline_limit,
     })
 }
 
@@ -1182,6 +1240,31 @@ mod tests {
         );
 
         std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn tool_advice_is_kept_behind_the_preview_warning() {
+        let result = json!({
+            "structuredContent": {
+                "toolName": "read",
+                "text": oversized_text("BODY-HEAD", "-BODY-TAIL"),
+                "retrievalAdvice": "a.rs returned lines 1-9; continue with start_line 10."
+            }
+        });
+        let candidate = prepare_response_budget(&result, false).expect("must budget");
+        let preview = candidate.finish("lr_advice");
+
+        let advice = preview
+            .pointer("/structuredContent/retrievalAdvice")
+            .and_then(Value::as_str)
+            .expect("advice");
+        assert!(advice.starts_with(PREVIEW_RETRIEVAL_ADVICE), "{advice}");
+        assert!(advice.ends_with("continue with start_line 10."), "{advice}");
+        assert_eq!(
+            advice.matches(PREVIEW_RETRIEVAL_ADVICE).count(),
+            1,
+            "re-attaching per compaction level must not repeat the warning"
+        );
     }
 
     /// Passthrough results (DevTools tools) carry no structuredContent, so

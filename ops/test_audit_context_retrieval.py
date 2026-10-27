@@ -33,7 +33,7 @@ class AuditContextRetrievalTests(unittest.TestCase):
             {"event": "tool_result_bytes", "rpc_tool": "read", "class": "small", "raw_bytes": 500, "inline_bytes": 500},
             {"event": "read_usage", "full_requests": 3, "ranged_requests": 2,
              "full_files": 2, "ranged_files": 1, "failed_files": 1,
-             "returned_bytes": 9000},
+             "budget_cut_files": 1, "returned_bytes": 9000},
             {"event": "read_usage", "full_requests": 1, "ranged_requests": 0,
              "full_files": 1, "ranged_files": 0, "failed_files": 0,
              "returned_bytes": 120},
@@ -46,6 +46,8 @@ class AuditContextRetrievalTests(unittest.TestCase):
         self.assertEqual(result["full_files"], 3)
         self.assertEqual(result["ranged_files"], 1)
         self.assertEqual(result["failed_files"], 1)
+        # Older records lack the counter; they contribute zero, not an error.
+        self.assertEqual(result["budget_cut_files"], 1)
         self.assertEqual(result["returned_bytes"], 9120)
 
 
