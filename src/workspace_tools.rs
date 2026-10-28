@@ -27,8 +27,9 @@ pub const MAX_READ_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// that fit come back whole (smallest first); the next ones are cut at a line
 /// boundary with startLine/endLine set so a ranged read continues exactly
 /// where the reply stopped. Hosts truncate oversized tool results on their
-/// own, silently, so the reply stays well under what they accept.
-pub const DEFAULT_READ_INLINE_BYTES: usize = 128 * 1024;
+/// own, silently, so the reply stays under what they accept: ChatGPT passed a
+/// 512 KiB read intact on 2026-10-28 (docs/findings/2026-10-27-read-inline-packing.md).
+pub const DEFAULT_READ_INLINE_BYTES: usize = 384 * 1024;
 const MIN_READ_INLINE_BYTES: usize = 4 * 1024;
 /// Overrides the inline budget, e.g. to measure where a host starts cutting.
 pub const READ_INLINE_BYTES_ENV: &str = "CATDESK_READ_INLINE_BYTES";

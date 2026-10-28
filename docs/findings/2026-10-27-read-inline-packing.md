@@ -27,7 +27,8 @@ numbers. Production logs (2026-10-12..27): 32 of 1072 reads externalized,
 
 ## Change
 
-- `read` packs its own inline budget: `DEFAULT_READ_INLINE_BYTES` = 128 KiB of
+- `read` packs its own inline budget: `DEFAULT_READ_INLINE_BYTES` = 128 KiB
+  (384 KiB since 2026-10-28, see the measurement below) of
   JSON-escaped text (`src/workspace_tools.rs`, `pack_inline`). Files that fit
   come back whole, smallest first; the next ones are cut at a line boundary in
   request order with `startLine`/`endLine`, `truncated` and `budgetTruncated`
@@ -76,3 +77,20 @@ script's expected line with `budgetTruncated=false` is the host's own cut. If
 ChatGPT passes 256 KiB intact, raising `DEFAULT_READ_INLINE_BYTES` is a
 one-constant change (consider the transcript cost first, or key it on
 `clientInfo`, which the server already sees per request).
+
+### Measurement (2026-10-28, ChatGPT web connector)
+
+Run with `CATDESK_READ_INLINE_BYTES=1048576`, one fresh conversation per probe:
+
+| probe | bytes | last line seen | END token | `budgetTruncated` |
+|---|---|---|---|---|
+| 256k | 262 119 | L004096 (expected) | yes | false |
+| 384k | 393 191 | L006144 (expected) | yes | false |
+| 512k | 524 263 | L008192 (expected) | yes | false |
+
+For 512k the model also listed L004000–L004100 with no gaps, so the host
+neither cut the tail nor elided the middle. ChatGPT therefore passes at least
+512 KiB of `read` text. `DEFAULT_READ_INLINE_BYTES` is now 384 KiB: a margin
+under the measured ceiling, and a cap on the transcript cost of one read
+(~96k tokens) — larger files continue through ranged reads. Codex was not
+re-measured; its code_mode cut regular results to a few KB already at 128 KiB.

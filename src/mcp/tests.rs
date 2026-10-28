@@ -4568,8 +4568,11 @@ async fn read_tool_range_returns_full_text_when_lossy_decoding_expands() {
 #[tokio::test]
 async fn read_tool_budget_cut_range_reports_returned_lines_and_continuation() {
     let workspace_root = read_workspace("line-range-report-end");
-    // Eight 100-KiB lines: the default inline budget fits one per reply.
-    let big_line = format!("{}\n", "z".repeat(100 * 1024));
+    // Eight lines of three quarters of the budget: one fits per reply.
+    let big_line = format!(
+        "{}\n",
+        "z".repeat(workspace_tools::read_inline_budget() * 3 / 4)
+    );
     std::fs::write(workspace_root.join("lines.txt"), big_line.repeat(8)).expect("write file");
 
     let structured = read_batch(
@@ -4607,8 +4610,13 @@ async fn read_tool_budget_cut_range_reports_returned_lines_and_continuation() {
 #[tokio::test]
 async fn read_tool_externalized_batch_is_complete_and_says_it_is_a_preview() {
     let workspace_root = read_workspace("mixed-externalized");
-    std::fs::write(workspace_root.join("big.log"), filler(300 * 1024)).expect("write log");
-    std::fs::write(workspace_root.join("app.min.js"), "x".repeat(200 * 1024)).expect("write js");
+    let budget = workspace_tools::read_inline_budget();
+    std::fs::write(workspace_root.join("big.log"), filler(budget * 3 / 2)).expect("write log");
+    std::fs::write(
+        workspace_root.join("app.min.js"),
+        "x".repeat(budget + 64 * 1024),
+    )
+    .expect("write js");
 
     let structured = read_batch(&workspace_root, json!(["big.log", "app.min.js"])).await;
 
@@ -4643,7 +4651,12 @@ async fn read_tool_full_batch_of_long_paths_stays_inline() {
         .map(|index| format!("{dir}/{index:02}-{}.rs", "f".repeat(150)))
         .collect();
     for path in &paths {
-        std::fs::write(workspace_root.join(path), filler(8 * 1024)).expect("write file");
+        // Twice the budget across the batch, so the batch is cut.
+        std::fs::write(
+            workspace_root.join(path),
+            filler(workspace_tools::read_inline_budget() / 16),
+        )
+        .expect("write file");
     }
 
     let structured = read_batch(&workspace_root, json!(paths)).await;
@@ -4698,6 +4711,13 @@ async fn read_tool_rejects_oversized_whole_file_without_scanning() {
     assert_eq!(structured["files"][1]["truncated"], json!(false));
 
     let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+/// Repeats of the 9-byte "ż中🙂" that make one line wider than the read budget
+/// plus its gate reserve: read never cuts inside a line, so the reply must
+/// take the externalization path.
+fn unbreakable_read_line_repeats() -> usize {
+    workspace_tools::read_inline_budget() / 4
 }
 
 // Line breaks keep the tokenizer off one huge pre-token; BPE is quadratic there.
@@ -5191,9 +5211,9 @@ async fn read_tool_rejects_a_directory_the_same_way_wherever_it_lands() {
 async fn read_tool_does_not_let_an_unreadable_file_shrink_the_others() {
     let workspace_root = read_workspace("unreadable");
     // Together they would overflow the inline budget; alone app.js fits.
-    let big = 100 * 1024;
+    let big = workspace_tools::read_inline_budget() * 2 / 3;
     std::fs::write(workspace_root.join("app.js"), filler(big)).expect("write file");
-    std::fs::write(workspace_root.join("locked.txt"), filler(100 * 1024)).expect("write file");
+    std::fs::write(workspace_root.join("locked.txt"), filler(big)).expect("write file");
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
         workspace_root.join("locked.txt"),
@@ -5266,7 +5286,11 @@ async fn read_tool_counts_lines_over_complete_files() {
 async fn read_tool_charges_one_file_once_however_many_times_it_is_named() {
     let workspace_root = read_workspace("dup");
     // Charged twice, this file would overflow the inline budget and be cut.
-    std::fs::write(workspace_root.join("a.txt"), filler(100 * 1024)).expect("write file");
+    std::fs::write(
+        workspace_root.join("a.txt"),
+        filler(workspace_tools::read_inline_budget() * 2 / 3),
+    )
+    .expect("write file");
 
     let structured = read_batch(&workspace_root, json!(["a.txt", "a.txt"])).await;
     let files = structured["files"].as_array().expect("missing files");
@@ -7396,7 +7420,10 @@ async fn shared_tools_call_boundary_externalizes_oversized_result_losslessly() {
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
     // One line no ranged read can fit: read leaves it whole, so the reply
     // overflows the read ceiling and takes the externalization path.
-    let full_text = format!("HEAD{}TAIL", "ż中🙂".repeat(30_000));
+    let full_text = format!(
+        "HEAD{}TAIL",
+        "ż中🙂".repeat(unbreakable_read_line_repeats())
+    );
     std::fs::write(workspace_root.join("big.txt"), &full_text).expect("write file");
     let workspace_root_str = workspace_root.to_string_lossy().into_owned();
     let store = LargeResultStore::new_default().expect("create result store");
@@ -7537,7 +7564,10 @@ async fn externalized_results_surface_retrieval_inside_structured_content() {
     std::fs::create_dir_all(&workspace_root).expect("create workspace");
     // One line no ranged read can fit: read leaves it whole, so the reply
     // overflows the read ceiling and takes the externalization path.
-    let full_text = format!("HEAD{}TAIL", "ż中🙂".repeat(30_000));
+    let full_text = format!(
+        "HEAD{}TAIL",
+        "ż中🙂".repeat(unbreakable_read_line_repeats())
+    );
     std::fs::write(workspace_root.join("big.txt"), &full_text).expect("write file");
     let workspace_root_str = workspace_root.to_string_lossy().into_owned();
     let store = LargeResultStore::new_default().expect("create result store");
@@ -8369,7 +8399,10 @@ async fn byte_accounting_reports_externalized_results_from_the_budget_policy() {
     // A single unbreakable line: read keeps it whole and the reply externalizes.
     std::fs::write(
         workspace_root.join("big.txt"),
-        format!("HEAD{}TAIL", "ż中🙂".repeat(30_000)),
+        format!(
+            "HEAD{}TAIL",
+            "ż中🙂".repeat(unbreakable_read_line_repeats())
+        ),
     )
     .expect("write file");
     let workspace_root_str = workspace_root.to_string_lossy().into_owned();
