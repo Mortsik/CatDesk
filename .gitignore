@@ -16,3 +16,7 @@ log_old.txt
 # Local-only session artifacts
 .claude/settings.local.json
 scratch/
+
+# Gas City
+.beads/*
+!.beads/identity.toml
