@@ -1039,7 +1039,7 @@ fn shell_segments(command: &str) -> Vec<String> {
 /// paths, or unknown program names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandShape {
-    /// Category of the first segment that is not a bare `cd`.
+    /// Category of the first segment that is not a bare `cd` or `pwd`.
     pub category: &'static str,
     /// Known program name of that segment, or `other`.
     pub program: &'static str,
@@ -1067,10 +1067,12 @@ pub fn command_shape(command: &str) -> CommandShape {
     }
 }
 
-/// Labels of the first segment that runs something other than a bare `cd`;
-/// `bash -c "…"` style wrappers are unwrapped once so their payload counts.
+/// Labels of the first segment that runs something other than a bare `cd` or
+/// `pwd` (orientation preambles like `pwd && git status` would otherwise hide
+/// the real command); `bash -c "…"` style wrappers are unwrapped once so their
+/// payload counts.
 fn lead_command_labels(segments: &[String], depth: usize) -> (&'static str, &'static str) {
-    let mut saw_cd = false;
+    let mut preamble = None;
     for segment in segments {
         let body = segment.trim_end().trim_end_matches(['&', ';', '|']);
         let words = shell_words(body);
@@ -1079,7 +1081,11 @@ fn lead_command_labels(segments: &[String], depth: usize) -> (&'static str, &'st
         };
         let program = command_basename(&words[idx].text);
         if program == "cd" {
-            saw_cd = true;
+            preamble.get_or_insert(("navigation", "cd"));
+            continue;
+        }
+        if program == "pwd" {
+            preamble.get_or_insert(("listing", "pwd"));
             continue;
         }
         if depth == 0
@@ -1090,11 +1096,7 @@ fn lead_command_labels(segments: &[String], depth: usize) -> (&'static str, &'st
         }
         return classify_program(&program, &words[idx + 1..]);
     }
-    if saw_cd {
-        ("navigation", "cd")
-    } else {
-        ("other", "other")
-    }
+    preamble.unwrap_or(("other", "other"))
 }
 
 /// Known programs per diagnostic category; anything else is `other`.
@@ -1583,6 +1585,10 @@ mod tests {
             ("bash -lc \"cd x && sed -n '1,9p' f\"", "file_view", "sed"),
             ("/usr/bin/rg -n needle", "search", "rg"),
             ("FOO=1 cargo test", "build_test", "cargo"),
+            ("pwd && git status --short", "git_read", "git"),
+            ("pwd; cd x && rg -n needle", "search", "rg"),
+            ("pwd", "listing", "pwd"),
+            ("cd x && pwd", "navigation", "cd"),
             ("", "other", "other"),
             ("FOO=1", "other", "other"),
             ("env", "other", "other"),

@@ -42,8 +42,9 @@ Records contain Unix milliseconds (`timestamp_ms`), process ID (`pid`), and:
   `category` (`file_view`, `file_write`, `search`, `listing`, `git_read`,
   `git_write`, `build_test`, `interpreter`, `file_ops`, `shell`, `network`,
   `system`, `navigation`, `other`) and `program` (a known program name or
-  `other`) of the first segment that is not a bare `cd`; one `bash -c "…"`
-  style wrapper is unwrapped. A viewer (`cat`, `sed`, …) that redirects stdout
+  `other`) of the first segment that is not a bare `cd` or `pwd` (builds
+  before this rule counted a leading `pwd` as `listing`/`pwd`); one
+  `bash -c "…"` style wrapper is unwrapped. A viewer (`cat`, `sed`, …) that redirects stdout
   into a file or edits in place counts as `file_write`, and git splits into
   read-only inspection versus everything else. `segments` is approximate (a
   `&` in `2>&1` and heredoc body lines split too), `has_pipe` marks a `|`
