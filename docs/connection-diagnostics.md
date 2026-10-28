@@ -37,6 +37,23 @@ Records contain Unix milliseconds (`timestamp_ms`), process ID (`pid`), and:
   data in the result store. Older logs cannot distinguish full/ranged reads.
   Run `python3 ops/audit_context_retrieval.py` from the repo to summarize
   these counters over the retained log window (or pass a specific JSONL log).
+- `command_usage`: one record per `run_command`/`start_command` call that
+  carried a command string (logged since 2026-10-28), with `tool`, a fixed
+  `category` (`file_view`, `file_write`, `search`, `listing`, `git_read`,
+  `git_write`, `build_test`, `interpreter`, `file_ops`, `shell`, `network`,
+  `system`, `navigation`, `other`) and `program` (a known program name or
+  `other`) of the first segment that is not a bare `cd`; one `bash -c "…"`
+  style wrapper is unwrapped. A viewer (`cat`, `sed`, …) that redirects stdout
+  into a file or edits in place counts as `file_write`, and git splits into
+  read-only inspection versus everything else. `segments` is approximate (a
+  `&` in `2>&1` and heredoc body lines split too), `has_pipe` marks a `|`
+  separator and `has_heredoc` is a plain `<<` substring test. Labels come from
+  fixed tables in `src/command.rs`; command text, arguments, paths and unknown
+  program names are never saved. Calls later rejected (co-author marker,
+  timeout, cwd outside the workspace) are counted too. The audit script above
+  aggregates them per tool; `file_view` and `search` shell calls approximate
+  context reads that bypassed `read`/`search` (wrappers such as `timeout` or
+  `xargs` land in `other`).
 - `http_finished`: HTTP `status`, numeric `rpc_error_code` when provided by the
   MCP handler, `tool_error` and `content_items` for tool responses, and `elapsed_ms`.
   Scheduled MCP calls additionally record `scheduler_class`,

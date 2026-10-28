@@ -50,6 +50,18 @@ class AuditContextRetrievalTests(unittest.TestCase):
         self.assertEqual(result["budget_cut_files"], 1)
         self.assertEqual(result["returned_bytes"], 9120)
 
+    def test_command_usage_counts_categories_and_programs_per_tool(self):
+        rows = [
+            {"event": "command_usage", "tool": "run_command", "category": "file_view", "program": "sed"},
+            {"event": "command_usage", "tool": "run_command", "category": "file_view", "program": "cat"},
+            {"event": "command_usage", "tool": "start_command", "category": "build_test", "program": "cargo"},
+        ]
+        result = summarize(rows)
+        self.assertEqual(result["command_usage_calls"], 3)
+        self.assertEqual(result["command_categories"],
+                         {"run_command:file_view": 2, "start_command:build_test": 1})
+        self.assertEqual(result["command_programs"]["run_command:sed"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

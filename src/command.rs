@@ -1034,6 +1034,212 @@ fn shell_segments(command: &str) -> Vec<String> {
     segments
 }
 
+/// Privacy-safe shape of a shell command for usage diagnostics: only fixed
+/// labels from the tables below ever leave this function, never arguments,
+/// paths, or unknown program names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandShape {
+    /// Category of the first segment that is not a bare `cd`.
+    pub category: &'static str,
+    /// Known program name of that segment, or `other`.
+    pub program: &'static str,
+    /// Shell segments split on `;`, newlines, `&&`, `||`, `&` and `|`.
+    pub segments: usize,
+    pub has_pipe: bool,
+    pub has_heredoc: bool,
+}
+
+pub fn command_shape(command: &str) -> CommandShape {
+    let segments = shell_segments(command);
+    let (category, program) = lead_command_labels(&segments, 0);
+    let non_empty = segments
+        .iter()
+        .filter(|segment| !segment.trim().is_empty())
+        .count();
+    CommandShape {
+        category,
+        program,
+        segments: non_empty,
+        has_pipe: segments
+            .iter()
+            .any(|segment| segment.ends_with('|') && !segment.ends_with("||")),
+        has_heredoc: command.contains("<<"),
+    }
+}
+
+/// Labels of the first segment that runs something other than a bare `cd`;
+/// `bash -c "…"` style wrappers are unwrapped once so their payload counts.
+fn lead_command_labels(segments: &[String], depth: usize) -> (&'static str, &'static str) {
+    let mut saw_cd = false;
+    for segment in segments {
+        let body = segment.trim_end().trim_end_matches(['&', ';', '|']);
+        let words = shell_words(body);
+        let Some(idx) = command_start_index(&words, |_| true) else {
+            continue;
+        };
+        let program = command_basename(&words[idx].text);
+        if program == "cd" {
+            saw_cd = true;
+            continue;
+        }
+        if depth == 0
+            && is_shell_command(&program)
+            && let Some(nested) = nested_shell_command(body)
+        {
+            return lead_command_labels(&shell_segments(&nested.command), depth + 1);
+        }
+        return classify_program(&program, &words[idx + 1..]);
+    }
+    if saw_cd {
+        ("navigation", "cd")
+    } else {
+        ("other", "other")
+    }
+}
+
+/// Known programs per diagnostic category; anything else is `other`.
+#[rustfmt::skip]
+const PROGRAM_CATEGORIES: &[(&str, &[&str])] = &[
+    ("file_view", &[
+        "cat", "head", "tail", "sed", "nl", "bat", "less", "more", "awk", "wc", "jq", "xxd", "od",
+        "hexdump", "strings", "diff", "cmp",
+    ]),
+    ("search", &["rg", "grep", "egrep", "fgrep", "ag", "ack", "find", "fd", "fdfind", "locate"]),
+    ("listing", &[
+        "ls", "tree", "du", "stat", "file", "pwd", "realpath", "readlink", "eza", "exa",
+        "basename", "dirname",
+    ]),
+    ("git", &["git"]),
+    ("build_test", &[
+        "cargo", "npm", "npx", "pnpm", "yarn", "bun", "go", "make", "cmake", "ninja", "mvn",
+        "gradle", "rustc", "gcc", "g++", "clang", "tsc", "pytest", "jest", "vitest", "dotnet",
+        "uv", "pip", "pip3", "tox", "ruff", "eslint", "prettier", "mypy", "deno", "swift",
+        "xcodebuild",
+    ]),
+    ("interpreter", &[
+        "python", "python3", "node", "perl", "ruby", "bash", "sh", "zsh", "dash", "pwsh",
+        "powershell",
+    ]),
+    ("file_ops", &[
+        "mkdir", "cp", "mv", "rm", "rmdir", "touch", "chmod", "ln", "tee", "patch", "apply_patch",
+        "tar", "unzip", "zip",
+    ]),
+    ("shell", &[
+        "echo", "printf", "true", "false", "test", "[", "which", "command", "type", "export",
+        "date", "env", "sleep", "uname", "whoami", "id", "hostname",
+    ]),
+    ("network", &["curl", "wget", "gh"]),
+    ("system", &[
+        "ps", "kill", "pkill", "pgrep", "lsof", "top", "free", "df", "nproc", "systemctl",
+        "docker", "journalctl",
+    ]),
+];
+
+/// `(category, program)` as `'static` table labels. Viewers that redirect
+/// into a file or edit in place count as `file_write`; git splits on whether
+/// the subcommand only inspects the repository.
+fn classify_program(program: &str, args: &[ShellWord]) -> (&'static str, &'static str) {
+    let Some((category, known)) = PROGRAM_CATEGORIES.iter().find_map(|(category, programs)| {
+        programs
+            .iter()
+            .find(|known| **known == program)
+            .map(|known| (*category, *known))
+    }) else {
+        return ("other", "other");
+    };
+    match category {
+        "file_view" if writes_a_file(known, args) => ("file_write", known),
+        "git" => (git_category(args), known),
+        _ => (category, known),
+    }
+}
+
+fn writes_a_file(program: &str, args: &[ShellWord]) -> bool {
+    let in_place = matches!(program, "sed" | "awk")
+        && args.iter().any(|word| {
+            word.text == "--in-place"
+                || word.text.starts_with("--in-place=")
+                || (word.text.starts_with("-i") && !word.text.starts_with("--"))
+                || word.text == "inplace"
+        });
+    in_place || redirects_stdout_to_file(args)
+}
+
+/// An unquoted `>`/`>>` (optionally fd 1) whose target is a file, not
+/// `/dev/null` or another descriptor.
+fn redirects_stdout_to_file(args: &[ShellWord]) -> bool {
+    args.iter().enumerate().any(|(idx, word)| {
+        let text = word.text.strip_prefix('1').unwrap_or(&word.text);
+        let Some(rest) = text.strip_prefix('>') else {
+            return false;
+        };
+        let rest = rest.strip_prefix('>').unwrap_or(rest);
+        let target = if rest.is_empty() {
+            args.get(idx + 1)
+                .map(|next| next.text.as_str())
+                .unwrap_or("")
+        } else {
+            rest
+        };
+        !target.is_empty() && !target.starts_with('&') && target != "/dev/null"
+    })
+}
+
+fn git_category(args: &[ShellWord]) -> &'static str {
+    // Skip global options so `git -C dir status` and `git --no-pager log`
+    // classify by their subcommand.
+    let mut idx = 0;
+    while let Some(word) = args.get(idx) {
+        match word.text.as_str() {
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" => idx += 2,
+            text if text.starts_with('-') => idx += 1,
+            _ => break,
+        }
+    }
+    let Some(subcommand) = args.get(idx) else {
+        return "git_read";
+    };
+    let rest = &args[idx + 1..];
+    let positionals = || rest.iter().filter(|word| !word.text.starts_with('-'));
+    let has_flag = |flags: &[&str]| rest.iter().any(|word| flags.contains(&word.text.as_str()));
+    let read = match subcommand.lower.as_str() {
+        "status" | "diff" | "log" | "show" | "blame" | "rev-parse" | "ls-files" | "grep"
+        | "describe" | "shortlog" | "reflog" | "cat-file" | "merge-base" | "for-each-ref"
+        | "ls-tree" | "rev-list" | "name-rev" | "ls-remote" | "show-ref" => true,
+        "branch" | "tag" => {
+            (positionals().next().is_none() || has_flag(&["-l", "--list"]))
+                && !has_flag(&["-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move"])
+        }
+        "config" => {
+            !rest.iter().any(|word| {
+                word.text.starts_with("--unset")
+                    || word.text.starts_with("--remove")
+                    || word.text.starts_with("--rename")
+                    || matches!(
+                        word.text.as_str(),
+                        "--add" | "--replace-all" | "-e" | "--edit"
+                    )
+            }) && (rest.iter().any(|word| {
+                word.text == "-l" || word.text == "--list" || word.text.starts_with("--get")
+            }) || positionals().count() == 1)
+        }
+        "remote" => matches!(
+            positionals().next().map(|word| word.lower.as_str()),
+            None | Some("show" | "get-url")
+        ),
+        "worktree" => matches!(
+            positionals().next().map(|word| word.lower.as_str()),
+            Some("list")
+        ),
+        "stash" => matches!(
+            positionals().next().map(|word| word.lower.as_str()),
+            Some("list" | "show")
+        ),
+        _ => false,
+    };
+    if read { "git_read" } else { "git_write" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1322,5 +1528,71 @@ mod tests {
     fn detect_move_path_intercept_rejects_multi_source_or_unsupported_flags() {
         assert_eq!(detect_move_path_intercept("mv a b c"), None);
         assert_eq!(detect_move_path_intercept("mv -r a b"), None);
+    }
+
+    #[test]
+    fn command_shape_reports_only_fixed_labels() {
+        let shape = command_shape("cd src && sed -n '1,200p' secret/path.rs | nl");
+        assert_eq!(shape.category, "file_view");
+        assert_eq!(shape.program, "sed");
+        assert_eq!(shape.segments, 3);
+        assert!(shape.has_pipe);
+        assert!(!shape.has_heredoc);
+
+        let shape = command_shape("FOO=1 git status --short");
+        assert_eq!((shape.category, shape.program), ("git_read", "git"));
+        let shape = command_shape("git commit -m 'x'");
+        assert_eq!(shape.category, "git_write");
+        let shape = command_shape("python3 - <<'EOF'\nprint(1)\nEOF");
+        assert_eq!((shape.category, shape.program), ("interpreter", "python3"));
+        assert!(shape.has_heredoc);
+        let shape = command_shape("/opt/private-tool --token abc");
+        assert_eq!((shape.category, shape.program), ("other", "other"));
+        let shape = command_shape("cd somewhere");
+        assert_eq!((shape.category, shape.program), ("navigation", "cd"));
+        let shape = command_shape("rg -n foo || true");
+        assert_eq!(shape.category, "search");
+        assert!(!shape.has_pipe);
+    }
+
+    #[test]
+    fn command_shape_classifies_common_agent_commands() {
+        for (command, category, program) in [
+            ("git status; git diff", "git_read", "git"),
+            ("git status&&git log", "git_read", "git"),
+            ("git -C some/repo status --short", "git_read", "git"),
+            ("git --no-pager log -5", "git_read", "git"),
+            ("git branch -a", "git_read", "git"),
+            ("git branch -D old", "git_write", "git"),
+            ("git tag v1", "git_write", "git"),
+            ("git config user.name", "git_read", "git"),
+            ("git config user.name me", "git_write", "git"),
+            ("git worktree list", "git_read", "git"),
+            ("git branch --list 'feat/*'", "git_read", "git"),
+            ("git tag -l 'v*'", "git_read", "git"),
+            ("git ls-remote origin", "git_read", "git"),
+            ("git config --unset user.name", "git_write", "git"),
+            ("git worktree add ../x", "git_write", "git"),
+            ("git commit -m 'x'", "git_write", "git"),
+            ("cat > out.txt <<'EOF'\nbody\nEOF", "file_write", "cat"),
+            ("cat src/a.rs >> log.txt", "file_write", "cat"),
+            ("sed -i 's/a/b/' f", "file_write", "sed"),
+            ("sed -n '1,80p' f 2>/dev/null", "file_view", "sed"),
+            ("cat f 2>&1 | head", "file_view", "cat"),
+            ("cat f >/dev/null", "file_view", "cat"),
+            ("bash -lc \"cd x && sed -n '1,9p' f\"", "file_view", "sed"),
+            ("/usr/bin/rg -n needle", "search", "rg"),
+            ("FOO=1 cargo test", "build_test", "cargo"),
+            ("", "other", "other"),
+            ("FOO=1", "other", "other"),
+            ("env", "other", "other"),
+        ] {
+            let shape = command_shape(command);
+            assert_eq!(
+                (shape.category, shape.program),
+                (category, program),
+                "{command:?}"
+            );
+        }
     }
 }

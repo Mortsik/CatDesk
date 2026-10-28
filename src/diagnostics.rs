@@ -156,6 +156,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_usage_records_only_fixed_labels() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let log = Diagnostics {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+            write_failures: Arc::new(AtomicU64::new(0)),
+            write_dropped: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicU64::new(0)),
+            active_requests: Arc::new(StdMutex::new(HashMap::new())),
+            stopping_since: Arc::new(StdMutex::new(None)),
+        };
+        let trace = RequestLog {
+            log,
+            id: "command-test".to_string(),
+            started: Instant::now(),
+            complete: AtomicBool::new(false),
+            tool: AtomicU8::new(0),
+            rpc_recorded: AtomicBool::new(false),
+        };
+        let command = "cd private-dir && /opt/secret-tool --token hunter2 | tee secret.log";
+        let nested = "bash -lc 'cd private-dir && cat secret.log > hunter2.txt'";
+        REQUEST
+            .scope(trace, async {
+                command_usage("run_command", crate::command::command_shape(command));
+                command_usage("start_command", crate::command::command_shape(nested));
+            })
+            .await;
+        let record = receiver.recv().unwrap().unwrap();
+        assert_eq!(record["event"], "command_usage");
+        assert_eq!(record["tool"], "run_command");
+        assert_eq!(record["category"], "other");
+        assert_eq!(record["program"], "other");
+        assert_eq!(record["segments"], 3);
+        assert_eq!(record["has_pipe"], true);
+        let nested_record = receiver.recv().unwrap().unwrap();
+        assert_eq!(nested_record["category"], "file_write");
+        assert_eq!(nested_record["program"], "cat");
+        for text in [record.to_string(), nested_record.to_string()] {
+            for secret in ["private-dir", "secret-tool", "hunter2", "secret.log"] {
+                assert!(!text.contains(secret), "{secret} leaked into {text}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn read_usage_records_only_numeric_mode_counters() {
         let (sender, receiver) = mpsc::sync_channel(8);
         let log = Diagnostics {
@@ -2087,6 +2132,24 @@ pub(crate) fn read_usage(metrics: ReadUsageMetrics) {
             "failed_files": metrics.failed_files,
             "budget_cut_files": metrics.budget_cut_files,
             "returned_bytes": metrics.returned_bytes,
+        }));
+    });
+}
+
+/// One shell command's shape: `tool` is a caller literal and every
+/// `CommandShape` field comes from a fixed table, so command text, arguments
+/// and paths never reach the log.
+pub(crate) fn command_usage(tool: &'static str, shape: crate::command::CommandShape) {
+    let _ = REQUEST.try_with(|request| {
+        request.log.record(json!({
+            "event": "command_usage",
+            "request_id": request.id,
+            "tool": tool,
+            "category": shape.category,
+            "program": shape.program,
+            "segments": shape.segments,
+            "has_pipe": shape.has_pipe,
+            "has_heredoc": shape.has_heredoc,
         }));
     });
 }

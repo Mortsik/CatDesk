@@ -29,8 +29,18 @@ def summarize(records):
         "failed_files": 0,
         "budget_cut_files": 0,
         "returned_bytes": 0,
+        "command_usage_calls": 0,
+        "command_categories": {},
+        "command_programs": {},
     }
     for row in records:
+        if row.get("event") == "command_usage":
+            report["command_usage_calls"] += 1
+            for field, key in (("command_categories", "category"),
+                               ("command_programs", "program")):
+                label = f"{row.get('tool', 'other')}:{row.get(key, 'other')}"
+                report[field][label] = report[field].get(label, 0) + 1
+            continue
         if row.get("event") == "read_usage":
             report["read_usage_calls"] += 1
             for field in ("full_requests", "ranged_requests", "full_files",
@@ -77,10 +87,16 @@ def main():
         str(Path.home() / ".catdesk/logs/connections*.jsonl")
     ], help="Diagnostics JSONL paths or glob patterns")
     args = parser.parse_args()
-    print(json.dumps(summarize(read_logs(args.logs)), indent=2))
+    report = summarize(read_logs(args.logs))
+    for field in ("command_categories", "command_programs"):
+        report[field] = dict(sorted(report[field].items(), key=lambda item: -item[1]))
+    print(json.dumps(report, indent=2))
     print("Full/ranged input counters include duplicate requested paths; output "
           "counters exclude deduplicated entries. Logs before the read_usage "
           "event was introduced cannot classify historical read calls.")
+    print("Command categories come from the command_usage event (2026-10-28+); "
+          "file_view/search shell calls approximate context reads that bypassed "
+          "read/search; redirects and in-place edits count as file_write.")
     print("Retrieval calls count chunks, not recovered files/results. "
           "Correlating individual outputRef values requires additional tracking.")
 

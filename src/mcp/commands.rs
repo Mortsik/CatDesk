@@ -202,6 +202,7 @@ pub(crate) async fn handle_start_command(
         Ok(value) => value,
         Err(error) => return tool_error_response(req, error),
     };
+    crate::diagnostics::command_usage("start_command", command::command_shape(command_text));
     if command::contains_catdesk_co_author_marker(command_text) {
         let message = if set_catdesk_as_co_author {
             "Rewrite the commit message normally and remove \"Co-Authored-By: CatDesk\". CatDesk will add that trailer automatically."
@@ -396,6 +397,7 @@ pub(crate) async fn handle_run_command(
             return tool_error_response(req, "Missing required parameter: command".into());
         }
     };
+    crate::diagnostics::command_usage("run_command", command::command_shape(cmd));
 
     let cwd_input = arguments.get("cwd").and_then(|v| v.as_str());
     let timeout_ms = arguments.get("timeout").and_then(|v| v.as_u64());
