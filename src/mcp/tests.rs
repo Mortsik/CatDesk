@@ -3115,6 +3115,100 @@ fn catdesk_instruction_points_new_sessions_to_library_handoff_search() {
     let _ = std::fs::remove_dir_all(workspace_root);
 }
 
+#[tokio::test]
+async fn disabled_handoff_is_not_advertised_or_callable() {
+    let _handoff = HandoffEnabledOverride::set(false);
+    let workspace_root =
+        std::env::temp_dir().join(format!("catdesk-mcp-handoff-disabled-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+    let list_req = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!("req-tools-list")),
+        method: "tools/list".into(),
+        params: json!({}),
+    };
+
+    for tool_mode in [ToolMode::MultiTools, ToolMode::ReadOnly] {
+        let response = handle_tools_list(&list_req, Mode::Both, tool_mode, &None).await;
+        let names = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("missing tools")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(
+            !names.iter().any(|name| name == "create_handoff"),
+            "{} must not advertise create_handoff: {names:?}",
+            tool_mode.label()
+        );
+        assert!(names.iter().any(|name| name == "read"));
+
+        let call_req = tool_call_request("create_handoff", json!({ "goal": "continue" }));
+        let response = handle_tools_call(
+            &call_req,
+            &workspace_root_str,
+            1,
+            Mode::Both,
+            tool_mode,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = response.result.as_ref().expect("tool result");
+        assert_eq!(result.get("isError"), Some(&json!(true)));
+        assert!(
+            result.to_string().contains("Unknown tool: create_handoff"),
+            "{} must reject a disabled create_handoff: {result}",
+            tool_mode.label()
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(&workspace_root)
+            .expect("read workspace")
+            .count(),
+        0,
+        "a rejected handoff must not touch the workspace"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[test]
+fn catdesk_instruction_omits_library_guidance_when_handoff_is_disabled() {
+    let _handoff = HandoffEnabledOverride::set(false);
+    let workspace_root = std::env::temp_dir().join(format!(
+        "catdesk-mcp-instruction-handoff-disabled-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+    for tool_mode in [ToolMode::MultiTools, ToolMode::ReadOnly] {
+        let instruction = catdesk_instruction_text(&workspace_root_str, Mode::Both, tool_mode)
+            .expect("build instruction");
+        for forbidden in [
+            "create_handoff",
+            "persistent ChatGPT Library",
+            "files.search",
+        ] {
+            assert!(
+                !instruction.contains(forbidden),
+                "{} instruction must not mention {forbidden}: {instruction}",
+                tool_mode.label()
+            );
+        }
+        assert!(instruction.contains("read_image"));
+    }
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
 #[test]
 fn catdesk_instruction_describes_offline_sandbox_and_connector_error_reporting() {
     let workspace_root = std::env::temp_dir().join(format!(

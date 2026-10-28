@@ -13,6 +13,7 @@ use crate::state::{Mode, ShowDetailMode, ToolMode};
 use crate::workspace_tools;
 
 use crate::mcp::commands::fetch_devtools_tools;
+use crate::mcp::current_handoff_enabled;
 #[cfg(test)]
 use crate::mcp::current_show_detail_mode;
 use crate::mcp::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
@@ -515,6 +516,7 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
     devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
     show_detail_mode: ShowDetailMode,
 ) -> JsonRpcResponse {
+    let handoff_enabled = current_handoff_enabled();
     let mut tools: Vec<Value> = Vec::new();
 
     // Computer tools
@@ -832,7 +834,9 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
-            tools.push(create_handoff_tool_descriptor());
+            if handoff_enabled {
+                tools.push(create_handoff_tool_descriptor());
+            }
             tools.push(json!({
                 "name": "delete",
                 "title": "Delete path",
@@ -848,7 +852,7 @@ pub(crate) async fn handle_tools_list_with_show_detail_mode(
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
         }
-        if tool_mode.read_only() {
+        if tool_mode.read_only() && handoff_enabled {
             tools.push(create_handoff_tool_descriptor());
         }
     }

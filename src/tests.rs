@@ -108,6 +108,7 @@ fn settings_renders_traditional_chinese_theme_names_and_descriptions() {
                 WidgetCornerStyle::Rounded,
                 UiLanguage::TraditionalChinese,
                 false,
+                false,
                 "test-slug",
                 None,
                 &UsageTotals::default(),

@@ -86,7 +86,9 @@ pub use crate::usage_pricing::GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 /// 10: read cuts files at a line boundary to an inline budget; the cached
 /// read descriptions said budgetTruncated was always false and oversized
 /// reads errored, which a model would take as "this text is complete".
-pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 10;
+/// 11: create_handoff is opt-in (`handoff_enabled`, default off) and leaves
+/// tools/list unless the TUI setting enables it.
+pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 11;
 
 /// Token totals for one usage bucket.
 ///
@@ -382,6 +384,8 @@ pub struct AppConfig {
     pub partner_binagotchy_seed: Option<String>,
     #[serde(default)]
     pub set_catdesk_as_co_author: bool,
+    #[serde(default)]
+    pub handoff_enabled: bool,
     pub theme: String,
     pub mode: Mode,
     pub tool_mode: ToolMode,
@@ -410,6 +414,7 @@ impl Default for AppConfig {
             ui_language: UiLanguage::English,
             partner_binagotchy_seed: None,
             set_catdesk_as_co_author: false,
+            handoff_enabled: false,
             theme: theme::DEFAULT_THEME_ID.to_string(),
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
@@ -731,6 +736,7 @@ pub struct AppState {
     pub mascot_seed: u64,
     pub partner_binagotchy_seed: Option<String>,
     pub set_catdesk_as_co_author: bool,
+    pub handoff_enabled: bool,
     pub mascot: MascotPack,
     pub detected_browsers: Vec<DetectedBrowser>,
     pub selected_browser: Option<DetectedBrowser>,
@@ -1142,6 +1148,7 @@ impl AppState {
             mascot_seed,
             partner_binagotchy_seed,
             set_catdesk_as_co_author: config.set_catdesk_as_co_author,
+            handoff_enabled: config.handoff_enabled,
             mascot,
             workspace_root,
             detected_browsers: Vec::new(),
@@ -1208,6 +1215,7 @@ impl AppState {
         config.chatgpt_connector_revision = self.chatgpt_connector_revision;
         config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
         config.set_catdesk_as_co_author = self.set_catdesk_as_co_author;
+        config.handoff_enabled = self.handoff_enabled;
         config.theme = self.theme.clone();
         config.mode = self.mode;
         config.tool_mode = self.tool_mode;
@@ -1921,6 +1929,7 @@ mod tests {
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
         assert!(matches!(app.show_detail_mode, ShowDetailMode::Collapsed));
         assert!(app.set_catdesk_as_co_author);
+        assert!(!app.handoff_enabled);
         assert_eq!(
             app.partner_binagotchy_seed.as_deref(),
             Some("00000000000000ff")
@@ -2089,6 +2098,7 @@ toolCallCount = 1
         app.theme = "neon".into();
         app.mode = Mode::Computer;
         app.tool_mode = ToolMode::ReadOnly;
+        app.handoff_enabled = true;
         app.usage_by_model
             .entry(FALLBACK_USAGE_BUCKET.to_string())
             .or_default()
@@ -2100,6 +2110,7 @@ toolCallCount = 1
         assert_eq!(saved.theme, "neon");
         assert!(matches!(saved.mode, Mode::Computer));
         assert!(matches!(saved.tool_mode, ToolMode::ReadOnly));
+        assert!(saved.handoff_enabled);
         let saved_usage = saved
             .usage_by_model
             .get(FALLBACK_USAGE_BUCKET)
@@ -2116,6 +2127,7 @@ toolCallCount = 1
         )
         .expect("reload app state");
         assert_eq!(reloaded.all_time_usage_totals().total_tokens, 20);
+        assert!(reloaded.handoff_enabled);
         assert_eq!(reloaded.session_usage_totals, UsageTotals::default());
 
         let _ = std::fs::remove_file(config_path);

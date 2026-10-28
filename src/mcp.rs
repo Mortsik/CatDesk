@@ -408,8 +408,11 @@ async fn handle_tools_call_with_result_store(
                     "search_result" => {
                         handle_search_result(req, workspace_root, result_store, session_namespace)
                     }
-                    "create_handoff" => {
+                    "create_handoff" if current_handoff_enabled() => {
                         handle_create_handoff_for_project(req, workspace_root, active_project)
+                    }
+                    "create_handoff" => {
+                        tool_error_response(req, "Unknown tool: create_handoff".to_string())
                     }
                     _ => {
                         if tool_mode.write_tools_enabled() {
@@ -789,6 +792,44 @@ fn current_widget_corner_style() -> WidgetCornerStyle {
 #[cfg(test)]
 fn current_show_detail_mode() -> ShowDetailMode {
     ShowDetailMode::Expanded
+}
+
+/// Library handoff is opt-in (upstream 63283b83): `create_handoff` and the
+/// Library guidance only exist when the TUI setting enabled it.
+#[cfg(not(test))]
+pub(crate) fn current_handoff_enabled() -> bool {
+    cached_app_config()
+        .map(|config| config.handoff_enabled)
+        .unwrap_or(false)
+}
+
+// Tests default to enabled so existing tool inventories stay stable; the
+// disabled path is exercised through `HandoffEnabledOverride`.
+#[cfg(test)]
+thread_local! {
+    static HANDOFF_ENABLED_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+pub(crate) fn current_handoff_enabled() -> bool {
+    HANDOFF_ENABLED_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) struct HandoffEnabledOverride(bool);
+
+#[cfg(test)]
+impl HandoffEnabledOverride {
+    pub(crate) fn set(enabled: bool) -> Self {
+        Self(HANDOFF_ENABLED_FOR_TEST.with(|cell| cell.replace(enabled)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for HandoffEnabledOverride {
+    fn drop(&mut self) {
+        HANDOFF_ENABLED_FOR_TEST.with(|cell| cell.set(self.0));
+    }
 }
 
 fn is_local_destructive_tool(tool_name: &str) -> bool {

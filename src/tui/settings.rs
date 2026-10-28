@@ -29,7 +29,7 @@ pub(crate) async fn run_settings(
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
     let total_rows =
-        themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 4;
+        themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 5;
 
     let mut redraw = true;
     loop {
@@ -40,6 +40,7 @@ pub(crate) async fn run_settings(
             current_ui_language,
             usage_totals,
             set_catdesk_as_co_author,
+            handoff_enabled,
             mcp_slug,
             ngrok_domain,
         ) = {
@@ -51,6 +52,7 @@ pub(crate) async fn run_settings(
                 app.ui_language,
                 app.all_time_usage_totals(),
                 app.set_catdesk_as_co_author,
+                app.handoff_enabled,
                 app.mcp_slug.clone(),
                 app.ngrok_domain.clone(),
             )
@@ -65,6 +67,7 @@ pub(crate) async fn run_settings(
                     current_widget_corner_style,
                     current_ui_language,
                     set_catdesk_as_co_author,
+                    handoff_enabled,
                     &mcp_slug,
                     ngrok_domain.as_deref(),
                     &usage_totals,
@@ -165,12 +168,23 @@ pub(crate) async fn run_settings(
                                     );
                                     app.persist_state_with_log();
                                 } else if selected_row == corner_end + 1 {
-                                    // Keep existing slug, do nothing
+                                    app.handoff_enabled = !app.handoff_enabled;
+                                    let enabled = app.handoff_enabled;
+                                    app.log(
+                                        "INFO",
+                                        format!(
+                                            "Library handoff: {}",
+                                            if enabled { "enabled" } else { "disabled" }
+                                        ),
+                                    );
+                                    app.persist_state_with_log();
                                 } else if selected_row == corner_end + 2 {
+                                    // Keep existing slug, do nothing
+                                } else if selected_row == corner_end + 3 {
                                     app.regenerate_mcp_slug();
                                     app.log("INFO", "Generated new random MCP slug".into());
                                     app.persist_state_with_log();
-                                } else if selected_row == corner_end + 3 {
+                                } else if selected_row == corner_end + 4 {
                                     let current_domain =
                                         app.ngrok_domain.clone().unwrap_or_default();
                                     drop(app);
@@ -228,6 +242,7 @@ pub(crate) fn draw_settings(
     current_widget_corner_style: WidgetCornerStyle,
     ui_language: UiLanguage,
     set_catdesk_as_co_author: bool,
+    handoff_enabled: bool,
     mcp_slug: &str,
     ngrok_domain: Option<&str>,
     usage_totals: &UsageTotals,
@@ -493,7 +508,59 @@ pub(crate) fn draw_settings(
         Style::default().fg(palette.muted_fg),
     )]));
 
-    let slug_keep_row = co_author_row + 1;
+    let handoff_row = co_author_row + 1;
+    let handoff_selected = handoff_row == selected_row;
+    let handoff_marker = if handoff_selected { ">" } else { " " };
+    let handoff_name_style = if handoff_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        ui_language.text("  Library handoff", "  Library 交接"),
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    if handoff_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] {}",
+            handoff_marker,
+            handoff_row + 1,
+            ui_language.text("Enable create_handoff", "啟用 create_handoff")
+        ),
+        handoff_name_style,
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("     ", Style::default()),
+        Span::styled(
+            if handoff_enabled {
+                ui_language.text("[enabled]", "[已啟用]")
+            } else {
+                ui_language.text("[disabled]", "[已停用]")
+            },
+            Style::default().fg(if handoff_enabled {
+                palette.success_fg
+            } else {
+                palette.muted_fg
+            }),
+        ),
+    ]));
+    lines.push(Line::from(vec![Span::styled(
+        ui_language.text(
+            "     Requires ChatGPT Library Search. When enabled, create_handoff is listed and catdesk_instruction tells ChatGPT to look for and save handoffs in the Library. Re-add the connector after changing this.",
+            "     需要 ChatGPT Library 搜尋。啟用後會列出 create_handoff，且 catdesk_instruction 會要求 ChatGPT 在 Library 中尋找並儲存交接。變更後請重新加入連接器。",
+        ),
+        Style::default().fg(palette.muted_fg),
+    )]));
+
+    let slug_keep_row = co_author_row + 2;
     let slug_keep_selected = slug_keep_row == selected_row;
     let slug_keep_marker = if slug_keep_selected { ">" } else { " " };
     let slug_keep_name_style = if slug_keep_selected {
@@ -504,7 +571,7 @@ pub(crate) fn draw_settings(
         Style::default().fg(palette.primary_fg)
     };
 
-    let slug_new_row = co_author_row + 2;
+    let slug_new_row = co_author_row + 3;
     let slug_new_selected = slug_new_row == selected_row;
     let slug_new_marker = if slug_new_selected { ">" } else { " " };
     let slug_new_name_style = if slug_new_selected {
@@ -515,7 +582,7 @@ pub(crate) fn draw_settings(
         Style::default().fg(palette.primary_fg)
     };
 
-    let domain_row = co_author_row + 3;
+    let domain_row = co_author_row + 4;
     let domain_selected = domain_row == selected_row;
     let domain_marker = if domain_selected { ">" } else { " " };
     let domain_name_style = if domain_selected {
