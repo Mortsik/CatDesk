@@ -7629,8 +7629,13 @@ async fn poll_command_elided_middle_events_stay_recoverable() {
         .expect("missing jobId")
         .to_string();
 
-    // Wait for the job to finish so one poll carries every event at once.
-    for _ in 0..200 {
+    // Wait for the job to finish so one poll carries every event at once. The
+    // deadline is generous because the full suite runs this beside hundreds
+    // of other tests; a job still running at the end is a hard failure, not a
+    // silent fall-through into a partial poll.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut finished = false;
+    while std::time::Instant::now() < deadline {
         let probe = tool_call_request("poll_command", json!({ "job_id": job_id, "wait_ms": 0 }));
         let probe_response = handle_tools_call_with_result_store(
             &probe,
@@ -7654,10 +7659,12 @@ async fn poll_command_elided_middle_events_stay_recoverable() {
             .and_then(Value::as_str)
             == Some("succeeded")
         {
+            finished = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    assert!(finished, "the job must finish before the single full poll");
 
     let poll_req = tool_call_request(
         "poll_command",
@@ -7731,18 +7738,20 @@ async fn poll_command_elided_middle_events_stay_recoverable() {
         "the stored original must hold the events the preview elided, got {}",
         stored_events.len()
     );
-    assert_eq!(
-        stored_events
-            .first()
-            .and_then(|event| event["text"].as_str()),
-        Some("HEAD-SENTINEL\n")
-    );
+    // Events are pipe-read chunks, so a chunk boundary after HEAD-SENTINEL
+    // depends on scheduling (under load the first read already holds `x`
+    // lines). Compare the reassembled stream instead of chunk boundaries.
+    let stored_text = stored_events
+        .iter()
+        .map(|event| event["text"].as_str().expect("event text"))
+        .collect::<String>();
+    let expected_text = format!("HEAD-SENTINEL\n{}\nTAIL-SENTINEL\n", "x\n".repeat(60_000));
     assert!(
-        stored_events
-            .last()
-            .and_then(|event| event["text"].as_str())
-            .is_some_and(|text| text.ends_with("TAIL-SENTINEL\n")),
-        "the stored tail must survive byte-for-byte"
+        stored_text == expected_text,
+        "the stored original must reassemble the whole output byte-for-byte \
+         ({} bytes stored, {} expected)",
+        stored_text.len(),
+        expected_text.len()
     );
     if let Some(events) = inline
         .pointer("/structuredContent/events")
