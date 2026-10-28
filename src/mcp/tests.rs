@@ -3180,6 +3180,23 @@ async fn disabled_handoff_is_not_advertised_or_callable() {
 }
 
 #[test]
+fn handoff_setting_defaults_off_and_fails_closed() {
+    use crate::state::AppConfig;
+    assert!(!handoff_enabled_from(Ok(AppConfig::default())));
+    assert!(handoff_enabled_from(Ok(AppConfig {
+        handoff_enabled: true,
+        ..AppConfig::default()
+    })));
+    assert!(!handoff_enabled_from(Err(std::io::Error::other(
+        "unreadable config"
+    ))));
+    let legacy: AppConfig =
+        toml::from_str("theme = \"neon\"\nmode = \"both\"\ntoolMode = \"multiTools\"\n")
+            .expect("parse config without handoff_enabled");
+    assert!(!legacy.handoff_enabled);
+}
+
+#[test]
 fn catdesk_instruction_omits_library_guidance_when_handoff_is_disabled() {
     let _handoff = HandoffEnabledOverride::set(false);
     let workspace_root = std::env::temp_dir().join(format!(

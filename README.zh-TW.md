@@ -158,7 +158,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
   </tr>
 </table>
 
-- 為了提升效能並避免記憶體使用量過高，我們強烈建議**每個小功能都開一個新 session**。Library handoff 預設停用；只有在 ChatGPT Library Search 可用且需要跨聊天延續時，才在 TUI 設定中啟用。啟用後，切換聊天前可以請 ChatGPT 使用 `create_handoff`。CatDesk 會準備一份名為 `catdesk_handoff_<workspace-name>_<short-id>.md` 的 handoff，內容包含目前目標、已完成工作、重要決策、驗證結果、下一步以及 Git 狀態；接著由 ChatGPT 把它存進長期保存的 Library，而不是寫進 workspace。下一個 session 呼叫 `catdesk_instruction` 時，ChatGPT 會使用完整 workspace identity 前綴 `catdesk_handoff_<workspace-name>_<short-id>` 搜尋 Library，而不是只用 workspace 名稱。若只有一份完全符合目前 workspace 的 handoff，就讀取並在成功讀完後刪除；若有多份完全符合的結果，會先詢問要使用哪一份，再只讀取並刪除選中的 handoff。不要把憑證、token、密碼或其他秘密寫進 handoff。工具呼叫超過 50 次之後，畫面可能會開始非常卡。
+- 為了提升效能並避免記憶體使用量過高，我們強烈建議**每個小功能都開一個新 session**。Library handoff 預設停用；只有在 ChatGPT Library Search 可用且需要跨聊天延續時，才在 TUI 設定中啟用，並重新整理或重新加入連接器，讓 ChatGPT 看到變更後的工具列表。啟用後，切換聊天前可以請 ChatGPT 使用 `create_handoff`。CatDesk 會準備一份名為 `catdesk_handoff_<workspace-name>_<short-id>.md` 的 handoff，內容包含目前目標、已完成工作、重要決策、驗證結果、下一步以及 Git 狀態；接著由 ChatGPT 把它存進長期保存的 Library，而不是寫進 workspace。下一個 session 呼叫 `catdesk_instruction` 時，ChatGPT 會使用完整 workspace identity 前綴 `catdesk_handoff_<workspace-name>_<short-id>` 搜尋 Library，而不是只用 workspace 名稱。若只有一份完全符合目前 workspace 的 handoff，就讀取並在成功讀完後刪除；若有多份完全符合的結果，會先詢問要使用哪一份，再只讀取並刪除選中的 handoff。不要把憑證、token、密碼或其他秘密寫進 handoff。工具呼叫超過 50 次之後，畫面可能會開始非常卡。
 <p align="center">
   <img src="docs/images/high_ram_usage.png" alt="3.9 GB Memory usage🥹" width="300"><br>
   <em>3.9 GB 記憶體用量🥹</em>

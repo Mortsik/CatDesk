@@ -798,9 +798,12 @@ fn current_show_detail_mode() -> ShowDetailMode {
 /// Library guidance only exist when the TUI setting enabled it.
 #[cfg(not(test))]
 pub(crate) fn current_handoff_enabled() -> bool {
-    cached_app_config()
-        .map(|config| config.handoff_enabled)
-        .unwrap_or(false)
+    handoff_enabled_from(cached_app_config())
+}
+
+/// An unreadable config keeps the shipped default: handoff stays off.
+fn handoff_enabled_from(config: std::io::Result<crate::state::AppConfig>) -> bool {
+    config.is_ok_and(|config| config.handoff_enabled)
 }
 
 // Tests default to enabled so existing tool inventories stay stable; the
@@ -815,13 +818,18 @@ pub(crate) fn current_handoff_enabled() -> bool {
     HANDOFF_ENABLED_FOR_TEST.with(std::cell::Cell::get)
 }
 
+/// Restores the previous value on drop; `!Send` so it cannot be dropped on
+/// another thread than the one whose thread-local it changed.
 #[cfg(test)]
-pub(crate) struct HandoffEnabledOverride(bool);
+pub(crate) struct HandoffEnabledOverride(bool, std::marker::PhantomData<*const ()>);
 
 #[cfg(test)]
 impl HandoffEnabledOverride {
     pub(crate) fn set(enabled: bool) -> Self {
-        Self(HANDOFF_ENABLED_FOR_TEST.with(|cell| cell.replace(enabled)))
+        Self(
+            HANDOFF_ENABLED_FOR_TEST.with(|cell| cell.replace(enabled)),
+            std::marker::PhantomData,
+        )
     }
 }
 
