@@ -570,7 +570,10 @@ pub(crate) fn draw_ui(
         Span::styled("[End]", Style::default().fg(palette.key_fg)),
         Span::raw(ui_language.text(" Latest  ", " 最新  ")),
         Span::styled("[e]", Style::default().fg(palette.key_fg)),
-        Span::raw(ui_language.text(" Export logs", " 匯出紀錄")),
+        Span::raw(ui_language.text(" Export logs  ", " 匯出紀錄  ")),
+        // One short label for both states keeps the bar within 80 columns.
+        Span::styled("[u]", Style::default().fg(palette.key_fg)),
+        Span::raw(ui_language.text(" History", " 用量歷史")),
     ];
     let keys = Paragraph::new(Line::from(key_spans)).block(
         Block::default()

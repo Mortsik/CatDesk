@@ -998,6 +998,10 @@ async fn run_tui(
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break;
                         }
+                        KeyCode::Char('u') => {
+                            let mut app = state.lock().await;
+                            app.usage_history_visible = !app.usage_history_visible;
+                        }
                         KeyCode::Char('e') => {
                             let export_result = {
                                 let app = state.lock().await;

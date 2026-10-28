@@ -1,6 +1,8 @@
-//! Usage section of the Status panel: one aligned table of requests, tool
-//! calls, tokens and cost per time window, followed by the burn rate, the
-//! tracked-history coverage and a seven-day token sparkline.
+//! Usage section of the Status panel. By default a compact table of the live
+//! (60 s) and session usage only; with [`AppState::usage_history_visible`]
+//! (`u`) the full history table of requests, tool calls, tokens and cost per
+//! time window, followed by the burn rate, the tracked-history coverage and a
+//! seven-day token sparkline. Persistence is the same in both views.
 
 use ratatui::prelude::*;
 use std::time::Duration;
@@ -24,6 +26,9 @@ const LABEL_CELLS: usize = 16;
 /// mascot layout. Compact token counts are at most 5 cells (`99.9K`); the cost
 /// columns fit a partially priced `$0.0123+N/A`.
 const COLUMN_CELLS: [usize; 7] = [6, 6, 6, 6, 6, 11, 12];
+/// Compact view columns: requests, calls, Σ tokens, cost, $/h rate; the
+/// session row appends its duration (16 + 42 + ~9 cells).
+const COMPACT_COLUMN_CELLS: [usize; 5] = [6, 7, 8, 10, 11];
 const SPARKLINE_DAYS: i64 = 7;
 const SPARKLINE_GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
@@ -82,6 +87,73 @@ pub(crate) fn usage_table_lines(
         &app.session_usage_totals,
         &usage_pricing::FALLBACK_MODEL_PRICING,
     );
+    let (live_per_min, live_per_hour) = session_cost_rates(
+        rolling_cost_usd,
+        Duration::from_millis(LIVE_USAGE_WINDOW_MS as u64),
+    );
+    let (_, session_per_hour) = session_cost_rates(session_cost_usd, session_elapsed);
+
+    if !app.usage_history_visible {
+        let headers = [
+            ui_language.text("REQS", "請求"),
+            ui_language.text("CALLS", "呼叫"),
+            ui_language.text("TOKENS", "Token"),
+            ui_language.text("COST", "成本"),
+            ui_language.text("RATE", "速率"),
+        ];
+        let mut header = vec![Span::styled(
+            pad_label(ui_language.text("USAGE", "用量")),
+            label_style,
+        )];
+        for (text, cells) in headers.iter().zip(COMPACT_COLUMN_CELLS) {
+            header.push(Span::styled(pad_left(text, cells), header_style));
+        }
+        let compact_row = |label: &str,
+                           requests: Option<u64>,
+                           totals: &UsageTotals,
+                           cost_usd: f64,
+                           per_hour: f64| {
+            let cells = [
+                (
+                    requests.map_or_else(|| "—".to_string(), |count| count.to_string()),
+                    value_style,
+                ),
+                (totals.tool_call_count.to_string(), value_style),
+                (format_token_compact(totals.total_tokens), value_style),
+                (format!("${}", format_usd_short(cost_usd)), cost_style),
+                (format!("${}/h", format_usd_short(per_hour)), cost_style),
+            ];
+            let mut spans = vec![Span::styled(pad_label(label), label_style)];
+            for ((text, style), cells) in cells.into_iter().zip(COMPACT_COLUMN_CELLS) {
+                let style = if text == "—" { muted_style } else { style };
+                spans.push(Span::styled(pad_left(&text, cells), style));
+            }
+            spans
+        };
+        let mut session = compact_row(
+            ui_language.text("Session", "工作階段"),
+            Some(app.request_count),
+            &app.session_usage_totals,
+            session_cost_usd,
+            session_per_hour,
+        );
+        session.push(Span::styled(
+            format!("  {}", format_session_duration(session_elapsed)),
+            muted_style,
+        ));
+        return vec![
+            Line::from(header),
+            Line::from(compact_row(
+                ui_language.text("Now (60s)", "即時 (60 秒)"),
+                None,
+                &rolling,
+                rolling_cost_usd,
+                live_per_hour,
+            )),
+            Line::from(session),
+        ];
+    }
+
     let today_by_model = app.today_usage_by_model();
 
     let mut tracked_totals = UsageTotals::default();
@@ -188,11 +260,6 @@ pub(crate) fn usage_table_lines(
         lines.push(Line::from(spans));
     }
 
-    let (live_per_min, live_per_hour) = session_cost_rates(
-        rolling_cost_usd,
-        Duration::from_millis(LIVE_USAGE_WINDOW_MS as u64),
-    );
-    let (_, session_per_hour) = session_cost_rates(session_cost_usd, session_elapsed);
     lines.push(Line::from(vec![
         Span::styled(pad_label(ui_language.text("BURN", "消耗速率")), label_style),
         Span::styled(ui_language.text("now ", "即時 "), muted_style),

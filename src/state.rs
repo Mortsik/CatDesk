@@ -761,6 +761,10 @@ pub struct AppState {
     /// [`ServerUiEvent::RecordToolCallOutcome`]. Bounded by the number of
     /// known tool names; session telemetry only, never persisted.
     pub tool_timeout_streaks: HashMap<String, ToolTimeoutStreak>,
+    /// Status panel shows the full usage history (today, per-day average,
+    /// all time, 7 days) instead of only the live and session rows. Toggled
+    /// with `u`; session-only view state, never persisted.
+    pub usage_history_visible: bool,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub daily_usage_by_model: DailyUsageByModel,
     pub session_usage_totals: UsageTotals,
@@ -1172,6 +1176,7 @@ impl AppState {
             daily_request_counts: config.daily_request_counts,
             last_tool_call_ms: None,
             tool_timeout_streaks: HashMap::new(),
+            usage_history_visible: false,
             usage_by_model: config.usage_by_model,
             daily_usage_by_model: config.daily_usage_by_model,
             session_usage_totals: UsageTotals::default(),

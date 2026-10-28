@@ -30,6 +30,15 @@ $1, three significant digits below, `N/A` when not finite); the flow row keeps
 the exact formatter. A partially priced cost renders `$X+N/A` (no inner space,
 one table cell).
 
+## Default view
+
+The full history table is too dense for an always-on panel. By default the
+`USAGE` section shows only `Now (60s)` and `Session` (columns `REQS CALLS
+TOKENS COST RATE`, the session row followed by its duration). `u` toggles the
+full history view described above (`[u] History` in the Keys bar, one label for both states so the bar fits
+80 columns). The toggle is session-only view state
+(`AppState::usage_history_visible`); persistence is identical in both views.
+
 ## Requirements
 
 - Persist MCP requests per local calendar day in `daily_request_counts`

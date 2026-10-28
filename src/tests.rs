@@ -189,6 +189,7 @@ fn main_dashboard_renders_traditional_chinese() {
     let mut app =
         AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
             .expect("create app");
+    app.usage_history_visible = true;
     app.ui_language = UiLanguage::TraditionalChinese;
     app.log("WARN", "No local browser found in PATH".into());
     app.log("INFO", "MCP Server started on port 3200".into());
@@ -274,6 +275,7 @@ fn main_dashboard_renders_live_telemetry() {
     let mut app =
         AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
             .expect("create app");
+    app.usage_history_visible = true;
     app.record_flow(
         "session:a",
         &["tools/call:read".to_string()],
@@ -412,6 +414,7 @@ fn main_dashboard_separates_legacy_total_from_tracked_daily_average() {
     let mut app =
         AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
             .expect("create app");
+    app.usage_history_visible = true;
 
     // $1,924.70 of legacy usage has no trustworthy per-day history.
     app.usage_by_model
@@ -469,6 +472,7 @@ fn main_dashboard_renders_unknown_usage_bucket_without_panicking() {
     let mut app =
         AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
             .expect("create app");
+    app.usage_history_visible = true;
 
     // A model bucket with no registry entry: nothing can be priced, the draw
     // below must render instead of panicking.
@@ -717,6 +721,7 @@ fn main_dashboard_marks_partially_priced_usage_with_unpriced_tail() {
     let mut app =
         AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
             .expect("create app");
+    app.usage_history_visible = true;
 
     // Legacy history prices at $65; the unknown future model adds unpriced
     // tokens that must surface as a "+N/A" tail instead of vanishing.
@@ -768,6 +773,7 @@ fn main_dashboard_combines_priced_model_buckets_into_one_total() {
     let mut app =
         AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
             .expect("create app");
+    app.usage_history_visible = true;
 
     // Historic legacy usage ($65) plus current unattributed turns ($5): both
     // buckets are priced, so the total sums them without any N/A tail.
@@ -928,11 +934,128 @@ fn main_dashboard_keeps_requests_visible_without_flow_slots() {
         "42",
         "session request counter must remain in the always-visible status area"
     );
+
+    // The persisted total lives in the usage history view, which must fit too.
+    app.usage_history_visible = true;
+    terminal
+        .draw(|frame| {
+            draw_ui(
+                frame,
+                &app,
+                0,
+                Duration::from_secs(120),
+                0,
+                true,
+                &mut None,
+                None,
+                None,
+                &HashMap::new(),
+            )
+        })
+        .expect("draw compact dashboard with usage history");
+    let text = terminal_buffer_text(&terminal);
     assert_eq!(
         usage_cells(&text, "All-time")[0],
         "142",
-        "persisted total request counter must remain in the always-visible status area"
+        "persisted total request counter must remain visible in the usage history"
     );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn main_dashboard_defaults_to_live_and_session_usage() {
+    // Day/all-time history is still persisted but hidden until `u` toggles
+    // it: the default Status panel shows only the live and session rows.
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let workspace = std::env::temp_dir().join(format!("catdesk-usage-compact-{unique}"));
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let config_path = workspace.join("config.toml");
+    let mut app =
+        AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+            .expect("create app");
+    app.usage_by_model
+        .entry(super::usage_pricing::FALLBACK_USAGE_BUCKET.to_string())
+        .or_default()
+        .accumulate(0, 1_600_000, 20);
+    app.record_turn_usage(
+        super::usage_pricing::FALLBACK_USAGE_BUCKET,
+        2_000,
+        1_000_000,
+    );
+    app.request_count = 42;
+    app.total_request_count = 142;
+
+    let draw = |app: &AppState| {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("create terminal");
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    app,
+                    0,
+                    Duration::from_secs(120),
+                    0,
+                    true,
+                    &mut None,
+                    None,
+                    None,
+                    &HashMap::new(),
+                )
+            })
+            .expect("draw dashboard");
+        terminal_buffer_text(&terminal)
+    };
+
+    let text = draw(&app);
+    // Columns: REQS CALLS TOKENS COST RATE (+ session duration).
+    let cells = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        usage_cells(&text, "Now (60s)"),
+        cells(&["—", "1", "1M", "$5.06", "$304/h"])
+    );
+    assert_eq!(
+        usage_cells(&text, "Session"),
+        cells(&["42", "1", "1M", "$5.06", "$152/h", "2m", "0s"])
+    );
+    for hidden in [
+        "Today",
+        "Avg/day",
+        "All-time",
+        "TRACKED",
+        "LAST 7 DAYS",
+        "BURN",
+    ] {
+        assert!(
+            !text.contains(hidden),
+            "compact view must hide {hidden}: {text}"
+        );
+    }
+    assert!(text.contains("[u] History"), "{text}");
+
+    app.usage_history_visible = true;
+    let text = draw(&app);
+    assert_eq!(usage_cells(&text, "All-time")[0], "142");
+    assert!(text.contains("LAST 7 DAYS"), "{text}");
+
+    app.usage_history_visible = false;
+    app.ui_language = UiLanguage::TraditionalChinese;
+    let text = draw(&app).replace(' ', "");
+    for expected in ["即時(60秒)", "工作階段", "速率", "用量歷史"] {
+        assert!(
+            text.contains(expected),
+            "missing compact zh text {expected}: {text}"
+        );
+    }
+    assert!(!text.contains("累計"), "{text}");
 
     let _ = std::fs::remove_dir_all(workspace);
 }
@@ -952,6 +1075,7 @@ fn usage_table_fits_the_120_column_mascot_layout() {
     let mut app =
         AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
             .expect("create app");
+    app.usage_history_visible = true;
     app.server_running = true;
     app.ngrok_running = true;
     app.record_flow(
@@ -1035,6 +1159,38 @@ fn usage_table_fits_the_120_column_mascot_layout() {
         assert!(
             text.contains(language.text("Your computer", "你 的 電 腦")),
             "the flow row must still fit: {text}"
+        );
+    }
+
+    // The default compact view must fit the same worst case: 6-digit session
+    // requests, $125 over 12h 34m, and the trailing session duration.
+    app.usage_history_visible = false;
+    for language in [UiLanguage::English, UiLanguage::TraditionalChinese] {
+        app.ui_language = language;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("create terminal");
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    &app,
+                    0,
+                    session,
+                    0,
+                    true,
+                    &mut None,
+                    None,
+                    None,
+                    &HashMap::new(),
+                )
+            })
+            .expect("draw 120-column compact dashboard");
+        let text = terminal_buffer_text(&terminal);
+        assert_eq!(
+            usage_cells(&text, language.text("Session", "工 作 階 段")),
+            ["123456", "1", "25M", "$125", "$9.95/h", "12h", "34m"]
+                .map(str::to_string)
+                .to_vec(),
+            "{language:?}: {text}"
         );
     }
 
