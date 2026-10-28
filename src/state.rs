@@ -107,6 +107,7 @@ pub struct UsageTotals {
 }
 
 pub type DailyUsageByModel = BTreeMap<String, BTreeMap<String, UsageTotals>>;
+pub type DailyRequestCounts = BTreeMap<String, u64>;
 
 impl UsageTotals {
     pub fn accumulate(
@@ -395,6 +396,10 @@ pub struct AppConfig {
     pub daily_usage_by_model: DailyUsageByModel,
     #[serde(default)]
     pub total_request_count: u64,
+    /// MCP requests per local calendar day (`YYYY-MM-DD`). Starts empty on
+    /// existing installs: `total_request_count` has no per-day history.
+    #[serde(default)]
+    pub daily_request_counts: DailyRequestCounts,
     pub selected_browser: Option<DetectedBrowser>,
 }
 
@@ -421,6 +426,7 @@ impl Default for AppConfig {
             usage_by_model: BTreeMap::new(),
             daily_usage_by_model: DailyUsageByModel::new(),
             total_request_count: 0,
+            daily_request_counts: DailyRequestCounts::new(),
             selected_browser: None,
         }
     }
@@ -747,6 +753,7 @@ pub struct AppState {
     connected_chat_ids: HashSet<String>,
     pub request_count: u64,
     pub total_request_count: u64,
+    pub daily_request_counts: DailyRequestCounts,
     /// When the last tool call was observed, for stream-failure correlation:
     /// a stream error long after this is unlikely to be CatDesk's fault.
     pub last_tool_call_ms: Option<u128>,
@@ -842,6 +849,7 @@ pub(crate) fn persist_usage_by_model_at_path_if_current(
     usage_by_model: BTreeMap<String, UsageTotals>,
     daily_usage_by_model: DailyUsageByModel,
     total_request_count: u64,
+    daily_request_counts: DailyRequestCounts,
     expected_generation: u64,
     current_generation: &AtomicU64,
 ) -> std::io::Result<bool> {
@@ -855,6 +863,7 @@ pub(crate) fn persist_usage_by_model_at_path_if_current(
     config.usage_by_model = usage_by_model;
     config.daily_usage_by_model = daily_usage_by_model;
     config.total_request_count = total_request_count;
+    config.daily_request_counts = daily_request_counts;
     config.save_to_path(path)?;
     Ok(true)
 }
@@ -1160,6 +1169,7 @@ impl AppState {
             connected_chat_ids: HashSet::new(),
             request_count: 0,
             total_request_count: config.total_request_count,
+            daily_request_counts: config.daily_request_counts,
             last_tool_call_ms: None,
             tool_timeout_streaks: HashMap::new(),
             usage_by_model: config.usage_by_model,
@@ -1224,6 +1234,7 @@ impl AppState {
         config.usage_by_model = self.usage_by_model.clone();
         config.daily_usage_by_model = self.daily_usage_by_model.clone();
         config.total_request_count = self.total_request_count;
+        config.daily_request_counts = self.daily_request_counts.clone();
         config.selected_browser = self.selected_browser.clone();
         Ok(config.normalized())
     }
@@ -1250,6 +1261,7 @@ impl AppState {
                 self.usage_by_model.clone(),
                 self.daily_usage_by_model.clone(),
                 self.total_request_count,
+                self.daily_request_counts.clone(),
             );
         }
         result
@@ -1272,6 +1284,21 @@ impl AppState {
     pub fn today_usage_by_model(&self) -> Option<&BTreeMap<String, UsageTotals>> {
         let day_key = local_usage_day_key(local_now());
         self.daily_usage_by_model.get(&day_key)
+    }
+
+    pub fn today_request_count(&self) -> u64 {
+        let day_key = local_usage_day_key(local_now());
+        self.daily_request_counts
+            .get(&day_key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn tracked_request_day_count(&self) -> usize {
+        self.daily_request_counts
+            .values()
+            .filter(|count| **count > 0)
+            .count()
     }
 
     pub fn tracked_usage_day_count(&self) -> usize {
@@ -1311,6 +1338,7 @@ impl AppState {
             self.usage_by_model.clone(),
             self.daily_usage_by_model.clone(),
             self.total_request_count,
+            self.daily_request_counts.clone(),
         );
     }
 
@@ -1422,6 +1450,9 @@ impl AppState {
             ServerUiEvent::IncrementRequestCount => {
                 self.request_count = self.request_count.saturating_add(1);
                 self.total_request_count = self.total_request_count.saturating_add(1);
+                let day_key = local_usage_day_key(local_now());
+                let today = self.daily_request_counts.entry(day_key).or_default();
+                *today = today.saturating_add(1);
                 self.schedule_usage_persistence();
             }
             ServerUiEvent::RecordToolCallOutcome {
@@ -2063,6 +2094,8 @@ toolCallCount = 1
         }
         assert_eq!(app.request_count, 3);
         assert_eq!(app.total_request_count, 3);
+        assert_eq!(app.today_request_count(), 3);
+        assert_eq!(app.tracked_request_day_count(), 1);
         drop(app);
 
         let reloaded = AppState::from_config_path(
@@ -2073,6 +2106,11 @@ toolCallCount = 1
         .expect("reload request totals");
         assert_eq!(reloaded.request_count, 0);
         assert_eq!(reloaded.total_request_count, 3);
+        assert_eq!(
+            reloaded.today_request_count(),
+            3,
+            "per-day request counts must survive a restart"
+        );
         drop(reloaded);
 
         let _ = std::fs::remove_file(config_path);

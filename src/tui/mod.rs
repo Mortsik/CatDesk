@@ -8,6 +8,7 @@ pub(crate) mod logs;
 pub(crate) mod ngrok_setup;
 pub(crate) mod settings;
 pub(crate) mod text;
+pub(crate) mod usage_table;
 
 // Wiring hub: only items the crate root (run_app/run_tui) still calls.
 pub(crate) use browser_select::{

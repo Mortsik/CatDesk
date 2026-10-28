@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::CHATGPT_CONNECTOR_SETTINGS_URL;
 use crate::mascot::{TUI_MASCOT_BLOCK_HEIGHT, TUI_MASCOT_BLOCK_WIDTH, render_tui_lines};
 use crate::perf_metrics;
-use crate::state::{AppState, FlowLane, LIVE_USAGE_WINDOW_MS};
+use crate::state::{AppState, FlowLane};
 use crate::tui::chrome::{draw_tui_header, render_toast};
 use crate::tui::flow::{
     active_bootstrap_status_flow, flow_bootstrap_status_lines, flow_lane_left_label,
@@ -16,11 +16,9 @@ use crate::tui::flow::{
 use crate::tui::logs::MCP_URL_MASK;
 use crate::tui::logs::{LogView, localize_log_message, mask_secret_log_message, wrap_log_message};
 use crate::tui::text::{
-    format_average_usage_cost_usd, format_cost_estimate_usd, format_session_duration,
-    format_token_compact, format_usd_compact, mcp_url_reveal_bar_segments, mcp_url_reveal_seconds,
-    pad_right_to_cell_width, session_cost_rates, trim_line,
+    mcp_url_reveal_bar_segments, mcp_url_reveal_seconds, pad_right_to_cell_width, trim_line,
 };
-use crate::usage_pricing;
+use crate::tui::usage_table::usage_table_lines;
 
 pub(crate) const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
 pub(crate) const STATUS_LABEL_WIDTH: usize = 13;
@@ -147,52 +145,9 @@ pub(crate) fn draw_ui(
     let status_content_height = status_height.saturating_sub(4) as usize;
     let flow_block_lines = 1;
 
-    let rolling_usage_totals = app.rolling_usage_totals(now_millis, LIVE_USAGE_WINDOW_MS);
-    // Rolling, session, and flow totals only ever hold freshly recorded turns, so
-    // the fallback estimate is the applicable rate for them.
-    let rolling_usage_cost_usd = usage_pricing::estimate_usage_cost_usd(
-        &rolling_usage_totals,
-        &usage_pricing::FALLBACK_MODEL_PRICING,
-    );
-    let (live_cost_per_min_usd, live_cost_per_hour_usd) = session_cost_rates(
-        rolling_usage_cost_usd,
-        Duration::from_millis(LIVE_USAGE_WINDOW_MS as u64),
-    );
-    let session_usage_cost_usd = usage_pricing::estimate_usage_cost_usd(
-        &app.session_usage_totals,
-        &usage_pricing::FALLBACK_MODEL_PRICING,
-    );
-    let (_session_cost_per_min_usd, session_cost_per_hour_usd) =
-        session_cost_rates(session_usage_cost_usd, session_elapsed);
-    let all_time_usage_cost = usage_pricing::estimate_usage_by_model_cost(&app.usage_by_model);
-    let today_usage_by_model = app.today_usage_by_model();
-    let today_usage_cost = today_usage_by_model
-        .map(usage_pricing::estimate_usage_by_model_cost)
-        .unwrap_or_default();
-    let today_tool_call_count = today_usage_by_model
-        .map(|usage_by_model| {
-            usage_by_model
-                .values()
-                .map(|usage| usage.tool_call_count)
-                .sum::<u64>()
-        })
-        .unwrap_or_default();
-    let tracked_usage_day_count = app.tracked_usage_day_count();
-    let tracked_daily_usage_cost = app
-        .daily_usage_by_model
-        .values()
-        .map(usage_pricing::estimate_usage_by_model_cost)
-        .fold(usage_pricing::CostEstimate::default(), |mut total, day| {
-            total.priced_usd += day.priced_usd;
-            total.unpriced_tokens = total.unpriced_tokens.saturating_add(day.unpriced_tokens);
-            total
-        });
     let muted_style = Style::default().fg(palette.muted_fg);
     let value_style = Style::default()
         .fg(palette.secondary_fg)
-        .add_modifier(Modifier::BOLD);
-    let cost_style = Style::default()
-        .fg(palette.success_fg)
         .add_modifier(Modifier::BOLD);
     let health_style = |healthy: bool| {
         Style::default()
@@ -213,138 +168,7 @@ pub(crate) fn draw_ui(
     // One bounded snapshot per redraw: copy under the lock, sort on the stack.
     let perf = perf_metrics::snapshot();
 
-    let mut status_lines: Vec<Line> = vec![
-        Line::from(vec![
-            status_label(ui_language.text("REQ NOW", "即時請求")),
-            Span::styled(
-                format!("{} ", ui_language.text("CHATS", "聊天")),
-                muted_style,
-            ),
-            Span::styled(app.connected_chat_count().to_string(), value_style),
-            Span::styled(
-                format!("      {} ", ui_language.text("JOBS", "工作")),
-                muted_style,
-            ),
-            Span::styled(active_job_count.to_string(), value_style),
-        ]),
-        Line::from(vec![
-            status_label(ui_language.text("REQ SESSION", "工作階段請求")),
-            Span::styled(app.request_count.to_string(), value_style),
-            Span::styled(
-                format!("  {} ", ui_language.text("last call", "最後呼叫")),
-                muted_style,
-            ),
-            Span::styled(
-                format_last_tool_call_elapsed(app.last_tool_call_ms, now_millis),
-                value_style,
-            ),
-        ]),
-        Line::from(vec![
-            status_label(ui_language.text("REQ TOTAL", "累計請求")),
-            Span::styled(app.total_request_count.to_string(), value_style),
-        ]),
-        Line::from(vec![
-            status_label(ui_language.text("PERF", "效能")),
-            Span::styled(perf_metrics::format_perf_line(&perf), value_style),
-        ]),
-        Line::from(vec![
-            status_label(ui_language.text("SYS", "系統")),
-            Span::styled(perf_metrics::format_system_line(&perf), muted_style),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            status_label(ui_language.text("COST NOW", "即時成本")),
-            Span::styled(
-                format!("${}/h", format_usd_compact(live_cost_per_hour_usd)),
-                cost_style,
-            ),
-            Span::raw("      "),
-            Span::styled(
-                format!("${}/min", format_usd_compact(live_cost_per_min_usd)),
-                cost_style,
-            ),
-        ]),
-        Line::from(vec![
-            status_label(ui_language.text("COST SESSION", "工作階段成本")),
-            Span::styled(ui_language.text("AVG ", "平均 "), muted_style),
-            Span::styled(
-                format!("${}/h", format_usd_compact(session_cost_per_hour_usd)),
-                cost_style,
-            ),
-            Span::styled(
-                ui_language.text("      SPENT ", "      已花費 "),
-                muted_style,
-            ),
-            Span::styled(
-                format!("${}", format_usd_compact(session_usage_cost_usd)),
-                cost_style,
-            ),
-            Span::raw("      "),
-            Span::styled(format_session_duration(session_elapsed), value_style),
-        ]),
-        Line::from(vec![
-            status_label(ui_language.text("COST TODAY", "今日成本")),
-            Span::styled(ui_language.text("SPENT ", "已花費 "), muted_style),
-            Span::styled(format_cost_estimate_usd(today_usage_cost), cost_style),
-            Span::styled(ui_language.text("      AVG ", "      平均 "), muted_style),
-            Span::styled(
-                format!(
-                    "{}{}",
-                    format_average_usage_cost_usd(today_usage_cost, today_tool_call_count),
-                    ui_language.text("/call", "/次")
-                ),
-                cost_style,
-            ),
-            Span::styled(ui_language.text("      CALLS ", "      呼叫 "), muted_style),
-            Span::styled(today_tool_call_count.to_string(), value_style),
-        ]),
-        Line::from(vec![
-            status_label(ui_language.text("COST TOTAL", "累計成本")),
-            Span::styled(ui_language.text("SPENT ", "已花費 "), muted_style),
-            Span::styled(format_cost_estimate_usd(all_time_usage_cost), cost_style),
-        ]),
-        Line::from(vec![
-            status_label(ui_language.text("COST TRACKED", "追蹤成本")),
-            Span::styled(ui_language.text("SPENT ", "已花費 "), muted_style),
-            Span::styled(
-                format_cost_estimate_usd(tracked_daily_usage_cost),
-                cost_style,
-            ),
-            Span::styled(ui_language.text("      DAYS ", "      天數 "), muted_style),
-            Span::styled(tracked_usage_day_count.to_string(), value_style),
-            Span::styled(ui_language.text("      AVG ", "      平均 "), muted_style),
-            Span::styled(
-                format!(
-                    "{}{}",
-                    format_average_usage_cost_usd(
-                        tracked_daily_usage_cost,
-                        tracked_usage_day_count as u64,
-                    ),
-                    ui_language.text("/day", "/天")
-                ),
-                cost_style,
-            ),
-        ]),
-        Line::from(vec![
-            status_label(ui_language.text("TOKENS 60s", "Token 60秒")),
-            Span::styled(ui_language.text("↓REQ", "↓請求"), muted_style),
-            Span::styled(
-                format_token_compact(rolling_usage_totals.tool_input_tokens),
-                value_style,
-            ),
-            Span::raw("      "),
-            Span::styled(ui_language.text("↑RES", "↑回應"), muted_style),
-            Span::styled(
-                format_token_compact(rolling_usage_totals.tool_output_tokens),
-                value_style,
-            ),
-            Span::raw("      "),
-            Span::styled("Σ", muted_style),
-            Span::styled(
-                format_token_compact(rolling_usage_totals.total_tokens),
-                value_style,
-            ),
-        ]),
+    let mut system_section: Vec<Line> = vec![
         Line::from(vec![
             status_label(ui_language.text("SYSTEM", "系統")),
             Span::styled("MCP ", muted_style),
@@ -352,53 +176,99 @@ pub(crate) fn draw_ui(
                 if app.server_running { "✓" } else { "×" },
                 health_style(app.server_running),
             ),
-            Span::styled("      NGROK ", muted_style),
+            Span::styled("   NGROK ", muted_style),
             Span::styled(
                 if app.ngrok_running { "✓" } else { "×" },
                 health_style(app.ngrok_running),
             ),
-            Span::styled("      DEVTOOLS ", muted_style),
+            Span::styled("   DEVTOOLS ", muted_style),
             Span::styled(
                 devtools_indicator.0,
                 devtools_indicator.1.add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("      {} ", ui_language.text("MODE", "模式")),
+                format!("   {} ", ui_language.text("MODE", "模式")),
                 muted_style,
             ),
             Span::styled(mode_label, value_style),
             Span::styled(" / ", muted_style),
             Span::styled(tool_mode_label, value_style),
         ]),
+        Line::from(vec![
+            status_label(ui_language.text("ACTIVITY", "活動")),
+            Span::styled(
+                format!("{} ", ui_language.text("CHATS", "聊天")),
+                muted_style,
+            ),
+            Span::styled(app.connected_chat_count().to_string(), value_style),
+            Span::styled(
+                format!("   {} ", ui_language.text("JOBS", "工作")),
+                muted_style,
+            ),
+            Span::styled(active_job_count.to_string(), value_style),
+            Span::styled(
+                format!("   {} ", ui_language.text("last call", "最後呼叫")),
+                muted_style,
+            ),
+            Span::styled(
+                format_last_tool_call_elapsed(app.last_tool_call_ms, now_millis),
+                value_style,
+            ),
+        ]),
     ];
 
     // Retry-storm warning on its own line, shown only once the same failure
-    // class repeats (>1). It must be a separate line, not appended to REQ
-    // SESSION: at the narrowest mascot layout (120 columns) the status
-    // content is ~66 cells and an inlined `504×N tool@class` (81+) loses its
+    // class repeats (>1). It must be a separate line, not appended to
+    // ACTIVITY: at the narrowest mascot layout (120 columns) the status
+    // content is ~72 cells and an inlined `504×N tool@class` (81+) loses its
     // class suffix — @execution vs @queue must stay distinguishable. Like
     // the flow row below, it claims vertical space only while a storm is
     // live, so idle dashboards are unchanged.
     if let Some(streak) = app.worst_tool_timeout_streak() {
-        status_lines.insert(
-            2,
-            Line::from(vec![
-                status_label(ui_language.text("504 STREAK", "504 連續")),
-                Span::styled(
-                    format!("504×{} ", streak.count),
-                    Style::default()
-                        .fg(palette.danger_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    streak.tool.clone(),
-                    Style::default()
-                        .fg(palette.warning_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("@{}", streak.reason), muted_style),
-            ]),
-        );
+        system_section.push(Line::from(vec![
+            status_label(ui_language.text("504 STREAK", "504 連續")),
+            Span::styled(
+                format!("504×{} ", streak.count),
+                Style::default()
+                    .fg(palette.danger_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                streak.tool.clone(),
+                Style::default()
+                    .fg(palette.warning_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("@{}", streak.reason), muted_style),
+        ]));
+    }
+
+    let usage_section = usage_table_lines(app, now_millis, session_elapsed, &palette, ui_language);
+    let perf_section: Vec<Line> = vec![
+        Line::from(vec![
+            status_label(ui_language.text("PERF", "效能")),
+            Span::styled(perf_metrics::format_perf_line(&perf), value_style),
+        ]),
+        Line::from(vec![
+            status_label(ui_language.text("HOST", "主機")),
+            Span::styled(perf_metrics::format_system_line(&perf), muted_style),
+        ]),
+    ];
+
+    // Blank separators between sections only while everything still fits,
+    // including the flow row (blank + row) below; short terminals drop them
+    // before losing the flow row or clipping the PERF/HOST tail.
+    let sections = [system_section, usage_section, perf_section];
+    let section_line_count: usize = sections.iter().map(Vec::len).sum();
+    let flow_reserve = if show_flow_panel { 2 } else { 0 };
+    let separate_sections =
+        section_line_count + sections.len() - 1 + flow_reserve <= status_content_height;
+    let mut status_lines: Vec<Line> = Vec::with_capacity(section_line_count + sections.len());
+    for (index, section) in sections.into_iter().enumerate() {
+        if index > 0 && separate_sections {
+            status_lines.push(Line::from(""));
+        }
+        status_lines.extend(section);
     }
 
     let visible_flow_slots = if show_flow_panel {

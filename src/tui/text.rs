@@ -73,15 +73,18 @@ pub(crate) fn format_token_compact(value: u64) -> String {
 }
 
 /// Renders usage cost with an explicit unpriced tail: `$X` when every bucket is
-/// priced, `$X +N/A` when some buckets have no registry entry, `N/A` when nothing
-/// could be priced, and `$0` when no usage was recorded at all. Chosen over a bare
-/// `$X*` marker because the status panel has no legend line to explain it.
+/// priced, `$X+N/A` when some buckets have no registry entry, `N/A` when nothing
+/// could be priced (or the estimate is not a finite number), and `$0` when no
+/// usage was recorded at all. Chosen over a bare `$X*` marker because the status
+/// panel has no legend line to explain it; no inner space keeps it one table cell.
 pub(crate) fn format_cost_estimate_usd(estimate: usage_pricing::CostEstimate) -> String {
-    if estimate.priced_usd > 0.0 {
+    if !estimate.priced_usd.is_finite() {
+        "N/A".to_string()
+    } else if estimate.priced_usd > 0.0 {
         if estimate.unpriced_tokens == 0 {
-            format!("${}", format_usd_compact(estimate.priced_usd))
+            format!("${}", format_usd_short(estimate.priced_usd))
         } else {
-            format!("${} +N/A", format_usd_compact(estimate.priced_usd))
+            format!("${}+N/A", format_usd_short(estimate.priced_usd))
         }
     } else if estimate.is_unpriced() {
         "N/A".to_string()
@@ -110,6 +113,36 @@ pub(crate) fn format_usd_compact(usd: f64) -> String {
     let formatted = format!("{usd:.prec$}", prec = PRICE_DISPLAY_DECIMALS);
     let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
     if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Dashboard-sized dollars: whole dollars from $100, cents from $1, and three
+/// significant digits below that, so sub-cent rates stay visible (`0.00042`)
+/// without the six-decimal tail of [`format_usd_compact`]. A non-finite input
+/// renders `N/A` so a broken rate never reads as a free one.
+pub(crate) fn format_usd_short(usd: f64) -> String {
+    if !usd.is_finite() {
+        return "N/A".to_string();
+    }
+    if usd <= 0.0 {
+        return "0".to_string();
+    }
+    let decimals = if usd >= 100.0 {
+        0
+    } else if usd >= 1.0 {
+        2
+    } else {
+        ((-usd.log10()).floor() as usize + 3).min(PRICE_DISPLAY_DECIMALS)
+    };
+    let formatted = format!("{usd:.decimals$}");
+    if decimals == 0 {
+        return formatted;
+    }
+    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "0" {
         "0".to_string()
     } else {
         trimmed.to_string()

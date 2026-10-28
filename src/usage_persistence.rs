@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::state::{DailyUsageByModel, UsageTotals, persist_usage_by_model_at_path_if_current};
+use crate::state::{
+    DailyRequestCounts, DailyUsageByModel, UsageTotals, persist_usage_by_model_at_path_if_current,
+};
 
 type UsageSnapshot = BTreeMap<String, UsageTotals>;
 
@@ -16,6 +18,7 @@ struct PendingUsage {
     snapshot: UsageSnapshot,
     daily_snapshot: DailyUsageByModel,
     total_request_count: u64,
+    daily_request_counts: DailyRequestCounts,
 }
 
 #[cfg(not(test))]
@@ -68,6 +71,7 @@ impl UsagePersistence {
         snapshot: UsageSnapshot,
         daily_snapshot: DailyUsageByModel,
         total_request_count: u64,
+        daily_request_counts: DailyRequestCounts,
     ) {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         *self
@@ -78,6 +82,7 @@ impl UsagePersistence {
             snapshot,
             daily_snapshot,
             total_request_count,
+            daily_request_counts,
         });
 
         let Some(wake_tx) = self.wake_tx.as_ref() else {
@@ -130,6 +135,7 @@ fn flush_pending(
         pending_usage.snapshot.clone(),
         pending_usage.daily_snapshot.clone(),
         pending_usage.total_request_count,
+        pending_usage.daily_request_counts.clone(),
         pending_usage.generation,
         current_generation,
     ) {
@@ -185,6 +191,7 @@ mod tests {
             snapshot: usage,
             daily_snapshot: DailyUsageByModel::new(),
             total_request_count: 0,
+            daily_request_counts: DailyRequestCounts::new(),
         }));
         let generation = AtomicU64::new(1);
 

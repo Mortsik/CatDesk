@@ -33,6 +33,27 @@ fn terminal_buffer_text(terminal: &Terminal<TestBackend>) -> String {
         .join("\n")
 }
 
+/// The single rendered line holding a Status row label, e.g. `All-time`.
+fn status_row<'a>(text: &'a str, label: &str) -> &'a str {
+    text.lines()
+        .find(|line| line.contains(label))
+        .unwrap_or_else(|| panic!("missing status row {label}: {text}"))
+}
+
+/// The whitespace-separated cells after a USAGE table row label, up to the
+/// Status panel border: `[REQS, CALLS, ↓REQ, ↑RES, Σ TOK, COST, $/CALL]`.
+fn usage_cells(text: &str, label: &str) -> Vec<String> {
+    let row = status_row(text, label);
+    let after_label = &row[row.find(label).expect("label") + label.len()..];
+    after_label
+        .split('│')
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
 fn redraw_gate_skips_idle_frames_but_honors_dirty_and_timed_ticks() {
     let elapsed = Duration::from_millis(40);
@@ -196,23 +217,31 @@ fn main_dashboard_renders_traditional_chinese() {
     for expected in [
         "讓ChatGPTWeb變成程式代理",
         "狀態",
-        "即時請求",
+        "系統",
+        "活動",
         "聊天",
         "工作",
-        "工作階段請求",
-        "累計請求",
-        "效能",
-        "即時成本",
-        "工作階段成本",
-        "今日成本",
-        "平均",
-        "已花費",
+        "最後呼叫",
+        "用量",
+        "請求",
         "呼叫",
-        "累計成本",
-        "追蹤成本",
-        "天數",
-        "Token60秒",
-        "系統",
+        "↓請求",
+        "↑回應",
+        "合計",
+        "成本",
+        "$/次",
+        "最近60秒",
+        "工作階段",
+        "今日",
+        "每日平均",
+        "追蹤",
+        "累計",
+        "消耗速率",
+        "本次",
+        "最近7天",
+        "尚無用量",
+        "效能",
+        "主機",
         "等待連線",
         "你的電腦",
         "按鍵",
@@ -268,6 +297,10 @@ fn main_dashboard_renders_live_telemetry() {
         .accumulate(0, 600_000, 3);
     app.request_count = 42;
     app.total_request_count = 142;
+    app.daily_request_counts.insert(
+        crate::state::local_usage_day_key(crate::state::local_now()),
+        7,
+    );
 
     let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
     let mut log_view = None;
@@ -291,47 +324,71 @@ fn main_dashboard_renders_live_telemetry() {
 
     let text = terminal_buffer_text(&terminal);
     for expected in [
-        "REQ NOW",
+        "SYSTEM",
+        "ACTIVITY",
         "CHATS 2",
         "JOBS 3",
-        "REQ SESSION",
-        "42",
-        "REQ TOTAL",
-        "142",
-        "COST NOW",
-        "$300/h",
-        "$5/min",
-        "COST SESSION",
-        "AVG $150/h",
-        "SPENT $5",
-        "2m 0s",
-        "COST TODAY",
-        "AVG $5/call",
-        "CALLS 1",
-        "COST TOTAL",
-        "SPENT $13",
-        "COST TRACKED",
-        "SPENT $8",
-        "DAYS 2",
-        "AVG $4/day",
-        "TOKENS 60s",
+        "USAGE",
+        "REQS",
+        "CALLS",
         "↓REQ",
         "↑RES",
-        "SYSTEM",
+        "Σ TOK",
+        "$/CALL",
+        "BURN",
+        "now $300/h · $5/min",
+        "session $150/h · 2m 0s",
+        "LAST 7 DAYS",
+        "TRACKED",
     ] {
         assert!(
             text.contains(expected),
             "missing live telemetry text: {expected}"
         );
     }
-    for hidden in ["Workspace", "All-time", "MCP Server URL"] {
+    // Columns: REQS CALLS ↓REQ ↑RES Σ COST $/CALL.
+    let cells = |values: [&str; 7]| values.map(str::to_string).to_vec();
+    assert_eq!(
+        usage_cells(&text, "Last 60s"),
+        cells(["—", "1", "0", "1M", "1M", "$5", "$5"])
+    );
+    assert_eq!(
+        usage_cells(&text, "Session"),
+        cells(["42", "1", "0", "1M", "1M", "$5", "$5"])
+    );
+    assert_eq!(
+        usage_cells(&text, "Today"),
+        cells(["7", "1", "0", "1M", "1M", "$5", "$5"])
+    );
+    // Two tracked usage days ($3 + $5 over 4 calls) but one request day (7).
+    assert_eq!(
+        usage_cells(&text, "Avg/day"),
+        cells(["7", "2", "0", "800K", "800K", "$4", "$2"])
+    );
+    assert_eq!(
+        usage_cells(&text, "All-time"),
+        cells(["142", "21", "0", "2.6M", "2.6M", "$13", "$0.619"])
+    );
+    let tracked = status_row(&text, "TRACKED");
+    for expected in ["usage 2d Σ $8 · 1.6M tok", "req 1d Σ 7"] {
+        assert!(
+            tracked.contains(expected),
+            "TRACKED missing {expected}: {tracked}"
+        );
+    }
+    let sparkline = status_row(&text, "LAST 7 DAYS");
+    assert!(
+        sparkline.contains("······█") && sparkline.contains("peak 1M"),
+        "only today has usage inside the 7-day window: {sparkline}"
+    );
+    for hidden in ["Workspace", "MCP Server URL"] {
         assert!(
             !text.contains(hidden),
             "normal status should hide low-priority field: {hidden}"
         );
     }
     for expected in [
-        "PERF", "p50", "p95", "p99", "ACT", "DL", "CACHE", "SCAN p95",
+        "PERF", "p50", "p95", "p99", "ACT", "DL", "HOST", "CACHE", "SCAN p95",
     ] {
         assert!(
             text.contains(expected),
@@ -385,21 +442,17 @@ fn main_dashboard_separates_legacy_total_from_tracked_daily_average() {
         .expect("draw main dashboard");
 
     let text = terminal_buffer_text(&terminal);
-    let total_line = text
-        .lines()
-        .find(|line| line.contains("COST TOTAL"))
-        .expect("COST TOTAL line");
-    assert!(total_line.contains("SPENT $1925"), "{total_line}");
-    assert!(!total_line.contains("DAYS"), "{total_line}");
-    assert!(!total_line.contains("AVG"), "{total_line}");
+    let total_line = status_row(&text, "All-time");
+    assert!(total_line.contains("$1925"), "{total_line}");
 
-    let tracked_line = text
-        .lines()
-        .find(|line| line.contains("COST TRACKED"))
-        .expect("COST TRACKED line");
-    assert!(tracked_line.contains("SPENT $0.3"), "{tracked_line}");
-    assert!(tracked_line.contains("DAYS 1"), "{tracked_line}");
-    assert!(tracked_line.contains("AVG $0.3/day"), "{tracked_line}");
+    // The per-day average only covers days the daily tracker has seen.
+    let average = usage_cells(&text, "Avg/day");
+    assert_eq!(average[5], "$0.3", "{average:?}");
+    assert_eq!(average[6], "$0.3", "{average:?}");
+    assert!(
+        status_row(&text, "TRACKED").contains("usage 1d Σ $0.3"),
+        "{text}"
+    );
 
     let _ = std::fs::remove_dir_all(workspace);
 }
@@ -445,11 +498,8 @@ fn main_dashboard_renders_unknown_usage_bucket_without_panicking() {
         .expect("unknown usage buckets must not panic the dashboard");
 
     let text = terminal_buffer_text(&terminal);
-    let total_line = text
-        .lines()
-        .find(|line| line.contains("COST TOTAL"))
-        .expect("COST TOTAL line");
-    assert!(total_line.contains("SPENT N/A"), "{total_line}");
+    let total_line = status_row(&text, "All-time");
+    assert!(total_line.contains("N/A"), "{total_line}");
     assert!(!total_line.contains('$'), "{total_line}");
 
     let _ = std::fs::remove_dir_all(workspace);
@@ -531,7 +581,7 @@ fn tool_timeout_streak_counts_identical_504s_and_resets_on_other_outcomes() {
 #[test]
 fn dashboard_504_streak_stays_fully_visible_at_120_columns() {
     // Sol rework: at the narrowest mascot layout (120 columns), the status
-    // content is only ~66 cells wide, so an inlined streak warning on the REQ
+    // content is only ~72 cells wide, so an inlined streak warning on the REQ
     // SESSION line lost its class suffix — users could not tell @execution
     // from @queue. The full `504xN tool@class` must survive the render.
     let unique = SystemTime::now()
@@ -700,11 +750,8 @@ fn main_dashboard_marks_partially_priced_usage_with_unpriced_tail() {
         .expect("draw mixed pricing dashboard");
 
     let text = terminal_buffer_text(&terminal);
-    let total_line = text
-        .lines()
-        .find(|line| line.contains("COST TOTAL"))
-        .expect("COST TOTAL line");
-    assert!(total_line.contains("SPENT $65 +N/A"), "{total_line}");
+    let total_line = status_row(&text, "All-time");
+    assert!(total_line.contains("$65+N/A"), "{total_line}");
 
     let _ = std::fs::remove_dir_all(workspace);
 }
@@ -754,11 +801,8 @@ fn main_dashboard_combines_priced_model_buckets_into_one_total() {
         .expect("draw combined pricing dashboard");
 
     let text = terminal_buffer_text(&terminal);
-    let total_line = text
-        .lines()
-        .find(|line| line.contains("COST TOTAL"))
-        .expect("COST TOTAL line");
-    assert!(total_line.contains("SPENT $70"), "{total_line}");
+    let total_line = status_row(&text, "All-time");
+    assert!(total_line.contains("$70"), "{total_line}");
     assert!(!total_line.contains("N/A"), "{total_line}");
 
     let _ = std::fs::remove_dir_all(workspace);
@@ -879,14 +923,120 @@ fn main_dashboard_keeps_requests_visible_without_flow_slots() {
         .expect("draw compact dashboard");
 
     let text = terminal_buffer_text(&terminal);
-    assert!(
-        text.contains("REQ SESSION") && text.contains("42"),
+    assert_eq!(
+        usage_cells(&text, "Session")[0],
+        "42",
         "session request counter must remain in the always-visible status area"
     );
-    assert!(
-        text.contains("REQ TOTAL") && text.contains("142"),
+    assert_eq!(
+        usage_cells(&text, "All-time")[0],
+        "142",
         "persisted total request counter must remain in the always-visible status area"
     );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn usage_table_fits_the_120_column_mascot_layout() {
+    // Worst realistic widths at the narrowest mascot layout: partially priced
+    // cost tails in both cost columns and a long session in BURN. Every cell
+    // must render whole and separated, in English and Traditional Chinese.
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let workspace = std::env::temp_dir().join(format!("catdesk-usage-120-{unique}"));
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let config_path = workspace.join("config.toml");
+    let mut app =
+        AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+            .expect("create app");
+    app.server_running = true;
+    app.ngrok_running = true;
+    app.record_flow(
+        "session:a",
+        &["tools/call:read".to_string()],
+        FlowDirection::Forward,
+    );
+    app.usage_by_model
+        .entry(super::usage_pricing::FALLBACK_USAGE_BUCKET.to_string())
+        .or_default()
+        .accumulate(0, 24_600, 9);
+    app.usage_by_model
+        .entry("model:gpt-9-future".to_string())
+        .or_default()
+        .accumulate(1_000, 1_000, 1);
+    app.request_count = 123_456;
+    app.total_request_count = 1_234_567;
+    // $125 over the session, and 120 partially priced tracked days ($1 each
+    // plus an unpriced tail) with 1,029 requests a day.
+    app.session_usage_totals.accumulate(0, 25_000_000, 1);
+    let today = crate::state::local_now();
+    for back in 200..320 {
+        let day = crate::state::local_usage_day_key(today - time::Duration::days(back));
+        let usage = app.daily_usage_by_model.entry(day.clone()).or_default();
+        usage
+            .entry(super::usage_pricing::FALLBACK_USAGE_BUCKET.to_string())
+            .or_default()
+            .accumulate(0, 200_000, 1);
+        usage
+            .entry("model:gpt-9-future".to_string())
+            .or_default()
+            .accumulate(1_000, 0, 1);
+        app.daily_request_counts.insert(day, 1_029);
+    }
+    let session = Duration::from_secs(12 * 3600 + 34 * 60);
+
+    for language in [UiLanguage::English, UiLanguage::TraditionalChinese] {
+        app.ui_language = language;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("create terminal");
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    &app,
+                    0,
+                    session,
+                    0,
+                    true,
+                    &mut None,
+                    None,
+                    None,
+                    &HashMap::new(),
+                )
+            })
+            .expect("draw 120-column dashboard");
+        let text = terminal_buffer_text(&terminal);
+        // Wide CJK glyphs occupy two cells; the buffer dump shows the second
+        // (continuation) cell as a space.
+        let all_time = usage_cells(&text, language.text("All-time", "累 計"));
+        assert_eq!(
+            all_time,
+            [
+                "1234567",
+                "10",
+                "1K",
+                "25.6K",
+                "26.6K",
+                "$0.123+N/A",
+                "$0.0123+N/A"
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            "{language:?}: {text}"
+        );
+        let burn = status_row(&text, language.text("BURN", "消 耗 速 率"));
+        assert!(burn.contains("$9.95/h · 12h 34m"), "{language:?}: {burn}");
+        let tracked = status_row(&text, language.text("TRACKED", "追 蹤"));
+        for expected in ["$120+N/A", "24.1M", "Σ 123480"] {
+            assert!(tracked.contains(expected), "{language:?}: {tracked}");
+        }
+        assert!(
+            text.contains(language.text("Your computer", "你 的 電 腦")),
+            "the flow row must still fit: {text}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(workspace);
 }
