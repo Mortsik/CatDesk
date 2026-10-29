@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 fn canonical_existing(path: &Path) -> io::Result<PathBuf> {
@@ -23,13 +24,85 @@ fn insert_existing(paths: &mut BTreeSet<PathBuf>, path: impl AsRef<Path>) {
     }
 }
 
-fn insert_env_path_list(paths: &mut BTreeSet<PathBuf>, variable: &str) {
-    let Some(value) = std::env::var_os(variable) else {
+/// PATH directories, minus those on a WSL Windows drive (`/mnt/c/...`).
+///
+/// Windows executables cannot run inside the sandbox anyway: WSL interop
+/// needs the host's `/init` as PID 1 and the `/run/WSL` socket, neither of
+/// which exists in the namespace, so `cmd.exe` exits with `UtilConnectUnix:
+/// connect failed`. Binding those directories still cost every command about
+/// 100 ms of 9p mounts and lookups (docs/findings/2026-10-29-sandbox-windows-path-binds.md).
+fn insert_path_dirs(paths: &mut BTreeSet<PathBuf>) {
+    let Some(value) = std::env::var_os("PATH") else {
         return;
     };
-    for path in std::env::split_paths(&value) {
-        insert_existing(paths, path);
+    insert_path_list(paths, &value, windows_drive_mounts());
+}
+
+fn insert_path_list(paths: &mut BTreeSet<PathBuf>, value: &OsStr, windows_drives: &[PathBuf]) {
+    let on_drive = |path: &Path| windows_drives.iter().any(|drive| path.starts_with(drive));
+    for path in std::env::split_paths(value) {
+        // Checked before canonicalize too: resolving a drive path is itself
+        // a slow 9p round trip.
+        if on_drive(&path) {
+            continue;
+        }
+        if let Ok(canonical) = path.canonicalize()
+            && !on_drive(&canonical)
+        {
+            paths.insert(canonical);
+        }
     }
+}
+
+/// Mount points of WSL Windows drives, read once per process.
+fn windows_drive_mounts() -> &'static [PathBuf] {
+    static MOUNTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    MOUNTS.get_or_init(|| {
+        std::fs::read_to_string("/proc/self/mountinfo")
+            .map(|mountinfo| windows_drive_mounts_from(&mountinfo))
+            .unwrap_or_default()
+    })
+}
+
+/// Windows drives are `9p`/`drvfs`/`virtiofs` mounts whose source is a drive
+/// letter (`C:\`); other 9p mounts such as `/usr/lib/wsl/drivers` stay.
+fn windows_drive_mounts_from(mountinfo: &str) -> Vec<PathBuf> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (fields, filesystem) = line.split_once(" - ")?;
+            let mount_point = fields.split(' ').nth(4)?;
+            let mut filesystem = filesystem.split(' ');
+            let fstype = filesystem.next()?;
+            let source = filesystem.next()?.as_bytes();
+            let drive = matches!(fstype, "9p" | "drvfs" | "virtiofs")
+                && source.len() >= 2
+                && source[0].is_ascii_alphabetic()
+                && source[1] == b':';
+            drive.then(|| unescape_mountinfo(mount_point))
+        })
+        .collect()
+}
+
+/// Undo mountinfo's octal escapes (`\040` for a space and so on).
+fn unescape_mountinfo(field: &str) -> PathBuf {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'\\'
+            && let Some(octal) = bytes.get(idx + 1..idx + 4)
+            && let Ok(octal) = std::str::from_utf8(octal)
+            && let Ok(byte) = u8::from_str_radix(octal, 8)
+        {
+            out.push(byte);
+            idx += 4;
+            continue;
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+    PathBuf::from(OsString::from_vec(out))
 }
 
 fn insert_env_path(paths: &mut BTreeSet<PathBuf>, variable: &str) {
@@ -115,7 +188,7 @@ fn runtime_read_paths() -> BTreeSet<PathBuf> {
 
     // Executables installed outside the standard system prefixes must remain
     // executable when their directory is explicitly present in PATH.
-    insert_env_path_list(&mut paths, "PATH");
+    insert_path_dirs(&mut paths);
 
     // NVM's npm/npx launchers in NVM_BIN are symlinks into the sibling lib
     // directory. Expose only that current version's lib tree, read-only.
@@ -1476,6 +1549,52 @@ mod tests {
         };
         let home = PathBuf::from(home).canonicalize().expect("canonical HOME");
         assert!(!runtime_read_paths().contains(&home));
+    }
+
+    #[test]
+    fn windows_drive_mounts_keep_only_drive_letter_sources() {
+        let mountinfo = [
+            r"85 64 0:52 / /usr/lib/wsl/drivers ro,nosuid - 9p drivers ro,aname=drivers",
+            r"92 64 0:59 / /mnt/c rw,noatime - 9p C:\134 rw,aname=drvfs;path=C:\;uid=1000",
+            r"93 64 0:60 / /mnt/my\040disk rw,noatime - drvfs D: rw",
+            r"94 64 0:61 / /mnt/e rw,noatime - virtiofs E:\134 rw",
+            r"95 64 8:48 / / rw,relatime - ext4 /dev/sdd rw",
+            r"96 64 0:62 / /mnt/wsl rw,relatime - tmpfs C:tmp rw",
+        ]
+        .join("\n");
+        assert_eq!(
+            windows_drive_mounts_from(&mountinfo),
+            [
+                PathBuf::from("/mnt/c"),
+                PathBuf::from("/mnt/my disk"),
+                PathBuf::from("/mnt/e"),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_dirs_on_a_windows_drive_are_not_bound() {
+        let tree = TempTree::new();
+        let drive = tree.path().join("mnt-c");
+        let windows_bin = drive.join("Windows/System32");
+        let linux_bin = tree.path().join("bin");
+        let link_into_drive = tree.path().join("vscode-bin");
+        std::fs::create_dir_all(&windows_bin).expect("create drive bin");
+        std::fs::create_dir_all(&linux_bin).expect("create linux bin");
+        std::os::unix::fs::symlink(&windows_bin, &link_into_drive).expect("symlink");
+        let value =
+            std::env::join_paths([&windows_bin, &linux_bin, &link_into_drive]).expect("join PATH");
+
+        let mut paths = BTreeSet::new();
+        insert_path_list(&mut paths, &value, std::slice::from_ref(&drive));
+        assert_eq!(paths, BTreeSet::from([linux_bin.clone()]));
+
+        let mut paths = BTreeSet::new();
+        insert_path_list(&mut paths, &value, &[]);
+        assert!(
+            paths.contains(&windows_bin),
+            "no drives: PATH bound as before"
+        );
     }
 
     #[test]
