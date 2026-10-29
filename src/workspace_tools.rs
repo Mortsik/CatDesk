@@ -90,6 +90,12 @@ static GREP_AVAILABLE: OnceLock<bool> = OnceLock::new();
 const SEARCH_DEADLINE: Duration = Duration::from_secs(60);
 /// A deadline cut is a first-class truncated outcome on every backend —
 /// partial results plus this note, never a backend failure.
+/// Listing counterpart: the walk is bounded by the caller's deadline (the
+/// intercepted command's `timeout_ms`), because `limit` counts only matching
+/// entries — `find -type d` over a tree of files visits every directory
+/// without growing the result, and blocking-pool work cannot be cancelled
+/// once started.
+const LIST_DEADLINE_TRUNCATED_NOTE: &str = "listing exceeded its time budget; narrow the path";
 const SEARCH_DEADLINE_TRUNCATED_NOTE: &str =
     "search exceeded its time budget and was truncated; narrow the path or refine the pattern";
 /// Excluded from every search unless the caller explicitly passes
@@ -140,6 +146,8 @@ pub struct ListFilesOutput {
     pub file_count: usize,
     pub other_count: usize,
     pub truncated: bool,
+    /// The walk stopped at its deadline rather than at `limit`.
+    pub deadline_hit: bool,
     pub limit: usize,
     pub entries: Vec<ListFilesEntry>,
 }
@@ -161,7 +169,12 @@ impl ListFilesOutput {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
-        if self.truncated {
+        if self.deadline_hit {
+            out.push_str(&format!(
+                "\n\n[truncated after {} items: {LIST_DEADLINE_TRUNCATED_NOTE}]",
+                self.item_count
+            ));
+        } else if self.truncated {
             out.push_str(&format!("\n\n[truncated at {} items]", self.limit));
         }
         out
@@ -1079,6 +1092,30 @@ pub fn list_files_filtered(
     include_hidden: bool,
     limit: Option<usize>,
     filter: command::FileListingFilter,
+    deadline: Instant,
+) -> Result<ListFilesOutput, String> {
+    list_files_until(
+        workspace_root,
+        path,
+        include_hidden,
+        limit,
+        filter,
+        &mut || Instant::now() >= deadline,
+    )
+}
+
+/// [`list_files_filtered`] with the deadline as a predicate, checked before
+/// each directory, for every entry while reading and while processing it, and
+/// between the runs of its sort: one huge directory must not outrun the
+/// budget either. A directory cut while it is being read or sorted is dropped
+/// whole rather than listed as an arbitrary unsorted subset.
+fn list_files_until(
+    workspace_root: &str,
+    path: Option<&str>,
+    include_hidden: bool,
+    limit: Option<usize>,
+    filter: command::FileListingFilter,
+    expired: &mut dyn FnMut() -> bool,
 ) -> Result<ListFilesOutput, String> {
     let root = workspace_root_path(workspace_root)?;
     let start = command::resolve_workspace_path(workspace_root, path)?;
@@ -1099,18 +1136,32 @@ pub fn list_files_filtered(
     let mut file_count: usize = 0;
     let mut other_count: usize = 0;
     let mut truncated = false;
+    let mut deadline_hit = false;
 
-    while let Some(dir) = queue.pop_front() {
-        let mut dir_entries = fs::read_dir(&dir)
-            .map_err(|e| e.to_string())?
-            .map(|entry_res| {
-                let entry = entry_res.map_err(|e| e.to_string())?;
-                let name = entry.file_name().to_string_lossy().to_string();
-                Ok((name, entry))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        dir_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    'walk: while let Some(dir) = queue.pop_front() {
+        if expired() {
+            deadline_hit = true;
+            break;
+        }
+        let mut dir_entries = Vec::new();
+        for entry_res in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            if expired() {
+                deadline_hit = true;
+                break 'walk;
+            }
+            let entry = entry_res.map_err(|e| e.to_string())?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            dir_entries.push((name, entry));
+        }
+        let Some(dir_entries) = sort_entries_until(dir_entries, LIST_SORT_CHUNK, expired) else {
+            deadline_hit = true;
+            break;
+        };
         for (name, entry) in dir_entries {
+            if expired() {
+                deadline_hit = true;
+                break 'walk;
+            }
             if !include_hidden && name.starts_with('.') {
                 continue;
             }
@@ -1179,10 +1230,86 @@ pub fn list_files_filtered(
         directory_count,
         file_count,
         other_count,
-        truncated,
+        truncated: truncated || deadline_hit,
+        deadline_hit,
         limit: max_items,
         entries,
     })
+}
+
+/// Run length of [`sort_entries_until`], and the most element moves it makes
+/// between two deadline polls.
+const LIST_SORT_CHUNK: usize = 4096;
+
+/// Sorts by name like `sort_by`, as a bottom-up merge sort that never does
+/// more than `chunk` units of work between two `expired` polls: each run of
+/// `chunk` entries is sorted after a poll, and every pass that moves entries
+/// (into slots, each merge pass, out of slots) polls every `chunk` moves, so
+/// one merge spanning a whole huge directory is cut as well. `None` when the
+/// deadline cut the sort. Names within one directory are unique, so the
+/// result equals a plain sort.
+fn sort_entries_until<T>(
+    mut entries: Vec<(String, T)>,
+    chunk: usize,
+    expired: &mut dyn FnMut() -> bool,
+) -> Option<Vec<(String, T)>> {
+    for run in entries.chunks_mut(chunk) {
+        if expired() {
+            return None;
+        }
+        run.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    if entries.len() <= chunk {
+        return Some(entries);
+    }
+    let len = entries.len();
+    // Polls before every `chunk`-th move of a pass.
+    let mut due = |moved: usize| moved.is_multiple_of(chunk) && expired();
+
+    let mut slots = Vec::with_capacity(len);
+    for entry in entries {
+        if due(slots.len()) {
+            return None;
+        }
+        slots.push(Some(entry));
+    }
+    let mut width = chunk;
+    while width < len {
+        let mut merged: Vec<Option<(String, T)>> = Vec::with_capacity(len);
+        let mut start = 0;
+        while start < len {
+            let mid = (start + width).min(len);
+            let end = (start + 2 * width).min(len);
+            let (mut left, mut right) = (start, mid);
+            while left < mid || right < end {
+                if due(merged.len()) {
+                    return None;
+                }
+                let take_left = right >= end
+                    || (left < mid && slot_name(&slots, left) <= slot_name(&slots, right));
+                let idx = if take_left { &mut left } else { &mut right };
+                merged.push(slots[*idx].take());
+                *idx += 1;
+            }
+            start = end;
+        }
+        slots = merged;
+        width = width.saturating_mul(2);
+    }
+
+    let mut sorted = Vec::with_capacity(len);
+    for slot in slots {
+        if due(sorted.len()) {
+            return None;
+        }
+        sorted.extend(slot);
+    }
+    Some(sorted)
+}
+
+/// Name of a slot that a merge has not moved yet.
+fn slot_name<T>(slots: &[Option<(String, T)>], idx: usize) -> &str {
+    slots[idx].as_ref().map_or("", |entry| entry.0.as_str())
 }
 
 pub fn search_text(
@@ -3015,6 +3142,130 @@ mod tests {
     }
 
     #[test]
+    fn list_files_stops_at_deadline_with_a_truncation_note() {
+        let workspace_root = test_workspace("list-deadline");
+        fs::create_dir_all(workspace_root.join("sub")).expect("create workspace");
+        fs::write(workspace_root.join("sub/a.txt"), "x\n").expect("write file");
+        let root = workspace_root.to_string_lossy().into_owned();
+        let list = |deadline| {
+            list_files_filtered(
+                &root,
+                None,
+                false,
+                None,
+                command::FileListingFilter::FilesOnly,
+                deadline,
+            )
+            .expect("deadline cut must stay a listing, not an error")
+        };
+
+        let missed = list(Instant::now());
+        assert!(missed.deadline_hit && missed.truncated);
+        assert!(missed.entries.is_empty());
+        assert!(missed.render_text().ends_with(
+            "[truncated after 0 items: listing exceeded its time budget; narrow the path]"
+        ));
+
+        let full = list(Instant::now() + Duration::from_secs(60));
+        assert!(!full.deadline_hit && !full.truncated);
+        assert_eq!(full.file_count, 1);
+        assert!(!full.render_text().contains("time budget"));
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn list_files_deadline_cuts_inside_one_directory() {
+        let workspace_root = test_workspace("list-deadline-one-dir");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        for index in 0..10 {
+            fs::write(workspace_root.join(format!("f{index}.txt")), "x\n").expect("write file");
+        }
+        let root = workspace_root.to_string_lossy().into_owned();
+        // Predicate calls: 1 before the directory, 10 while reading it, 1 for
+        // the single sort run, then one per entry while processing. Expire on
+        // call `n`.
+        let list_expiring_at = |n: usize| {
+            let mut calls = 0;
+            list_files_until(
+                &root,
+                None,
+                false,
+                None,
+                command::FileListingFilter::FilesOnly,
+                &mut || {
+                    calls += 1;
+                    calls >= n
+                },
+            )
+            .expect("deadline cut must stay a listing")
+        };
+
+        let reading = list_expiring_at(5);
+        assert!(reading.deadline_hit && reading.truncated);
+        assert!(
+            reading.entries.is_empty(),
+            "a half-read directory is dropped"
+        );
+
+        let sorting = list_expiring_at(1 + 10 + 1);
+        assert!(sorting.deadline_hit && sorting.truncated);
+        assert!(
+            sorting.entries.is_empty(),
+            "a half-sorted directory is dropped"
+        );
+
+        let processing = list_expiring_at(1 + 10 + 1 + 3);
+        assert!(processing.deadline_hit && processing.truncated);
+        let names: Vec<_> = processing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["f0.txt", "f1.txt"]);
+
+        let never = list_expiring_at(usize::MAX);
+        assert!(!never.deadline_hit && !never.truncated);
+        assert_eq!(never.file_count, 10);
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn interruptible_sort_matches_plain_sort_and_stops_at_deadline() {
+        let names = ["k", "b", "x", "a", "q", "m", "c", "z", "e", "d", "y"];
+        let entries = || {
+            names
+                .iter()
+                .map(|n| (n.to_string(), ()))
+                .collect::<Vec<_>>()
+        };
+        let mut expected: Vec<_> = names.to_vec();
+        expected.sort();
+        for chunk in [1, 2, 3, 4096] {
+            let sorted = sort_entries_until(entries(), chunk, &mut || false).expect("no deadline");
+            let sorted: Vec<_> = sorted.iter().map(|(n, ())| n.as_str()).collect();
+            assert_eq!(sorted, expected, "chunk {chunk}");
+        }
+
+        // chunk 2 over 11 entries polls 6 times for the run sorts, then every
+        // 2 moves (6 polls per 11-move pass) into slots, through the merge
+        // passes of widths 2, 4 and 8, and out of slots.
+        let count_calls = |n: usize| {
+            let mut calls = 0;
+            let result = sort_entries_until(entries(), 2, &mut || {
+                calls += 1;
+                calls >= n
+            });
+            (result.is_some(), calls)
+        };
+        let total = 6 + 6 + 3 * 6 + 6;
+        assert_eq!(count_calls(usize::MAX), (true, total));
+        for n in 1..=total {
+            assert_eq!(count_calls(n), (false, n), "every poll point cuts");
+        }
+        // The width-8 pass is one merge over the whole input (8 + 3 entries);
+        // its polls are calls 25..=30, so the cut lands inside that merge.
+        assert_eq!(count_calls(6 + 6 + 2 * 6 + 3), (false, 27));
+    }
+
+    #[test]
     fn collect_search_files_stops_at_deadline() {
         let _env = env_lock();
         let workspace_root = test_workspace("search-deadline-collect");
@@ -3259,6 +3510,7 @@ mod tests {
             false,
             Some(100),
             command::FileListingFilter::All,
+            Instant::now() + Duration::from_secs(60),
         )
         .expect("list workspace");
         assert!(

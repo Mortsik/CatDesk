@@ -3858,6 +3858,10 @@ async fn run_command_listing_intercept_uses_list_widget_payload() {
         Some("find")
     );
     assert_eq!(
+        structured.get("listTimedOut").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
         widget_payload.get("toolName").and_then(Value::as_str),
         Some("list_files")
     );

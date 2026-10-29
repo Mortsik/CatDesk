@@ -345,6 +345,7 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 "overwrite",
                 "skipped",
                 "listTruncated",
+                "listTimedOut",
                 "timedOut",
                 "stdoutTruncated",
                 "stderrTruncated",

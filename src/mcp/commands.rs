@@ -458,6 +458,7 @@ pub(crate) async fn handle_run_command(
             intercept.include_hidden,
             None,
             intercept.filter,
+            std::time::Instant::now() + std::time::Duration::from_millis(effective_timeout),
         ) {
             Ok(listing) => {
                 let output = listing.render_text();
@@ -701,6 +702,7 @@ fn build_run_command_listing_structured(
         "listFileCount": listing.file_count,
         "listOtherCount": listing.other_count,
         "listTruncated": listing.truncated,
+        "listTimedOut": listing.deadline_hit,
         "listLimit": listing.limit,
         "listEntries": listing.entries,
     })
