@@ -8,6 +8,7 @@
 - Ordinary CatDesk tool calls use a lightweight ChatGPT widget resource instead of the full dashboard resource.
 - `catdesk_instruction` keeps the full dashboard because it exposes settings/status that the compact card does not need to duplicate.
 - The compact widget reads only `_meta.catdesk/widgetPayload` / `window.openai.toolResponseMetadata`; it must not depend on the full model payload.
+- Every widget template completes the MCP Apps host handshake (spec `2026-01-26`): send `ui/initialize`, then `ui/notifications/initialized` after the host answers, report `ui/notifications/size-changed`, and answer `ui/resource-teardown`. The payload comes from `ui/notifications/tool-result` `params._meta`; `window.openai` is only a fallback. A template that never initializes leaves ChatGPT waiting until it shows "app did not respond in time" (added 2026-11-06).
 - Compact cards render only a small summary: tool name/title, state, optional command/search/path/counts, short command/detail preview, and changed-file metadata.
 - Widget-only payloads must not carry unbounded command output, full file diffs, or arbitrarily large directory listings.
 - Existing full model output schemas and tool behavior remain backward compatible.

@@ -8062,12 +8062,123 @@
           return true;
         }
 
+        // MCP Apps host bridge (spec 2026-01-26): the View must open with a
+        // `ui/initialize` request and confirm with `ui/notifications/initialized`
+        // before the host sends it anything. Without the handshake ChatGPT
+        // waits on the iframe and can give up with "app did not respond in
+        // time". `window.openai` stays the fallback for hosts that inject it.
+        var MCP_APPS_PROTOCOL_VERSION = "2026-01-26";
+        var hostBridge = {
+          nextRequestId: 1,
+          pending: {},
+          initialized: false,
+          lastWidth: 0,
+          lastHeight: 0,
+          sizeFrameQueued: false,
+        };
+
+        function hasHostFrame() {
+          return !!window.parent && window.parent !== window;
+        }
+
+        function postToHost(message) {
+          if (!hasHostFrame()) return;
+          try {
+            window.parent.postMessage(message, "*");
+          } catch (_error) {}
+        }
+
+        function sendHostRequest(method, params, onResponse) {
+          var id = "catdesk-" + hostBridge.nextRequestId++;
+          hostBridge.pending[id] = onResponse;
+          postToHost({ jsonrpc: "2.0", id: id, method: method, params: params });
+        }
+
+        function sendHostNotification(method, params) {
+          postToHost({ jsonrpc: "2.0", method: method, params: params || {} });
+        }
+
+        function reportSizeToHost() {
+          if (hostBridge.sizeFrameQueued) return;
+          hostBridge.sizeFrameQueued = true;
+          requestAnimationFrame(function () {
+            hostBridge.sizeFrameQueued = false;
+            var root = document.documentElement;
+            var previousHeight = root.style.height;
+            root.style.height = "max-content";
+            var height = Math.ceil(root.getBoundingClientRect().height);
+            root.style.height = previousHeight;
+            var width = Math.ceil(window.innerWidth);
+            if (width === hostBridge.lastWidth && height === hostBridge.lastHeight) {
+              return;
+            }
+            hostBridge.lastWidth = width;
+            hostBridge.lastHeight = height;
+            sendHostNotification("ui/notifications/size-changed", {
+              width: width,
+              height: height,
+            });
+          });
+        }
+
+        function startSizeReporting() {
+          reportSizeToHost();
+          if (typeof ResizeObserver !== "function") return;
+          var observer = new ResizeObserver(reportSizeToHost);
+          observer.observe(document.documentElement);
+          if (document.body) observer.observe(document.body);
+        }
+
+        function startHostHandshake() {
+          if (!hasHostFrame()) return;
+          sendHostRequest(
+            "ui/initialize",
+            {
+              appInfo: { name: "catdesk-dashboard", version: "1.0.0" },
+              appCapabilities: {},
+              protocolVersion: MCP_APPS_PROTOCOL_VERSION,
+            },
+            function (error) {
+              if (error || hostBridge.initialized) return;
+              hostBridge.initialized = true;
+              sendHostNotification("ui/notifications/initialized", {});
+              startSizeReporting();
+            },
+          );
+        }
+
+        function toolResultMetadata(params) {
+          if (params && typeof params === "object" && hasPureMetaPayload(params._meta)) {
+            return params._meta;
+          }
+          return currentToolResponseMetadata();
+        }
+
         window.addEventListener("message", function (event) {
           if (event.source !== window.parent) return;
           var message = event.data;
           if (!message || typeof message !== "object") return;
+          if (
+            !message.method &&
+            message.id != null &&
+            Object.prototype.hasOwnProperty.call(hostBridge.pending, message.id)
+          ) {
+            var onResponse = hostBridge.pending[message.id];
+            delete hostBridge.pending[message.id];
+            onResponse(message.error || null, message.result);
+            return;
+          }
+          if (message.method === "ui/resource-teardown") {
+            stopTokenRollAnimation();
+            stopInstructionMascotAnimation();
+            stopWaitingMascotAnimation();
+            if (message.id != null) {
+              postToHost({ jsonrpc: "2.0", id: message.id, result: {} });
+            }
+            return;
+          }
           if (message.method === "ui/notifications/tool-result") {
-            var toolResponseMetadata = currentToolResponseMetadata();
+            var toolResponseMetadata = toolResultMetadata(message.params);
             if (!hasPureMetaPayload(toolResponseMetadata)) return;
             applyPayload(toolResponseMetadata);
           }
@@ -8098,6 +8209,7 @@
         if (hasPureMetaPayload(initialToolResponseMetadata)) {
           applyPayload(initialToolResponseMetadata);
         }
+        startHostHandshake();
       })();
     </script>
   </body>

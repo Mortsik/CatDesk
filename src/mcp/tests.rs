@@ -6008,7 +6008,7 @@ fn read_file_missing_path_emits_widget_payload_error_panel() {
 #[test]
 fn widget_resource_uri_includes_revision_for_cache_busting() {
     let uri = current_widget_resource_uri_for_tool("catdesk_instruction");
-    assert!(uri.contains("widgetRevision=9"));
+    assert!(uri.contains("widgetRevision=10"));
     assert!(uri.contains("cardsRev="));
     assert!(uri.contains("mascotRev="));
     assert!(uri.contains("toolName=catdesk_instruction"));
@@ -6138,6 +6138,111 @@ fn resources_read_includes_widget_csp_connect_domains() {
             .map(|domains| domains.len()),
         Some(0)
     );
+}
+
+/// The widget must open the MCP Apps handshake itself: ChatGPT waits for
+/// `ui/initialize` → `ui/notifications/initialized` before talking to the
+/// iframe, and reports "app did not respond in time" when it never comes.
+/// Runs the real rendered widget script under node; skipped without node.
+#[test]
+fn widget_script_completes_mcp_apps_host_handshake() {
+    let _env = env_lock();
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping widget host bridge test: node is not installed");
+        return;
+    }
+    let resource_resp = handle_resources_read(
+        &resources_read_request(&current_widget_resource_uri_for_tool("read")),
+        Some("https://example.ngrok.app"),
+        1,
+    );
+    let html = resource_resp
+        .result
+        .as_ref()
+        .and_then(|result| result.get("contents"))
+        .and_then(Value::as_array)
+        .and_then(|contents| contents.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .expect("missing widget html")
+        .to_string();
+    let tool_result = enrich_tool_result(
+        &tool_call_request("read", json!({ "path": "README.md" })),
+        json!({
+            "structuredContent": { "toolName": "read", "text": "hello world" },
+            "content": [{ "type": "text", "text": "path: README.md" }]
+        }),
+        None,
+    );
+    assert!(
+        tool_result
+            .get("_meta")
+            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+            .is_some(),
+        "fixture tool result must carry a widget payload"
+    );
+
+    let dir = std::env::temp_dir().join(format!("catdesk-widget-bridge-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let html_path = dir.join("widget.html");
+    let result_path = dir.join("tool-result.json");
+    std::fs::write(&html_path, html).expect("write widget html");
+    std::fs::write(&result_path, tool_result.to_string()).expect("write tool result");
+    let output = std::process::Command::new("node")
+        .arg(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/widget_host_bridge_harness.js"),
+        )
+        .arg(&html_path)
+        .arg(&result_path)
+        .output()
+        .expect("run node harness");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "harness failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("harness report json");
+
+    let boot = report["boot"].as_array().expect("boot messages");
+    assert_eq!(boot.len(), 1, "only ui/initialize before the host answers");
+    assert_eq!(boot[0]["jsonrpc"], "2.0");
+    assert_eq!(boot[0]["method"], "ui/initialize");
+    assert!(boot[0]["id"].is_string(), "ui/initialize must be a request");
+    assert_eq!(boot[0]["params"]["protocolVersion"], "2026-01-26");
+    assert!(boot[0]["params"]["appInfo"]["name"].is_string());
+    assert!(boot[0]["params"]["appInfo"]["version"].is_string());
+    assert!(boot[0]["params"]["appCapabilities"].is_object());
+
+    assert_eq!(report["postedAfterForeignResponse"], 1);
+    let after_init = report["afterInitializeResult"]
+        .as_array()
+        .expect("post-initialize messages");
+    assert_eq!(after_init[0]["method"], "ui/notifications/initialized");
+    assert!(
+        after_init[0].get("id").is_none(),
+        "initialized is a notification"
+    );
+    assert_eq!(after_init[1]["method"], "ui/notifications/size-changed");
+    assert_eq!(after_init[1]["params"]["width"], 641);
+    assert_eq!(after_init[1]["params"]["height"], 322);
+    assert_eq!(report["resizeTargets"], 2);
+    assert_eq!(report["afterDuplicateResult"], json!([]));
+
+    assert_eq!(
+        report["toolResultRendered"], true,
+        "tool-result params._meta must render without window.openai"
+    );
+    assert_eq!(
+        report["afterTeardown"],
+        json!([{ "jsonrpc": "2.0", "id": 7, "result": {} }])
+    );
+    assert_eq!(report["origins"], json!(["*"]));
 }
 
 #[test]
