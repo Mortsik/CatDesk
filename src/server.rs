@@ -2580,7 +2580,14 @@ mod tests {
 
         let mut read_result = json!({ "contents": [] });
         mcp::decorate_modern_result("resources/read", &mut read_result);
+        // Immediately stale unless the read handler chose a hint itself.
         assert_eq!(read_result.get("ttlMs").and_then(Value::as_u64), Some(0));
+        let mut cached_read_result = json!({ "contents": [], "ttlMs": 5 });
+        mcp::decorate_modern_result("resources/read", &mut cached_read_result);
+        assert_eq!(
+            cached_read_result.get("ttlMs").and_then(Value::as_u64),
+            Some(5)
+        );
         assert_eq!(
             read_result.get("cacheScope").and_then(Value::as_str),
             Some("private")
@@ -2589,6 +2596,10 @@ mod tests {
         let mut resource_list_result = json!({ "resources": [], "nextCursor": null });
         mcp::decorate_modern_result("resources/list", &mut resource_list_result);
         assert!(resource_list_result.get("nextCursor").is_none());
+        assert_eq!(
+            resource_list_result.get("ttlMs").and_then(Value::as_u64),
+            Some(0)
+        );
 
         let unknown = post_mcp_http(
             State(server_state.clone()),

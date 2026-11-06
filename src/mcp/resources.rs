@@ -1,6 +1,8 @@
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
+use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::mascot;
 use crate::mcp::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
@@ -9,6 +11,7 @@ use crate::state::ShowDetailMode;
 
 #[cfg(test)]
 use crate::mcp::current_show_detail_mode;
+use crate::mcp::widget::tool_descriptor_should_attach_widget;
 use crate::mcp::{current_token_stats_layout, current_widget_corner_style};
 
 const SERVER_NAME: &str = "catdesk";
@@ -17,6 +20,42 @@ pub(crate) const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 pub(crate) const UI_TEMPLATE_URI: &str = "ui://widget/catdesk-dashboard.html";
 const WIDGET_RESOURCE_REVISION: u32 = 10;
+/// Freshness hint (MCP 2026-07-28 `ttlMs`) for a read of the current
+/// canonical widget template URI. That URI changes with every input of the
+/// resource (revision, layout, corner style, cards, mascot and CSP origin),
+/// so a cached read stays correct for it. With `ttlMs: 0` ChatGPT re-fetched
+/// the ~470 KB template after nearly every tool call. The hour bounds a dev
+/// build that changed the HTML without bumping the revision. Bare or stale
+/// URIs, and the lists that carry the current URIs, stay immediately stale.
+const WIDGET_RESOURCE_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// Fingerprint of the public origin the widget CSP allows (`connectDomains`).
+/// The MCP request path publishes it, like the mascot seed, so URI builders
+/// can address the resource without threading the origin through every call
+/// site; a new tunnel origin moves the URI and with it the host cache key.
+static CURRENT_WIDGET_ORIGIN_REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn set_current_widget_origin(public_base_url: Option<&str>) {
+    CURRENT_WIDGET_ORIGIN_REVISION
+        .store(widget_origin_revision(public_base_url), Ordering::Relaxed);
+}
+
+/// No public origin (local-only, and every test) maps to the initial `0`, so
+/// requests without a tunnel never move the process-global revision.
+pub(crate) fn widget_origin_revision(public_base_url: Option<&str>) -> u64 {
+    match public_base_url.filter(|origin| !origin.is_empty()) {
+        Some(origin) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            origin.hash(&mut hasher);
+            hasher.finish().max(1)
+        }
+        None => 0,
+    }
+}
+
+fn current_widget_origin_revision() -> u64 {
+    CURRENT_WIDGET_ORIGIN_REVISION.load(Ordering::Relaxed)
+}
 const UI_TEMPLATE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(crate) const WIDGET_PAYLOAD_META_KEY: &str = "catdesk/widgetPayload";
 pub(crate) const CATDESK_WIDGET_HTML: &str = include_str!("../widget/catdesk_dashboard.html");
@@ -124,7 +163,11 @@ pub(crate) fn decorate_modern_result(method: &str, result: &mut Value) {
             | "resources/templates/list"
             | "prompts/list"
     ) {
-        result_obj.insert("ttlMs".to_string(), json!(0));
+        // Immediately stale unless the handler already chose a freshness
+        // hint (the canonical widget template read does).
+        result_obj
+            .entry("ttlMs".to_string())
+            .or_insert_with(|| json!(0));
         result_obj.insert("cacheScope".to_string(), json!("private"));
     }
     if result_obj.get("nextCursor").is_some_and(Value::is_null) {
@@ -203,24 +246,36 @@ pub(crate) fn is_catdesk_widget_resource_uri(uri: &str) -> bool {
 }
 
 pub(crate) fn current_widget_resource_uri_for_tool(tool_name: &str) -> String {
-    let token_stats_layout = current_token_stats_layout();
-    let widget_corner_style = current_widget_corner_style();
     // `cardsRev` busts the host's template cache when the archive changes, so
     // the inlined card imagery (catdesk-2jk) refreshes with the real archive
     // state instead of serving a stale UI. `mascotRev` does the same for the
     // inlined mascot frames (catdesk-u4u): a partner change moves the seed
     // and with it the URI, while an unchanged seed keeps the URI stable.
+    // `originRev` does the same for the CSP origin baked into the resource.
+    widget_resource_uri(
+        tool_name,
+        mascot::current_widget_mascot_revision(),
+        current_widget_origin_revision(),
+    )
+}
+
+pub(crate) fn widget_resource_uri(
+    tool_name: &str,
+    mascot_revision: u64,
+    origin_revision: u64,
+) -> String {
+    let token_stats_layout = current_token_stats_layout();
+    let widget_corner_style = current_widget_corner_style();
     let cards_revision = mascot::archived_cards_revision();
-    let mascot_revision = mascot::current_widget_mascot_revision();
     if tool_name.is_empty() {
         return format!(
-            "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}&cardsRev={cards_revision}&mascotRev={mascot_revision}",
+            "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}&cardsRev={cards_revision}&mascotRev={mascot_revision}&originRev={origin_revision}",
             token_stats_layout.as_str(),
             widget_corner_style.as_str()
         );
     }
     format!(
-        "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}&cardsRev={cards_revision}&mascotRev={mascot_revision}&toolName={}",
+        "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}&cardsRev={cards_revision}&mascotRev={mascot_revision}&originRev={origin_revision}&toolName={}",
         token_stats_layout.as_str(),
         widget_corner_style.as_str(),
         tool_name
@@ -318,10 +373,29 @@ pub(crate) fn handle_resources_read_with_show_detail_mode(
     if show_detail_mode == ShowDetailMode::Disable {
         return JsonRpcResponse::error(req.id.clone(), -32602, format!("Unknown resource: {uri}"));
     }
-    let text = if is_catdesk_widget_resource_uri(uri) {
-        render_widget_html(uri, mascot_seed)
-    } else {
+    if !is_catdesk_widget_resource_uri(uri) {
         return JsonRpcResponse::error(req.id.clone(), -32602, format!("Unknown resource: {uri}"));
+    }
+    // Only an advertised URI that names exactly the rendered content may be
+    // cached: it is rebuilt from this request's own seed and origin, and
+    // checked on both sides of the render so a concurrent archive or layout
+    // change cannot slip in. A bare, stale or unknown-tool URI is served the
+    // current state and stays immediately stale.
+    let tool_name = initial_tool_name_from_resource_uri(uri);
+    let advertised_tool = tool_name.is_empty() || tool_descriptor_should_attach_widget(tool_name);
+    let canonical_uri = || {
+        widget_resource_uri(
+            tool_name,
+            mascot::widget_mascot_revision(mascot_seed),
+            widget_origin_revision(public_base_url),
+        )
+    };
+    let canonical_before_render = canonical_uri();
+    let text = render_widget_html(uri, mascot_seed);
+    let ttl_ms = if advertised_tool && uri == canonical_before_render && uri == canonical_uri() {
+        WIDGET_RESOURCE_TTL_MS
+    } else {
+        0
     };
     JsonRpcResponse::success(
         req.id.clone(),
@@ -331,7 +405,8 @@ pub(crate) fn handle_resources_read_with_show_detail_mode(
                 "mimeType": UI_TEMPLATE_MIME_TYPE,
                 "text": text,
                 "_meta": { "ui": widget_resource_ui_meta(public_base_url) }
-            }]
+            }],
+            "ttlMs": ttl_ms
         }),
     )
 }

@@ -5,7 +5,8 @@ use super::resources::{
     REFRESH_CATDESK_IMAGE_PLACEHOLDER, REMOVE_CATDESK_IMAGE_PLACEHOLDER, UI_TEMPLATE_URI,
     cached_data_uri, current_widget_resource_uri_for_tool,
     handle_resources_list_with_show_detail_mode, handle_resources_read,
-    handle_resources_read_with_show_detail_mode, handle_server_discover,
+    handle_resources_read_with_show_detail_mode, handle_server_discover, widget_origin_revision,
+    widget_resource_uri,
 };
 use super::*;
 use base64::Engine as _;
@@ -6137,6 +6138,83 @@ fn resources_read_includes_widget_csp_connect_domains() {
             .and_then(Value::as_array)
             .map(|domains| domains.len()),
         Some(0)
+    );
+}
+
+fn resources_read_ttl_ms(uri: &str) -> Option<u64> {
+    handle_resources_read(
+        &resources_read_request(uri),
+        Some("https://example.ngrok.app"),
+        1,
+    )
+    .result
+    .as_ref()
+    .and_then(|result| result.get("ttlMs"))
+    .and_then(Value::as_u64)
+}
+
+/// Only an advertised URI that names exactly the rendered content may be
+/// cached. It is rebuilt from the request's own mascot seed and origin, so a
+/// URI whose revisions disagree with what this read renders, a bare or stale
+/// URI, or a tool that never advertises the widget stays immediately stale.
+#[test]
+fn resources_read_lets_hosts_cache_only_the_advertised_widget_uri() {
+    let origin = widget_origin_revision(Some("https://example.ngrok.app"));
+    let seed_rev = mascot::widget_mascot_revision(1);
+    let canonical = widget_resource_uri("read", seed_rev, origin);
+    assert_eq!(resources_read_ttl_ms(&canonical), Some(60 * 60 * 1000));
+    assert_eq!(
+        resources_read_ttl_ms(&widget_resource_uri("", seed_rev, origin)),
+        Some(60 * 60 * 1000),
+        "the resources/list URI is advertised too"
+    );
+
+    assert_eq!(resources_read_ttl_ms(UI_TEMPLATE_URI), Some(0));
+    let stale = canonical.replace("widgetRevision=", "widgetRevision=0");
+    assert_eq!(resources_read_ttl_ms(&stale), Some(0));
+    assert_eq!(
+        resources_read_ttl_ms(&widget_resource_uri("nonexistent_tool", seed_rev, origin)),
+        Some(0),
+        "a tool that never advertises the widget"
+    );
+    assert_eq!(
+        resources_read_ttl_ms(&widget_resource_uri(
+            "read",
+            mascot::widget_mascot_revision(2),
+            origin
+        )),
+        Some(0),
+        "the URI names another mascot than the one rendered"
+    );
+    assert_eq!(
+        resources_read_ttl_ms(&widget_resource_uri(
+            "read",
+            seed_rev,
+            widget_origin_revision(Some("https://other.ngrok.app"))
+        )),
+        Some(0),
+        "the URI names another CSP origin than the one rendered"
+    );
+}
+
+/// The CSP origin is baked into the template, so it must move the URI: a new
+/// tunnel origin cannot be served a cached template that still allows the old
+/// one. No origin maps to the initial revision so tunnel-less requests (and
+/// tests) never move the process-global value.
+#[test]
+fn widget_resource_uri_tracks_the_csp_origin() {
+    assert!(current_widget_resource_uri_for_tool("read").contains("&originRev="));
+    assert_eq!(widget_origin_revision(None), 0);
+    assert_eq!(widget_origin_revision(Some("")), 0);
+    let first = widget_origin_revision(Some("https://a.ngrok-free.dev"));
+    assert_ne!(first, 0);
+    assert_eq!(
+        first,
+        widget_origin_revision(Some("https://a.ngrok-free.dev"))
+    );
+    assert_ne!(
+        first,
+        widget_origin_revision(Some("https://b.ngrok-free.dev"))
     );
 }
 
